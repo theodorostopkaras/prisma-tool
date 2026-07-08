@@ -1,37 +1,22 @@
 """
-Build 3-D SIMLINE intensity cubes and fit observational FITS maps (KoSens3D map_fit).
+Build 3-D SIMLINE intensity cubes and fit observational FITS maps.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import sys
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import grid_interp as gi
+import map_fit as _map_fit_mod
+import smli_labels
 
 try:
     from astropy.io import fits
 except ImportError:  # pragma: no cover
     fits = None
-
-# KoSens3D map-fit backend (optional at import time; required to run a fit).
-_KOSENS3D_SRC = os.environ.get(
-    'KOSENS3D_SRC',
-    os.path.abspath(os.path.join(
-        os.path.dirname(__file__), '..', 'KoSens3D', 'src')),
-)
-if os.path.isdir(_KOSENS3D_SRC) and _KOSENS3D_SRC not in sys.path:
-    sys.path.insert(0, _KOSENS3D_SRC)
-
-try:
-    from kosens3d.grid.grid_functions import _format_smli_transition_label
-    from kosens3d.grid import map_fit as _map_fit_mod
-except ImportError:  # pragma: no cover
-    _format_smli_transition_label = None
-    _map_fit_mod = None
 
 AXIS_X = 'density'
 AXIS_Y = 'fuv'
@@ -46,9 +31,7 @@ TARGET_UNITS_JERG = 'erg s-1 cm-2'
 
 
 def _format_transition_label(raw_transition: str) -> str:
-    if _format_smli_transition_label is not None:
-        return _format_smli_transition_label(raw_transition)
-    return str(raw_transition).replace('--', '-')
+    return smli_labels.format_smli_transition_label(raw_transition)
 
 
 def spectroscopic_line_key(species: str, raw_transition: str) -> str:
@@ -264,12 +247,7 @@ def run_map_fit(
     create_uncertainty_maps: bool = False,
     plot_contours: bool = False,
 ) -> dict:
-    """Run ``fit_fits_maps_to_grids_3d`` (KoSens3D) and return the results dict."""
-    if _map_fit_mod is None:
-        raise ImportError(
-            'kosens3d is not installed. Set KOSENS3D_SRC to the KoSens3D src path '
-            f'(tried {_KOSENS3D_SRC}).'
-        )
+    """Run ``fit_fits_maps_to_grids_3d`` and return the results dict."""
     os.makedirs(output_dir, exist_ok=True)
     return _map_fit_mod.fit_fits_maps_to_grids_3d(
         observed_fits_files=observed_fits_files,
@@ -378,6 +356,28 @@ def extract_spatial_coordinates(header, shape: Tuple[int, int]) -> Tuple[np.ndar
     return x_1d, y_1d
 
 
+_FIT_THEMES = {
+    'light': dict(
+        paper_bg='#ffffff',
+        plot_bg='#f8f9fa',
+        grid='#e0e0e0',
+        title='#333333',
+        font='#333333',
+    ),
+    'dark': dict(
+        paper_bg='#1a1a2e',
+        plot_bg='#16213e',
+        grid='#2a3a5c',
+        title='#e8eaf0',
+        font='#e0e0e0',
+    ),
+}
+
+
+def _fit_theme_colors(theme='light'):
+    return _FIT_THEMES.get(theme if theme in _FIT_THEMES else 'light', _FIT_THEMES['light'])
+
+
 def fig_fits_map(
     data: np.ndarray,
     title: str,
@@ -385,6 +385,7 @@ def fig_fits_map(
     zscale: str = 'log',
     colorscale: str = 'Viridis',
     colorbar_title: str = '',
+    theme: str = 'light',
 ) -> Any:
     """Plotly heatmap for a 2-D parameter or diagnostic map."""
     import plotly.graph_objects as go
@@ -423,23 +424,33 @@ def fig_fits_map(
         hovertemplate=hover,
     ))
     plot_height = int(max(520, min(780, 420 * sky_ratio)))
+    t = _fit_theme_colors(theme)
     fig.update_layout(
-        title=dict(text=title, x=0.02, xanchor='left', font=dict(size=13)),
-        paper_bgcolor='white',
-        plot_bgcolor='#f8f9fa',
+        title=dict(text=title, x=0.02, xanchor='left',
+                   font=dict(size=13, color=t['title'])),
+        paper_bgcolor=t['paper_bg'],
+        plot_bgcolor=t['plot_bg'],
         margin=dict(l=60, r=20, t=48, b=54),
         autosize=True,
         height=plot_height,
-        xaxis=dict(title=x_label, showgrid=True, gridcolor='#e0e0e0'),
+        font=dict(color=t['font']),
+        xaxis=dict(
+            title=dict(text=x_label, font=dict(color=t['font'])),
+            showgrid=True, gridcolor=t['grid'],
+            tickfont=dict(color=t['font']),
+        ),
         yaxis=dict(
-            title=y_label, showgrid=True, gridcolor='#e0e0e0',
+            title=dict(text=y_label, font=dict(color=t['font'])),
+            showgrid=True, gridcolor=t['grid'],
+            tickfont=dict(color=t['font']),
             scaleanchor='x', scaleratio=sky_ratio,
         ),
     )
     return fig
 
 
-def fit_result_figures(result: dict, fits_header=None) -> Dict[str, Any]:
+def fit_result_figures(result: dict, fits_header=None, *,
+                       theme='light', colorscale='Viridis') -> Dict[str, Any]:
     """Build Plotly figures for fitted x/y/z parameter maps."""
     if not result:
         return {}
@@ -450,25 +461,29 @@ def fit_result_figures(result: dict, fits_header=None) -> Dict[str, Any]:
             'Best-fit hydrogen density',
             header=header, zscale='log',
             colorbar_title='log<sub>10</sub> n (cm<sup>-3</sup>)',
+            theme=theme, colorscale=colorscale,
         ),
         'y': fig_fits_map(
             result['y_param_map'],
             f'Best-fit FUV field ({Y_MESH_KEY})',
             header=header, zscale='log',
             colorbar_title='log<sub>10</sub> χ',
+            theme=theme, colorscale=colorscale,
         ),
         'z': fig_fits_map(
             result['z_param_map'],
             f'Best-fit cosmic-ray rate ({Z_MESH_KEY})',
             header=header, zscale='log',
             colorbar_title='log<sub>10</sub> ζ',
+            theme=theme, colorscale=colorscale,
         ),
     }
     chi2_red = result.get('chi2_reduced_map')
     if chi2_red is not None and np.any(np.isfinite(chi2_red)):
         figs['chi2'] = fig_fits_map(
             chi2_red, 'Reduced χ² per pixel',
-            header=header, zscale='linear', colorscale='Magma',
+            header=header, zscale='linear', colorscale=colorscale,
             colorbar_title='χ²<sub>ν</sub>',
+            theme=theme,
         )
     return figs

@@ -24,6 +24,7 @@ After loading a main grid on **Load grids**, the other tabs become active:
 | **Grid slices** | 2-D contour maps over n_H, FUV, and ζ |
 | **Chemistry** | Top formation / destruction reactions with contribution metrics |
 | **Intensities** | SIMLINE line-intensity slice maps and spectrum |
+| **Interpolation error** | Native vs resampled grids with decimation error maps (abundance + SIMLINE) |
 | **Map fit** | Fit observed FITS maps to the 3-D SIMLINE model grid (KoSens3D) |
 
 ## How the grid is discovered
@@ -168,6 +169,27 @@ The **Intensities** tab provides:
 An optional **overlay SIMLINE** directory (attenuated `.smli` files) enables the
 same triple-panel x-shift layout as for HDF5 grid slices.
 
+## Interpolation error check
+
+The **Interpolation error** tab reproduces KoSens3D
+``plot_interpolation_comparison`` / ``resampled_grid_data`` with
+``calculate_error=True``:
+
+1. **Original** — native model grid (one point per grid folder)
+2. **Interpolated** — KoSens-style resample to the chosen ny × nx mesh
+3. **Error** — checkerboard decimation → re-interpolation on the native mesh;
+   relative (%) or absolute error in linear flux / abundance units
+
+When both data sources are loaded, each slice plane shows:
+
+- **Abundance / diagnostic** row (from the main HDF5 grid quantity dropdown)
+- **SIMLINE intensity** row (species + transition)
+
+Controls match the slice tabs (interpolation method, grid size, axis limits) plus
+**error decimation factor**, **error metric**, **relative threshold**,
+**flux scale**, and **colormap** (default Magma). Error panel uses `RdYlGn_r`
+(green = low error, red = high), as in KoSens.
+
 ## Formation / destruction reactions (chemistry grid)
 
 The per-model `pdrgrid` HDF5 files do **not** contain reaction rates — those live
@@ -200,18 +222,16 @@ with labels from the chem-grid metadata table, plotted against A_V
 ## Observational map fit
 
 The **Map fit** tab builds 3-D SIMLINE intensity cubes (density × FUV × ζ) and
-runs KoSens3D `fit_fits_maps_to_grids_3d` against user-supplied observed FITS
+runs ``fit_fits_maps_to_grids_3d`` against user-supplied observed FITS
 maps. Requires:
 
 - Main grid + SIMLINE directory loaded
-- KoSens3D Python package on `PYTHONPATH` (default: sibling `../KoSens3D/src`, or
-  set `KOSENS3D_SRC`)
 
 Provide JSON mappings of spectroscopic line keys to FITS paths and optional
 per-line errors. Output includes fitted n_H, χ, and ζ maps and reduced χ² maps
 (written to the chosen output directory).
 
-Implementation: `grid_fit.py`.
+Implementation: `grid_fit.py`, `map_fit.py`, `map_fit_extras.py`.
 
 ## Overlaying a second (attenuated) grid
 
@@ -242,8 +262,7 @@ box at the top of the page and click **Load grid** (tick *recursive* to walk
 sub-folders).
 
 **Dependencies:** `dash`, `plotly`, `numpy`, `h5py`, `scipy`, `astropy`.
-Map fitting additionally requires the KoSens3D Python package at
-`../KoSens3D/src` (default) or via the `KOSENS3D_SRC` environment variable.
+Optional: `tqdm` (progress bar during map fitting).
 
 ### CLI options
 
@@ -262,6 +281,9 @@ Map fitting additionally requires the KoSens3D Python package at
 | `app.py` | Dash UI, callbacks, plotting |
 | `grid_interp.py` | KoSens-aligned 2-D / 3-D grid resampling |
 | `grid_fit.py` | 3-D intensity cubes and FITS map fit |
+| `map_fit.py` | Core FITS-to-grid fitting (`fit_fits_maps_to_grids_3d`) |
+| `map_fit_extras.py` | Ratio grids, chi² analysis helpers for map fitting |
+| `smli_labels.py` | SIMLINE transition label formatting |
 | `model_config.py` | JSON config scan and Model setup panel |
 
 ## Export

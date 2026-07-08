@@ -8,7 +8,7 @@ Matches ``kosens3d.main_functions.resampled_grid_data`` for 2-D value resampling
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator, RectBivariateSpline, griddata
@@ -411,3 +411,203 @@ def resample_grid_3d_kosens(
     points = np.stack([Z_new.ravel(), Y_new.ravel(), X_new.ravel()], axis=-1)
     grid_out = rgi(points).reshape(tz, ny, nx)
     return grid_out, final_x, final_y, final_z
+
+
+def calculate_interpolation_error_kosens(
+    grid_log10: np.ndarray,
+    *,
+    interpolation_method: str = 'linear',
+    smoothing_order: int = 3,
+    clip_to_bounds: bool = True,
+    decimation_factor: int = 2,
+    error_metric: str = 'relative',
+    relative_threshold: float = 0.01,
+) -> Tuple[np.ndarray, Dict[str, float], np.ndarray, np.ndarray]:
+    """
+    Decimate a native 2-D grid, re-interpolate, and estimate error (KoSens
+    ``_calculate_interpolation_error_internal``).
+
+    ``grid_log10`` holds log10(flux) values.  Returns error grid and statistics
+    in linear flux units; ``error_grid`` matches the input shape.
+    """
+    original_grid = np.asarray(grid_log10, dtype=float)
+    original_shape = original_grid.shape
+    dec = max(int(decimation_factor), 2)
+
+    boundary_mask = np.zeros(original_shape, dtype=bool)
+    dec_y_indices = list(range(0, original_shape[0], dec))
+    if dec_y_indices[-1] != original_shape[0] - 1:
+        dec_y_indices.append(original_shape[0] - 1)
+    dec_x_indices = list(range(0, original_shape[1], dec))
+    if dec_x_indices[-1] != original_shape[1] - 1:
+        dec_x_indices.append(original_shape[1] - 1)
+
+    for i in range(original_shape[0]):
+        for j in range(original_shape[1]):
+            is_kept_row = i in dec_y_indices
+            is_kept_col = j in dec_x_indices
+            is_boundary = (
+                i == 0 or i == original_shape[0] - 1
+                or j == 0 or j == original_shape[1] - 1
+            )
+            if (is_kept_row and is_kept_col) or is_boundary:
+                boundary_mask[i, j] = True
+
+    dec_y_all, dec_x_all = np.where(boundary_mask)
+    decimated_values = original_grid[dec_y_all, dec_x_all].astype(np.float64)
+    finite_mask = np.isfinite(decimated_values)
+    if not np.all(finite_mask):
+        finite_vals = decimated_values[finite_mask]
+        fill_val = float(np.nanmin(finite_vals) - 10) if finite_vals.size else -30.0
+        decimated_for_interp = np.where(finite_mask, decimated_values, fill_val)
+    else:
+        decimated_for_interp = decimated_values
+
+    points = np.column_stack((dec_x_all, dec_y_all))
+    y_tgt, x_tgt = np.meshgrid(
+        np.arange(original_shape[0]), np.arange(original_shape[1]), indexing='ij',
+    )
+    xi = np.column_stack((x_tgt.ravel(), y_tgt.ravel()))
+    interp_method = 'cubic' if interpolation_method == 'spline' else interpolation_method
+    interpolated_grid = griddata(
+        points, decimated_for_interp, xi, method=interp_method, fill_value=np.nan,
+    ).reshape(original_shape).astype(np.float64)
+    if np.any(np.isnan(interpolated_grid)):
+        nearest = griddata(points, decimated_for_interp, xi, method='nearest')
+        interpolated_grid = np.where(
+            np.isnan(interpolated_grid), nearest.reshape(original_shape), interpolated_grid,
+        )
+
+    if clip_to_bounds:
+        finite_orig = original_grid[np.isfinite(original_grid)]
+        min_val = float(np.nanmin(finite_orig)) if finite_orig.size else -30.0
+        max_val = float(np.nanmax(finite_orig)) if finite_orig.size else 0.0
+        interpolated_grid = np.clip(interpolated_grid, min_val, max_val)
+
+    interpolated_grid[boundary_mask] = original_grid[boundary_mask]
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        orig_linear = np.where(
+            np.isfinite(original_grid),
+            10.0 ** np.clip(original_grid, -50.0, 100.0),
+            np.nan,
+        )
+        interp_linear = np.where(
+            np.isfinite(interpolated_grid),
+            10.0 ** np.clip(interpolated_grid, -50.0, 100.0),
+            np.nan,
+        )
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        if error_metric == 'relative':
+            max_linear = np.nanmax(orig_linear[np.isfinite(orig_linear)])
+            thresh_linear = (
+                max_linear * max(relative_threshold, 1e-30)
+                if np.isfinite(max_linear) else 0.0
+            )
+            denom_linear = np.where(
+                np.abs(orig_linear) > 1e-100, np.abs(orig_linear), np.nan,
+            )
+            error_grid = np.abs(interp_linear - orig_linear) / denom_linear * 100.0
+            error_grid = np.where(orig_linear < thresh_linear, 0.0, error_grid)
+            error_grid = np.where(~np.isfinite(denom_linear), 0.0, error_grid)
+        elif error_metric == 'absolute':
+            error_grid = np.abs(interp_linear - orig_linear)
+        else:
+            raise ValueError(
+                f"Unknown error_metric: {error_metric!r}. Use 'relative' or 'absolute'.",
+            )
+        error_grid = np.where(~np.isfinite(error_grid), 0.0, error_grid)
+
+    valid_errors = error_grid[np.isfinite(error_grid)]
+    n = valid_errors.size
+    error_statistics = {
+        'mean_error': float(np.mean(valid_errors)) if n else np.nan,
+        'max_error': float(np.max(valid_errors)) if n else np.nan,
+        'min_error': float(np.min(valid_errors)) if n else np.nan,
+        'std_error': float(np.std(valid_errors)) if n else np.nan,
+        'median_error': float(np.median(valid_errors)) if n else np.nan,
+        'decimation_factor': dec,
+        'interpolation_method': interpolation_method,
+        'error_metric': error_metric,
+    }
+    return error_grid, error_statistics, interp_linear, orig_linear
+
+
+def analyze_slice_interpolation(
+    x_phys: np.ndarray,
+    y_phys: np.ndarray,
+    grid: np.ndarray,
+    *,
+    x_logscale: bool = True,
+    y_logscale: bool = True,
+    target_shape: Tuple[int, int] = (60, 60),
+    x_lim: Optional[float] = None,
+    y_lim: Optional[float] = None,
+    interpolation_method: str = 'linear',
+    smoothing_order: int = 3,
+    clip_to_bounds: bool = False,
+    log_values: bool = True,
+    decimation_factor: int = 2,
+    error_metric: str = 'relative',
+    relative_threshold: float = 0.01,
+) -> Dict[str, object]:
+    """
+    Native-grid error analysis plus KoSens-style fine resampling for one slice.
+
+    Returns dict with native/fine coordinates, original & resampled linear grids,
+    error grid on the native mesh, and error statistics.
+    """
+    grid = np.asarray(grid, dtype=float)
+    x_phys = np.asarray(x_phys, dtype=float)
+    y_phys = np.asarray(y_phys, dtype=float)
+
+    x_phys, x_idx = _filter_axis_by_limit(x_phys, x_logscale, x_lim)
+    y_phys, y_idx = _filter_axis_by_limit(y_phys, y_logscale, y_lim)
+    grid = grid[np.ix_(y_idx, x_idx)]
+
+    x_phys, y_phys, grid = align_grid_axes_ascending(
+        x_phys, y_phys, grid, x_logscale=x_logscale, y_logscale=y_logscale,
+    )
+    grid = impute_grid_kosens(grid, log_values=log_values)
+
+    if log_values:
+        min_positive = (
+            float(np.nanmin(grid[grid > 0])) if np.any(grid > 0) else 1e-30
+        )
+        grid_log10 = np.log10(np.maximum(grid, min_positive))
+    else:
+        with np.errstate(divide='ignore'):
+            grid_log10 = np.log10(np.maximum(grid, np.finfo(float).tiny))
+
+    error_grid, error_stats, _, orig_linear = calculate_interpolation_error_kosens(
+        grid_log10,
+        interpolation_method=interpolation_method,
+        smoothing_order=smoothing_order,
+        clip_to_bounds=clip_to_bounds,
+        decimation_factor=decimation_factor,
+        error_metric=error_metric,
+        relative_threshold=relative_threshold,
+    )
+
+    final_x, final_y, resampled = resample_grid_2d_kosens(
+        x_phys, y_phys, grid,
+        x_logscale=x_logscale,
+        y_logscale=y_logscale,
+        target_shape=target_shape,
+        interpolation_method=interpolation_method,
+        smoothing_order=smoothing_order,
+        clip_to_bounds=clip_to_bounds,
+        log_values=log_values,
+    )
+
+    return dict(
+        x_native=x_phys,
+        y_native=y_phys,
+        original_linear=orig_linear,
+        x_fine=final_x,
+        y_fine=final_y,
+        resampled_linear=resampled,
+        error_grid=error_grid,
+        error_stats=error_stats,
+    )

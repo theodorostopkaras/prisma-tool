@@ -50,11 +50,23 @@ from plotly.subplots import make_subplots
 import grid_fit as gf
 import grid_interp as gi
 import model_config as mc
+import simline_spectra as ss
+import obs_spectrum_fits as osf
+import cr_attenuation as cra
+import grid_naming as gn
 
 
 # --- CLI ----------------------------------------------------------------------
 
-DEFAULT_DIR = '/home/teotopkaras/Desktop/Teo_AR_included_grid/pdrgrid_hdf5'
+OBS_ROW_OPTIONS = [
+    {'label': ' Mean (all spectra / pixels)', 'value': 'mean'},
+    {'label': ' Peak region (bright half)', 'value': 'peak'},
+    {'label': ' Single row / pixel index', 'value': 'row'},
+]
+DEFAULT_OBS_V_LOW = -20.0
+DEFAULT_OBS_V_HIGH = 20.0
+DEFAULT_DIR = '/home/teotopkaras/Desktop/new_teo_grid/pdrgrid_hdf5'
+
 
 parser = argparse.ArgumentParser(description="KOSMA-tau Grid Explorer")
 parser.add_argument('--dir', default=DEFAULT_DIR, type=str,
@@ -92,11 +104,20 @@ REACT_RANKING_OPTIONS = [
 DEFAULT_REACT_RANKING = 'fractional_contribution'
 
 SIMLINE_DEFAULT_SPECIES = 'CO'
-SIMLINE_DEFAULT_IDEF = 'jtemp'                      # jtemp (K km/s) or jerg
+SIMLINE_DEFAULT_IDEF = 'jtemp'                      # jtemp, jerg, or tau
 SIMLINE_IDEF_OPTIONS = [
     {'label': ' I [K km/s]  (jtemp)', 'value': 'jtemp'},
     {'label': ' I [erg s\u207B\u00B9 cm\u207B\u00B2 Hz\u207B\u00B9]  (jerg)', 'value': 'jerg'},
+    {'label': ' \u03c4  optical depth  (tau)', 'value': 'tau'},
 ]
+SIMLINE_MAPFIT_IDEF_OPTIONS = [
+    o for o in SIMLINE_IDEF_OPTIONS if o['value'] in ('jtemp', 'jerg')
+]
+SIMLINE_PV_QUANTITY_OPTIONS = [
+    {'label': ' T<sub>mb</sub> [K]  (brightness temperature)', 'value': 'intensity'},
+    {'label': ' \u03c4  optical depth  (tau)', 'value': 'tau'},
+]
+SIMLINE_DEFAULT_PV_QUANTITY = 'intensity'
 
 # Attenuation x-shift matching (KoSens grid_attenuation_compare / plot_triple_grid_ratio)
 X_SHIFT_MATCH_RTOL = 0.02
@@ -191,7 +212,14 @@ KEY_NH    = 'protdens'       # proton/H nucleus density profile (Gas state, col 
 KEY_TGAS  = 'tgas'           # gas temperature  (Gas state, col 2)
 KEY_TDUST = 'tdust'          # dust temperature (Gas state, col 3)
 KEY_HEAT_CR = 'heatrate_cr'  # cosmic-ray heating component (Heating rates, col 3)
+KEY_COSRAY  = 'cosray'       # CR ionisation rate profile (Gas state)
+KEY_NH2_PROFILE = 'cd_prof_h2'  # H2 column-density profile (Local quantities)
 KEY_RADIUS  = 'radius'       # radial profile (pc) for integrated abundances
+
+CR_ATTEN_XAXIS_OPTIONS = [
+    {'label': ' N<sub>H₂</sub> [cm⁻²]', 'value': 'nh2'},
+    {'label': ' A<sub>V</sub> [mag]', 'value': 'av'},
+]
 
 PC_TO_CM = 3.08567758128e18  # parsec to cm
 
@@ -290,18 +318,12 @@ def _dec(x):
 def parse_filename(fname):
     """Return a tuple of 6 integer tokens (DD, MM, FF, ZZ, CC, AA) or None.
 
-    Works for both ``Model<tag>_DD_MM_FF_ZZ_CC_AA.hdf5`` and the chemistry-grid
-    ``chem_Model<tag>_DD_MM_FF_ZZ_CC_AA.hdf5`` by locating the ``Model`` token.
+    Works for both ``Model<tag>_DD_MM_FF_ZZ_CC_AA.hdf5`` and
+    ``Model<tag>_DD_MM_FF_ZZ_CC.hdf5`` (missing ``AA`` -> atten 0), plus
+    chemistry-grid ``chem_Model<tag>_…`` names.
     """
     stem = os.path.splitext(os.path.basename(fname))[0]
-    parts = stem.split('_')
-    mi = next((i for i, p in enumerate(parts) if p.startswith('Model')), None)
-    if mi is None or len(parts) < mi + 1 + N_PARAMS:
-        return None
-    try:
-        return tuple(int(parts[mi + p['token_idx']]) for p in PARAM_DEFS)
-    except (ValueError, IndexError):
-        return None
+    return gn.parse_model_tokens_from_stem(stem)
 
 
 def _clean_rate_label(label, kind):
@@ -374,7 +396,7 @@ def _scan_files(directory, recursive):
         files[tokens] = path
     if not files:
         raise ValueError('Found .hdf5 files but none matched the expected '
-                         'Model_DD_MM_FF_ZZ_CC_AA naming convention.')
+                         'Model_DD_MM_FF_ZZ_CC[_AA] naming convention.')
 
     axis_tokens = {}
     for d, p in enumerate(PARAM_DEFS):
@@ -539,30 +561,35 @@ def clear_chem():
 
 
 def parse_smli_filename(fname):
-    """Parse ``jtemp_Model<tag>_DD_MM_FF_ZZ_CC_AA_<species>.smli`` (or jerg_).
+    """Parse ``{jtemp,jerg,tau}_Model<tag>_DD_MM_FF_ZZ_CC_AA_<species>.smli`` (or ``.smlc``).
 
-    Returns (intensity_def, tokens, species) or None.
+    Returns (quantity_key, tokens, species) or None.
     """
     base = os.path.basename(fname)
-    if not base.endswith('.smli'):
-        return None
-    if base.startswith('jtemp_'):
-        idef, core = 'jtemp', base[len('jtemp_'):-len('.smli')]
-    elif base.startswith('jerg_'):
-        idef, core = 'jerg', base[len('jerg_'):-len('.smli')]
+    if base.endswith('.smli'):
+        ext = '.smli'
+    elif base.endswith('.smlc'):
+        ext = '.smlc'
     else:
+        return None
+
+    idef = core = None
+    for prefix, key in (('jtemp_', 'jtemp'), ('jerg_', 'jerg'), ('tau_', 'tau')):
+        if base.startswith(prefix):
+            idef, core = key, base[len(prefix):-len(ext)]
+            break
+    if idef is None:
         return None
 
     parts = core.split('_')
     mi = next((i for i, p in enumerate(parts) if p.startswith('Model')), None)
-    if mi is None or len(parts) < mi + 1 + N_PARAMS:
+    if mi is None:
         return None
-    try:
-        tokens = tuple(int(parts[mi + p['token_idx']]) for p in PARAM_DEFS)
-    except (ValueError, IndexError):
+    tokens = gn.parse_model_tokens_from_parts(parts, mi)
+    if tokens is None:
         return None
 
-    sp_start = mi + 1 + N_PARAMS
+    sp_start = mi + 1 + gn.param_token_count(parts, mi)
     if sp_start >= len(parts):
         return None
     species = '_'.join(parts[sp_start:])
@@ -626,11 +653,14 @@ def _scan_simline_directory(directory, recursive, build_by_non_atten=False):
     if not directory or not os.path.isdir(directory):
         raise FileNotFoundError(f'Directory not found: {directory!r}')
 
-    pattern = os.path.join(directory, '**', '*.smli') if recursive \
+    pattern_smli = os.path.join(directory, '**', '*.smli') if recursive \
         else os.path.join(directory, '*.smli')
-    paths = sorted(glob.glob(pattern, recursive=recursive))
+    pattern_smlc = os.path.join(directory, '**', '*.smlc') if recursive \
+        else os.path.join(directory, '*.smlc')
+    paths = sorted(set(glob.glob(pattern_smli, recursive=recursive))
+                 | set(glob.glob(pattern_smlc, recursive=recursive)))
     if not paths:
-        raise FileNotFoundError(f'No .smli files found in {directory!r}')
+        raise FileNotFoundError(f'No .smli / .smlc files found in {directory!r}')
 
     files = {}
     by_non_atten = {}
@@ -663,8 +693,8 @@ def _scan_simline_directory(directory, recursive, build_by_non_atten=False):
             ]
 
     if not files:
-        raise ValueError('Found .smli files but none matched the expected '
-                         'jtemp_Model_DD_MM_FF_ZZ_CC_AA_<species>.smli naming convention.')
+        raise ValueError('Found .smli / .smlc files but none matched the expected '
+                         'jtemp_/jerg_/tau_Model_DD_MM_FF_ZZ_CC_AA_<species> naming convention.')
 
     out = dict(
         directory=directory,
@@ -674,6 +704,13 @@ def _scan_simline_directory(directory, recursive, build_by_non_atten=False):
         n_files=len(files),
         n_skipped=skipped,
     )
+    pv_index, pv_transitions, pv_tau_index, pv_tau_transitions = ss.scan_pv_index(
+        directory, recursive=recursive)
+    out['pv_index'] = pv_index
+    out['pv_transitions'] = pv_transitions
+    out['pv_tau_index'] = pv_tau_index
+    out['pv_tau_transitions'] = pv_tau_transitions
+    out['n_pv_files'] = len(pv_index) + len(pv_tau_index)
     if build_by_non_atten:
         out['by_non_atten'] = by_non_atten
     return out
@@ -705,6 +742,60 @@ def smli_file(tokens, species, idef, overlay=False):
     return None
 
 
+def model_core_from_tokens(tokens):
+    """HDF5 / SimLine model folder stem for the current slider selection."""
+    path = current_file(tokens)
+    if not path:
+        return None
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def pv_fits_path(tokens, species, transition, quantity='intensity'):
+    """Return the PV FITS path for one model point / species / transition."""
+    if not _simline or tokens is None or not species or transition is None:
+        return None
+    key = (tuple(tokens), species, str(transition))
+    store_key = 'pv_tau_index' if quantity == 'tau' else 'pv_index'
+    path = _simline.get(store_key, {}).get(key)
+    if path and os.path.isfile(path):
+        return path
+    model_core = model_core_from_tokens(tokens)
+    if not model_core:
+        return None
+    candidate = ss.expected_pv_fits_path(
+        _simline['directory'], model_core, species, str(transition),
+        quantity=quantity)
+    return candidate if os.path.isfile(candidate) else None
+
+
+def _sp_transition_options(tokens, species, quantity='intensity'):
+    """Dropdown options for PV transitions at the current model point."""
+    if not _simline or tokens is None or not species:
+        return []
+    trans_key = 'pv_tau_transitions' if quantity == 'tau' else 'pv_transitions'
+    raw_list = _simline.get(trans_key, {}).get((tuple(tokens), species), [])
+    if not raw_list:
+        return []
+    idef = 'tau' if quantity == 'tau' else SIMLINE_DEFAULT_IDEF
+    smli_rows = {
+        r['transition']: r
+        for r in (_simline['transitions'].get((species, idef)) or [])
+    }
+
+    def _sort_key(tr):
+        row = smli_rows.get(tr)
+        if row and np.isfinite(row.get('frequency', np.nan)):
+            return float(row['frequency'])
+        return str(tr)
+
+    opts = []
+    for tr in sorted(raw_list, key=_sort_key):
+        row = smli_rows.get(tr)
+        label = row['label'] if row else _smli_transition_label(tr)
+        opts.append({'label': label, 'value': tr})
+    return opts
+
+
 def get_smli_intensity(tokens, species, idef, transition_idx, overlay=False):
     """Intensity for one grid point and transition row index."""
     path = smli_file(tokens, species, idef, overlay=overlay)
@@ -727,7 +818,17 @@ def _smli_transition_option_label(idx, transition, frequency):
 def _intensity_unit_label(idef):
     if idef == 'jerg':
         return 'erg s\u207B\u00B9 cm\u207B\u00B2 Hz\u207B\u00B9'
+    if idef == 'tau':
+        return '\u03c4'
     return 'K km/s'
+
+
+def _quantity_axis_label(idef):
+    """Y-axis / colorbar label for SIMLINE .smli quantities."""
+    if idef == 'tau':
+        return '\u03c4'
+    unit = _intensity_unit_label(idef)
+    return f'I [{unit}]'
 
 
 def _simline_transition_options(species, idef):
@@ -872,6 +973,8 @@ def get_model(filepath):
             nH     = _read_field(hf, KEY_NH),
             tgas   = _read_field(hf, KEY_TGAS),
             tdust  = _read_field(hf, KEY_TDUST),
+            cosray = _read_field(hf, KEY_COSRAY),
+            nh2_profile = _read_field(hf, KEY_NH2_PROFILE),
             radius = _read_field(hf, KEY_RADIUS),
             rel    = np.asarray(hf[RELDENS_PATH][:], dtype=float),   # (n_depth, n_species)
             dens   = np.asarray(hf[DENS_PATH][:], dtype=float),
@@ -2543,7 +2646,9 @@ def fig_intensity_contour_plane(plane, slice_idx, species, idef, transition_idx,
     except (TypeError, ValueError, IndexError):
         tlabel = str(transition_idx)
 
-    if zscale == 'log':
+    if idef == 'tau':
+        cbar_title = f'log<sub>10</sub>(\u03c4)' if zscale == 'log' else '\u03c4'
+    elif zscale == 'log':
         cbar_title = f'log<sub>10</sub>(I) [{unit}]'
     else:
         cbar_title = f'I [{unit}]'
@@ -2632,9 +2737,13 @@ def fig_intensity_spectrum(values, species, idef, theme='light'):
     freqs = np.array([r['frequency'] for r in rows], dtype=float)
     ints = np.array([r['intensity'] for r in rows], dtype=float)
     labels = [_smli_transition_label(r['transition']) for r in rows]
-    unit = _intensity_unit_label(idef or SIMLINE_DEFAULT_IDEF)
+    idef = idef or SIMLINE_DEFAULT_IDEF
+    unit = _intensity_unit_label(idef)
+    ylab = _quantity_axis_label(idef)
     sp_html = format_species_html(species)
     t = _theme_colors(theme)
+    qty_word = 'optical depths' if idef == 'tau' else 'intensities'
+    y_hover = '\u03c4 = %{y:.4g}' if idef == 'tau' else 'I = %{y:.4g}'
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
@@ -2642,18 +2751,625 @@ def fig_intensity_spectrum(values, species, idef, theme='light'):
         marker=dict(size=5, color='#1f77b4'),
         line=dict(color='#1f77b4', width=1.5),
         text=labels,
-        hovertemplate='%{text}<br>\u03BD = %{x:.4g} GHz<br>I = %{y:.4g}<extra></extra>',
+        hovertemplate=f'%{{text}}<br>\u03bd = %{{x:.4g}} GHz<br>{y_hover}<extra></extra>',
     ))
     fig.update_layout(
         **_base_layout(theme),
         title=dict(
-            text=f'{sp_html} line intensities  [{unit}]',
+            text=f'{sp_html} line {qty_word}  [{unit}]',
             font=dict(size=13, color=t['title']), x=0.02, xanchor='left'),
         xaxis=dict(**_axis_style(theme), title=dict(text='Frequency (GHz)', font=dict(size=12)),
                    type='linear'),
-        yaxis=dict(**_axis_style(theme), title=dict(text=f'I [{unit}]', font=dict(size=12)),
-                   type='log' if np.all(ints[ints > 0] > 0) else 'linear'),
+        yaxis=dict(**_axis_style(theme), title=dict(text=ylab, font=dict(size=12)),
+                   type='log' if idef != 'tau' and np.all(ints[ints > 0] > 0) else 'linear'),
     )
+    return fig
+
+
+def _obs_fit_val_err(val, err, decimals=3):
+    if not np.isfinite(val):
+        return '—'
+    if not np.isfinite(err) or err == 0:
+        return f'{val:.{decimals}g}'
+    return f'{val:.{decimals}g} ± {err:.{decimals}g}'
+
+
+def _obs_fit_summary_layout(result):
+    """Dash-native layout for observational Gaussian fit results."""
+    if result is None:
+        return html.Div()
+
+    sel = result.spectrum_selection
+    sel_detail = ''
+    if result.n_spectra_selected is not None and sel in ('mean', 'peak'):
+        if sel == 'peak' and result.peak_n_selected is not None:
+            sel_detail = (f' ({result.peak_n_selected} / {result.n_spectra} pixels')
+            if result.peak_threshold is not None:
+                sel_detail += f', threshold = {result.peak_threshold:.4g}'
+            sel_detail += ')'
+        else:
+            sel_detail = f' ({result.n_spectra_selected} / {result.n_spectra} spectra)'
+
+    cell = {'padding': '4px 10px'}
+    center = {**cell, 'textAlign': 'center'}
+    header_row = html.Tr([
+        html.Th('Component', style={**cell, 'textAlign': 'left'}),
+        html.Th('A (K)', style=center),
+        html.Th('v₀ (km/s)', style=center),
+        html.Th('σ (km/s)', style=center),
+        html.Th('∫I dv (K km/s)', style=center),
+    ], style={'backgroundColor': '#eef2f7'})
+
+    rows = [header_row]
+    errs = result.param_errors
+    for j in range(result.n_components):
+        k = 3 * j
+        rows.append(html.Tr([
+            html.Td(f'Gaussian {j + 1}', style=cell),
+            html.Td(_obs_fit_val_err(result.amplitudes[j], errs[k]), style=center),
+            html.Td(_obs_fit_val_err(result.centers[j], errs[k + 1]), style=center),
+            html.Td(_obs_fit_val_err(result.sigmas[j], errs[k + 2]), style=center),
+            html.Td(f'{float(result.integrated_intensity_per_component[j]):.4g}',
+                    style=center),
+        ]))
+
+    off_err = errs[-1] if errs.size else float('nan')
+    rows.append(html.Tr([
+        html.Td('Offset (post-cont.)', style=cell),
+        html.Td(_obs_fit_val_err(result.offset, off_err) + ' K',
+                colSpan=4, style=center),
+    ]))
+    tot = _obs_fit_val_err(
+        result.integrated_intensity_total, result.integrated_intensity_total_error)
+    rows.append(html.Tr([
+        html.Td('Total ∫I dv', style={**cell, 'fontWeight': '600'}),
+        html.Td(f'{tot} K km/s', colSpan=4,
+                style={**center, 'fontWeight': '600'}),
+    ], style={'backgroundColor': '#f0f8f0'}))
+
+    meta = [
+        html.P([
+            html.B('Observational fit'), ' — ',
+            html.Code(os.path.basename(result.file_path)),
+        ], style={'margin': '0 0 4px'}),
+        html.P(f'Selection: {sel}{sel_detail}',
+               style={'margin': '0 0 4px'}),
+        html.P(
+            f'Noise (line-free): RMS = {result.noise_sigma_rms:.4g} K, '
+            f'MAD = {result.noise_sigma_mad:.4g} K',
+            style={'margin': '0 0 8px'}),
+    ]
+    if result.mean_noise_rms is not None:
+        meta.append(html.P(
+            f'Mean per-spectrum noise: RMS = {result.mean_noise_rms:.4g} K, '
+            f'MAD = {result.mean_noise_mad:.4g} K',
+            style={'margin': '0 0 8px'}))
+
+    return html.Div(meta + [
+        html.Table(rows, style={'borderCollapse': 'collapse', 'marginTop': '4px'}),
+    ], style={'fontSize': '13px', 'lineHeight': '1.55'})
+
+
+def _run_obs_spectrum_fit(obs_path, obs_hdu, obs_row_mode, obs_row_index,
+                          obs_v_low, obs_v_high, obs_n_gauss, do_fit):
+    """Load observational spectrum; optionally run Gaussian fit."""
+    path = (obs_path or '').strip()
+    if not path or not os.path.isfile(os.path.expanduser(path)):
+        return None, None, None
+
+    try:
+        row = osf.parse_row_selection(obs_row_mode, obs_row_index)
+        v_lo = float(obs_v_low if obs_v_low is not None else DEFAULT_OBS_V_LOW)
+        v_hi = float(obs_v_high if obs_v_high is not None else DEFAULT_OBS_V_HIGH)
+        hdu = int(obs_hdu if obs_hdu is not None else 1)
+        n_g = max(1, int(obs_n_gauss or 1))
+    except (TypeError, ValueError) as exc:
+        return None, None, str(exc)
+
+    try:
+        if do_fit:
+            result = osf.spectrum_fitting(
+                path, row, v_lo, v_hi, hdu_index=hdu, n_gaussians=n_g)
+            return result.v, result.y, result
+        v, y, _, _ = osf.extract_spectrum_only(path, row, v_lo, v_hi, hdu_index=hdu)
+        return v, y, None
+    except Exception as exc:
+        return None, None, str(exc)
+
+
+def _pv_spectrum_ylabel(quantity, bunit='K'):
+    if quantity == 'tau':
+        return '\u03c4'
+    return f'T<sub>mb</sub> ({bunit})'
+
+
+def _pv_spectrum_hover_y(quantity):
+    if quantity == 'tau':
+        return '\u03c4 = %{y:.4g}'
+    return 'T<sub>mb</sub> = %{y:.4g} K'
+
+
+def fig_spectra_plot(values, species, transitions, positions_text,
+                     obs_path=None, obs_hdu=None, obs_row_mode='mean',
+                     obs_row_index=None, obs_v_low=None, obs_v_high=None,
+                     obs_n_gauss=1, obs_overlay=False, obs_fit=False,
+                     pv_quantity='intensity', theme='light'):
+    """SimLine PV spectra with optional observational overlay and Gaussian fit."""
+    t = _theme_colors(theme)
+    fig = go.Figure()
+    bunit = 'K'
+    pv_quantity = pv_quantity or SIMLINE_DEFAULT_PV_QUANTITY
+    trace_idx = 0
+    n_simline = 0
+    has_simline_request = bool(species and transitions)
+    simline_subtitle = ''
+
+    if has_simline_request and _grid and _simline:
+        if isinstance(transitions, (list, tuple)):
+            trans_list = [tr for tr in transitions if tr]
+        else:
+            trans_list = [transitions] if transitions else []
+
+        tokens = _tokens_from_values(values) if _grid else None
+        positions = ss.parse_position_list(positions_text)
+
+        if tokens is not None and trans_list:
+            y_hover = _pv_spectrum_hover_y(pv_quantity)
+            for transition in trans_list:
+                fits_path = pv_fits_path(tokens, species, transition, quantity=pv_quantity)
+                if not fits_path:
+                    continue
+                try:
+                    result = ss.load_and_average_spectrum(fits_path, positions=positions)
+                    bunit, hdr_transition = ss.pv_header_info(fits_path)
+                    if pv_quantity == 'tau':
+                        bunit = '\u03c4'
+                except Exception:
+                    continue
+                tr_label = hdr_transition or _smli_transition_label(transition)
+                n_simline += 1
+                if positions is None:
+                    velocities, spectrum, _ = result
+                    fig.add_trace(go.Scatter(
+                        x=velocities, y=spectrum, mode='lines',
+                        line=dict(color=COLORS[trace_idx % len(COLORS)], width=1.5, shape='hv'),
+                        name=f'SimLine {tr_label}',
+                        hovertemplate=(
+                            f'{tr_label}<br>v = %{{x:.3g}} km/s'
+                            f'<br>{y_hover}<extra></extra>'
+                        ),
+                    ))
+                    trace_idx += 1
+                else:
+                    velocities, spectra, selected = result
+                    spectra = np.atleast_2d(spectra)
+                    selected = np.atleast_1d(selected)
+                    for pos, spec in zip(selected, spectra):
+                        pos_name = f'{pos:.2f}"'
+                        trace_name = (f'SimLine {tr_label} @ {pos_name}'
+                                      if len(trans_list) > 1 else f'SimLine {pos_name}')
+                        fig.add_trace(go.Scatter(
+                            x=velocities, y=spec, mode='lines',
+                            line=dict(color=COLORS[trace_idx % len(COLORS)],
+                                      width=1.5, shape='hv'),
+                            name=trace_name,
+                            hovertemplate=(
+                                f'{tr_label}<br>offset = {pos:.3f}"<br>v = %{{x:.3g}} km/s'
+                                f'<br>{y_hover}<extra></extra>'
+                            ),
+                        ))
+                        trace_idx += 1
+
+            if positions is None:
+                simline_subtitle = 'SimLine spatial mean'
+            elif n_simline == 1:
+                simline_subtitle = f'SimLine, {len(selected)} position(s)'
+            else:
+                simline_subtitle = f'SimLine {n_simline} transitions'
+
+    fit_result = None
+    fit_error = None
+    if obs_overlay or obs_fit:
+        v_obs, y_obs, fit_or_err = _run_obs_spectrum_fit(
+            obs_path, obs_hdu, obs_row_mode, obs_row_index,
+            obs_v_low, obs_v_high, obs_n_gauss, do_fit=obs_fit)
+        if isinstance(fit_or_err, str):
+            fit_error = fit_or_err
+        elif fit_or_err is not None:
+            fit_result = fit_or_err
+            v_obs, y_obs = fit_result.v, fit_result.y
+
+        if v_obs is not None and y_obs is not None and obs_overlay:
+            sel = fit_result.spectrum_selection if fit_result else 'obs'
+            fig.add_trace(go.Scatter(
+                x=v_obs, y=y_obs, mode='lines',
+                line=dict(color='#d62728', width=2.0),
+                name=f'Observed ({sel})',
+                hovertemplate='v = %{x:.3g} km/s<br>T<sub>mb</sub> = %{y:.4g} K<extra></extra>',
+            ))
+            trace_idx += 1
+
+        if fit_result is not None:
+            v_fit = fit_result.v
+            fig.add_trace(go.Scatter(
+                x=v_fit, y=fit_result.cont, mode='lines',
+                line=dict(color='#888', width=1.2, dash='dot'),
+                name='Obs continuum',
+                hovertemplate='continuum = %{y:.4g}<extra></extra>',
+            ))
+            for j in range(fit_result.n_components):
+                comp = fit_result.cont + fit_result.offset + fit_result.gaussian_components[j]
+                fig.add_trace(go.Scatter(
+                    x=v_fit, y=comp, mode='lines',
+                    line=dict(color='#ff7f0e', width=1.2, dash='dash'),
+                    name=f'Obs Gauss {j + 1}',
+                    hovertemplate=f'Gauss {j + 1}<extra></extra>',
+                ))
+            fig.add_trace(go.Scatter(
+                x=v_fit, y=fit_result.fit_total, mode='lines',
+                line=dict(color='#2ca02c', width=2.0),
+                name='Obs total fit',
+                hovertemplate='fit = %{y:.4g}<extra></extra>',
+            ))
+            v_lo = float(obs_v_low if obs_v_low is not None else DEFAULT_OBS_V_LOW)
+            v_hi = float(obs_v_high if obs_v_high is not None else DEFAULT_OBS_V_HIGH)
+            for vlim, lbl in ((v_lo, 'line core low'), (v_hi, 'line core high')):
+                fig.add_vline(x=vlim, line=dict(color='rgba(60,120,200,0.45)',
+                                                width=1, dash='dot'))
+
+    if not fig.data:
+        if fit_error:
+            return placeholder_fig(f'Observational spectrum: {fit_error}', theme=theme), None, fit_error
+        if has_simline_request:
+            if not _grid:
+                return placeholder_fig('Load a main grid directory', theme=theme), None, None
+            if not _simline:
+                return placeholder_fig('Load a SIMLINE directory on the Load tab',
+                                       theme=theme), None, None
+            return placeholder_fig('Select species and transition(s)', theme=theme), None, None
+        if obs_path and str(obs_path).strip():
+            return placeholder_fig('Enter a valid observational FITS path', theme=theme), None, None
+        return placeholder_fig('Load SimLine data and/or an observational FITS cube',
+                              theme=theme), None, None
+
+    sp_html = format_species_html(species) if species else ''
+    if n_simline == 1 and species:
+        title = f'{sp_html} spectrum  [{simline_subtitle}]'
+    elif n_simline > 1:
+        title = f'{sp_html} — {n_simline} SimLine transitions'
+    elif fit_result is not None:
+        title = f'Observed spectrum — {os.path.basename(fit_result.file_path)}'
+    elif obs_overlay:
+        title = 'Observed + SimLine spectra'
+    else:
+        title = 'Spectra'
+
+    if obs_overlay and n_simline > 0:
+        title += ' + observation'
+    elif fit_result is not None and not obs_overlay:
+        title += ' (fit only)'
+
+    layout_kw = {
+        **_base_layout(theme),
+        'height': 380,
+        'title': dict(text=title, font=dict(size=13, color=t['title']),
+                      x=0.02, xanchor='left'),
+        'xaxis': dict(**_axis_style(theme),
+                      title=dict(text='Velocity (km/s)', font=dict(size=12)),
+                      type='linear'),
+        'yaxis': dict(**_axis_style(theme),
+                      title=dict(text=_pv_spectrum_ylabel(pv_quantity, bunit),
+                                 font=dict(size=12)),
+                      type='linear'),
+        'showlegend': len(fig.data) > 1,
+    }
+    fig.update_layout(**layout_kw)
+    summary = _obs_fit_summary_layout(fit_result) if fit_result else html.Div()
+    if fit_error and not fit_result:
+        summary = html.Span(fit_error, style={'color': '#d62728'})
+    return fig, summary, fit_error
+
+
+def fig_simline_spectrum(values, species, transitions, positions_text, theme='light'):
+    """Backward-compatible wrapper (SimLine only, no observation)."""
+    fig, _, _ = fig_spectra_plot(
+        values, species, transitions, positions_text, theme=theme)
+    return fig
+
+
+def fig_simline_pv(values, species, transition, pos_min, pos_max, zscale,
+                   colorscale, pv_quantity='intensity', theme='light'):
+    """Position-velocity diagram from a SimLine PV FITS cube."""
+    if not _grid:
+        return placeholder_fig('Load a main grid directory', theme=theme)
+    if not _simline:
+        return placeholder_fig('Load a SIMLINE directory on the Load tab', theme=theme)
+    if isinstance(transition, (list, tuple)):
+        transition = transition[0] if transition else None
+    if not species or not transition:
+        return placeholder_fig('Select species and transition', theme=theme)
+
+    tokens = _tokens_from_values(values)
+    if tokens is None:
+        return placeholder_fig('No model file for this parameter combination', theme=theme)
+
+    pv_quantity = pv_quantity or SIMLINE_DEFAULT_PV_QUANTITY
+    fits_path = pv_fits_path(tokens, species, transition, quantity=pv_quantity)
+    if not fits_path:
+        return placeholder_fig('No PV FITS file for this transition', theme=theme)
+
+    pos_range = None
+    if pos_min is not None and pos_max is not None:
+        try:
+            p0, p1 = float(pos_min), float(pos_max)
+            if np.isfinite(p0) and np.isfinite(p1):
+                pos_range = (min(p0, p1), max(p0, p1))
+        except (TypeError, ValueError):
+            pos_range = None
+
+    try:
+        positions, velocities, data, header = ss.load_pv_diagram(
+            fits_path, position_range=pos_range)
+    except Exception as exc:
+        return placeholder_fig(f'Could not read PV FITS: {exc}', theme=theme)
+
+    zplot = np.asarray(data, dtype=float)
+    if zscale == 'log' and pv_quantity != 'tau':
+        zplot = np.where(zplot > 0, zplot, np.nan)
+
+    if pv_quantity == 'tau':
+        z_label = '\u03c4'
+        z_hover = '\u03c4 = %{z:.4g}'
+    else:
+        bunit = ss.brightness_unit_from_header(header)
+        z_label = f'T<sub>mb</sub> ({bunit})'
+        z_hover = 'T<sub>mb</sub> = %{z:.4g}'
+    tr_label = ss.transition_from_header(header) or _smli_transition_label(transition)
+    sp_html = format_species_html(species)
+    t = _theme_colors(theme)
+
+    fig = go.Figure(go.Heatmap(
+        x=positions, y=velocities, z=zplot,
+        colorscale=colorscale or 'Inferno',
+        colorbar=dict(title=dict(text=z_label)),
+        hovertemplate=(
+            'offset = %{x:.3f}"<br>v = %{y:.3g} km/s'
+            f'<br>{z_hover}<extra></extra>'
+        ),
+    ))
+    layout_kw = {
+        **_base_layout(theme),
+        'height': 520,
+        'title': dict(
+            text=f'PV diagram — {sp_html} {tr_label}',
+            font=dict(size=13, color=t['title']), x=0.02, xanchor='left'),
+        'xaxis': dict(**_axis_style(theme),
+                      title=dict(text='Position offset (arcsec)', font=dict(size=12)),
+                      type='linear'),
+        'yaxis': dict(**_axis_style(theme),
+                      title=dict(text='Velocity (km/s)', font=dict(size=12)),
+                      type='linear'),
+    }
+    fig.update_layout(**layout_kw)
+    return fig
+
+
+def _tokens_key(tokens):
+    return tuple(int(t) for t in tokens)
+
+
+def _filepath_for_tokens(tokens):
+    """Resolve an HDF5 path from a token tuple (main grid, then overlay)."""
+    if not tokens:
+        return None
+    key = _tokens_key(tokens)
+    if _grid:
+        path = _grid.get('files', {}).get(key)
+        if path:
+            return path
+    if _overlay:
+        path = _overlay.get('files', {}).get(key)
+        if path:
+            return path
+    return None
+
+
+def _model_profile_label(tokens, include_atten=True):
+    """Legend label from model token tuple: n_H, FUV χ, and ζ (optional atten tag)."""
+    if not tokens or len(tokens) < N_PARAMS:
+        return 'model'
+    dens = PARAM_DEFS[_PARAM_IDX['density']]['decode'](tokens[_PARAM_IDX['density']])
+    fuv = PARAM_DEFS[_PARAM_IDX['fuv']]['decode'](tokens[_PARAM_IDX['fuv']])
+    zeta = PARAM_DEFS[_PARAM_IDX['crir']]['decode'](tokens[_PARAM_IDX['crir']])
+    parts = [
+        f'n<sub>H</sub> = {_sci_label(dens)} cm\u207b\u00b3',
+        f'\u03c7 = {_sci_label(fuv)}',
+        f'\u03b6 = {_sci_label(zeta)} s\u207b\u00b9',
+    ]
+    if include_atten:
+        parts.append(f'atten {tokens[_PARAM_IDX["atten"]]:02d}')
+    return ', '.join(parts)
+
+
+def _cr_atten_profile_label(tokens):
+    """Legend label for one CR attenuation model profile."""
+    return _model_profile_label(tokens, include_atten=True)
+
+
+def _overlay_variants_for_sliders(values):
+    """All overlay models matching the current density / mass / FUV / metallicity."""
+    if not _overlay or not _grid:
+        return []
+    tokens = _tokens_from_values(values)
+    if tokens is None:
+        return []
+    prefix = tuple(tokens[:4])
+    out = []
+    for tok in _overlay['files']:
+        if tuple(tok[:4]) == prefix:
+            out.append(list(tok))
+    return sorted(out)
+
+
+def _plotly_log_range(vmin, vmax):
+    """Plotly log-axis ``range`` is in log10(data) units, not linear data values."""
+    return [float(np.log10(vmin)), float(np.log10(vmax))]
+
+
+def _cr_atten_profile_curve(model, x_axis='nh2', extrapolate=True):
+    """Return (x, zeta_h2) arrays for one loaded model."""
+    if model is None:
+        return None, None
+    cosray = model.get('cosray')
+    if cosray is None:
+        return None, None
+    zeta = cra.zeta_h2_from_cosray(cosray)
+    if x_axis == 'av':
+        x = model.get('av')
+        x_label_kind = 'av'
+    else:
+        x = model.get('nh2_profile')
+        x_label_kind = 'nh2'
+    if x is None:
+        return None, None
+    x, zeta = _align_depth_profiles(x, zeta)
+    x = np.asarray(x, dtype=float)
+    zeta = np.asarray(zeta, dtype=float)
+    mask = np.isfinite(x) & np.isfinite(zeta) & (x > 0) & (zeta > 0)
+    x, zeta = x[mask], zeta[mask]
+    if x.size == 0:
+        return None, None
+    if extrapolate and x_label_kind == 'nh2':
+        x, zeta = cra.extrapolate_profile_loglog(x, zeta)
+    return x, zeta
+
+
+def _add_padovani_band(fig, n_h2, zeta, color, name, show_legend=True):
+    """Add a Padovani reference line and ± factor-of-2 band."""
+    z_lo = zeta / 2.0
+    z_hi = zeta * 2.0
+    fig.add_trace(go.Scatter(
+        x=n_h2, y=zeta, mode='lines',
+        line=dict(color=color, width=2),
+        name=name,
+        legendgroup=name,
+        showlegend=show_legend,
+        hovertemplate='N<sub>H₂</sub> = %{x:.3g} cm⁻²<br>ζ = %{y:.3g} s⁻¹<extra></extra>',
+    ))
+    fig.add_trace(go.Scatter(
+        x=np.concatenate([n_h2, n_h2[::-1]]),
+        y=np.concatenate([z_hi, z_lo[::-1]]),
+        fill='toself',
+        fillcolor=_hex_to_rgba(color, 0.25),
+        line=dict(width=0),
+        showlegend=False,
+        legendgroup=name,
+        hoverinfo='skip',
+    ))
+
+
+def _hex_to_rgba(color, alpha):
+    named = {
+        'blue': '#1f77b4', 'green': '#2ca02c', 'orange': '#ff7f0e',
+        'red': '#d62728',
+    }
+    hex_color = named.get(color, color)
+    if isinstance(hex_color, str) and hex_color.startswith('#') and len(hex_color) == 7:
+        r = int(hex_color[1:3], 16)
+        g = int(hex_color[3:5], 16)
+        b = int(hex_color[5:7], 16)
+        return f'rgba({r},{g},{b},{alpha})'
+    return f'rgba(128,128,128,{alpha})'
+
+
+def fig_cr_attenuation(profiles, active_keys, x_axis='nh2', show_padovani=True,
+                       extrapolate=True, stopping_rate=None, show_threshold=True,
+                       theme='light'):
+    """ζ_H2 attenuation profiles with optional Padovani reference bands."""
+    t = _theme_colors(theme)
+    fig = go.Figure()
+    stopping_rate = float(stopping_rate or cra.DEFAULT_STOPPING_RATE)
+    x_axis = x_axis or 'nh2'
+    active = set(active_keys or [])
+
+    if show_padovani and x_axis == 'nh2':
+        n_ref, (z_l, z_h, z_u) = cra.padovani_reference_grid()
+        for _tag, _coef, color, name in cra.PADOVANI_MODELS:
+            zeta = {'L': z_l, 'H': z_h, 'U': z_u}[_tag]
+            _add_padovani_band(fig, n_ref, zeta, color, name)
+
+    threshold_x = None
+    if show_threshold and x_axis == 'nh2' and stopping_rate > 0:
+        # Match CR_atten_plot.ipynb: axvline(stopping_rate), not profile-derived N_H2.
+        threshold_x = float(stopping_rate)
+
+    n_plotted = 0
+    for entry in profiles or []:
+        key = entry.get('key')
+        if key not in active:
+            continue
+        path = _filepath_for_tokens(entry.get('tokens'))
+        if not path:
+            continue
+        try:
+            model = get_model(path)
+        except Exception:
+            continue
+        x, zeta = _cr_atten_profile_curve(model, x_axis=x_axis, extrapolate=extrapolate)
+        if x is None:
+            continue
+        color = COLORS[n_plotted % len(COLORS)]
+        label = _cr_atten_profile_label(entry.get('tokens'))
+        fig.add_trace(go.Scatter(
+            x=x, y=zeta, mode='lines',
+            line=dict(color=color, width=3),
+            name=label,
+            hovertemplate=(
+                'x = %{x:.3g}<br>ζ<sub>H₂</sub> = %{y:.3g} s⁻¹<extra></extra>'
+            ),
+        ))
+        n_plotted += 1
+
+    if not fig.data:
+        msg = 'Add model profiles with the buttons above'
+        if not _grid:
+            msg = 'Load a grid directory on the Load tab'
+        return placeholder_fig(msg, theme=theme)
+
+    if show_threshold and threshold_x is not None and np.isfinite(threshold_x):
+        fig.add_vline(
+            x=threshold_x,
+            line=dict(color='black', dash='dashdot', width=1.5),
+        )
+
+    if x_axis == 'av':
+        x_title = 'A<sub>V</sub> (mag)'
+        x_type = 'log'
+        x_range = _plotly_log_range(1e-2, 1e3)
+    else:
+        x_title = 'N<sub>H₂</sub> (cm⁻²)'
+        x_type = 'log'
+        x_range = _plotly_log_range(cra.DEFAULT_NH2_MIN, cra.DEFAULT_NH2_MAX)
+
+    y_range = _plotly_log_range(cra.DEFAULT_ZETA_MIN, cra.DEFAULT_ZETA_MAX)
+
+    layout_kw = {
+        **_base_layout(theme),
+        'height': 560,
+        'title': dict(
+            text='Cosmic-ray attenuation profiles',
+            font=dict(size=14, color=t['title']), x=0.02, xanchor='left'),
+        'xaxis': dict(**_axis_style(theme),
+                      title=dict(text=x_title, font=dict(size=13)),
+                      type=x_type, range=x_range),
+        'yaxis': dict(**_axis_style(theme),
+                      title=dict(text='ζ<sub>H₂</sub> (s⁻¹)', font=dict(size=13)),
+                      type='log',
+                      range=y_range),
+        'showlegend': True,
+        'legend': dict(font=dict(size=11)),
+    }
+    fig.update_layout(**layout_kw)
     return fig
 
 
@@ -3204,6 +3920,7 @@ app.layout = html.Div(
                 html.Div(id='simline-status',
                          style={'marginTop': '6px', 'fontSize': '13px', 'minHeight': '20px'}),
                 dcc.Store(id='simline-state', data=0),
+                dcc.Store(id='cr-atten-profiles', data=[]),
             ]),
         ]),
 
@@ -3368,7 +4085,7 @@ app.layout = html.Div(
                        style=_PAGE_INTRO),
                 html.Div([
                     html.Div([
-                        html.Label('Intensity units', style=_CTRL_LABEL),
+                        html.Label('Quantity', style=_CTRL_LABEL),
                         dcc.RadioItems(id='int-idef', options=SIMLINE_IDEF_OPTIONS,
                                        value=SIMLINE_DEFAULT_IDEF, **_RADIO),
                     ], style={'flex': '1.4', 'minWidth': '220px', 'marginRight': '18px'}),
@@ -3402,7 +4119,131 @@ app.layout = html.Div(
             ]),
         ]),
 
-        # --- Page 7: interpolation error check --------------------------------
+        # --- Page 7: SIMLINE spectra (PV FITS) --------------------------------
+        dcc.Tab(label='Spectra', value='spectra', style=_TAB_STYLE,
+                selected_style=_TAB_SEL, children=[
+            html.Div(style={'paddingTop': '10px'}, children=[
+                html.P('Velocity-resolved spectra and position–velocity diagrams from SimLine '
+                       'PV FITS cubes (brightness temperature or optical depth), with optional '
+                       'observational CLASS MATRIX / cube FITS overlay and multi-Gaussian '
+                       'line fitting.',
+                       style=_PAGE_INTRO),
+                html.Div([
+                    html.Div([
+                        html.Label('Quantity', style=_CTRL_LABEL),
+                        dcc.RadioItems(id='sp-quantity', options=SIMLINE_PV_QUANTITY_OPTIONS,
+                                       value=SIMLINE_DEFAULT_PV_QUANTITY, **_RADIO),
+                    ], style={'flex': '1.4', 'minWidth': '220px', 'marginRight': '18px'}),
+                    html.Div([
+                        html.Label('Species', style=_CTRL_LABEL),
+                        dcc.Dropdown(id='sp-species', options=[], value=None,
+                                     placeholder='Load a SIMLINE directory\u2026',
+                                     style={'fontSize': '13px'}),
+                    ], style={'flex': '1', 'minWidth': '140px', 'marginRight': '18px'}),
+                    html.Div([
+                        html.Label('Transition(s)', style=_CTRL_LABEL),
+                        dcc.Dropdown(id='sp-transition', options=[], value=[],
+                                     multi=True,
+                                     placeholder='Select species\u2026',
+                                     style={'fontSize': '13px'}),
+                    ], style={'flex': '1.8', 'minWidth': '240px', 'marginRight': '18px'}),
+                    html.Div([
+                        html.Label('Position offsets (arcsec)', style=_CTRL_LABEL),
+                        dcc.Input(id='sp-positions', type='text', value='',
+                                  placeholder='empty = spatial mean; e.g. 0, 21, 42',
+                                  style={'width': '100%', 'fontSize': '13px'}),
+                    ], style={'flex': '2', 'minWidth': '220px', 'marginRight': '18px'}),
+                    html.Div([
+                        html.Label('PV Z scale', style=_CTRL_LABEL),
+                        dcc.RadioItems(id='sp-zscale', options=_SCALE_OPTIONS,
+                                       value='linear', **_RADIO),
+                    ], style={**_CTRL_BOX, 'marginRight': '18px'}),
+                    html.Div([
+                        html.Label('PV colormap', style=_CTRL_LABEL),
+                        dcc.Dropdown(id='sp-colorscale', options=GRID_COLORMAP_OPTIONS,
+                                     value=DEFAULT_GRID_COLORMAP,
+                                     style={'fontSize': '13px'}),
+                    ], style={'flex': '1', 'minWidth': '120px'}),
+                ], style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
+                          'padding': '12px 18px', 'backgroundColor': '#f3f6fa',
+                          'borderRadius': '8px', 'marginBottom': '12px'}),
+                html.Div([
+                    html.Div([
+                        html.Label('PV position min (arcsec)', style=_CTRL_LABEL),
+                        dcc.Input(id='sp-pos-min', type='number', value=None,
+                                  placeholder='auto', style={'width': '100%'}),
+                    ], style={'flex': '1', 'minWidth': '140px', 'marginRight': '18px'}),
+                    html.Div([
+                        html.Label('PV position max (arcsec)', style=_CTRL_LABEL),
+                        dcc.Input(id='sp-pos-max', type='number', value=None,
+                                  placeholder='auto', style={'width': '100%'}),
+                    ], style={'flex': '1', 'minWidth': '140px'}),
+                ], style={'display': 'flex', 'alignItems': 'flex-end',
+                          'padding': '0 18px 12px', 'marginBottom': '4px'}),
+                html.Div([
+                    html.H4('Observational spectrum (FITS cube / CLASS MATRIX)',
+                            style={'margin': '0 0 8px', 'fontSize': '14px', 'color': '#444'}),
+                    html.Div([
+                        html.Div([
+                            html.Label('FITS file path', style=_CTRL_LABEL),
+                            dcc.Input(id='obs-fits-path', type='text', value='',
+                                      placeholder='/path/to/cube.fits or matrix table',
+                                      style={'width': '100%', 'fontSize': '13px'}),
+                        ], style={'flex': '3', 'minWidth': '280px', 'marginRight': '18px'}),
+                        html.Div([
+                            html.Label('HDU index', style=_CTRL_LABEL),
+                            dcc.Input(id='obs-hdu', type='number', value=1, min=0, step=1,
+                                      style={'width': '100%'}),
+                        ], style={'flex': '0.6', 'minWidth': '70px', 'marginRight': '18px'}),
+                        html.Div([
+                            html.Label('Spectrum selection', style=_CTRL_LABEL),
+                            dcc.Dropdown(id='obs-row-mode', options=OBS_ROW_OPTIONS,
+                                         value='peak', style={'fontSize': '13px'}),
+                        ], style={'flex': '1.4', 'minWidth': '180px', 'marginRight': '18px'}),
+                        html.Div([
+                            html.Label('Row / pixel index', style=_CTRL_LABEL),
+                            dcc.Input(id='obs-row-index', type='number', value=0, min=0,
+                                      step=1, style={'width': '100%'}),
+                        ], style={'flex': '0.8', 'minWidth': '90px', 'marginRight': '18px'}),
+                        html.Div([
+                            html.Label('N Gaussians', style=_CTRL_LABEL),
+                            dcc.Input(id='obs-n-gauss', type='number', value=1, min=1,
+                                      max=6, step=1, style={'width': '100%'}),
+                        ], style={'flex': '0.7', 'minWidth': '80px'}),
+                    ], style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
+                              'marginBottom': '10px'}),
+                    html.Div([
+                        html.Div([
+                            html.Label('Line core low (km/s)', style=_CTRL_LABEL),
+                            dcc.Input(id='obs-v-low', type='number', value=DEFAULT_OBS_V_LOW,
+                                      step=0.5, style={'width': '100%'}),
+                        ], style={'flex': '1', 'minWidth': '120px', 'marginRight': '18px'}),
+                        html.Div([
+                            html.Label('Line core high (km/s)', style=_CTRL_LABEL),
+                            dcc.Input(id='obs-v-high', type='number', value=DEFAULT_OBS_V_HIGH,
+                                      step=0.5, style={'width': '100%'}),
+                        ], style={'flex': '1', 'minWidth': '120px', 'marginRight': '18px'}),
+                        html.Div([
+                            dcc.Checklist(id='obs-overlay', options=[
+                                {'label': ' Overlay on SimLine spectrum', 'value': 'on'},
+                            ], value=['on'], style={'fontSize': '13px'}),
+                        ], style={'flex': '1.4', 'minWidth': '200px', 'marginRight': '18px'}),
+                        html.Div([
+                            dcc.Checklist(id='obs-fit', options=[
+                                {'label': ' Fit Gaussians (+ continuum)', 'value': 'on'},
+                            ], value=['on'], style={'fontSize': '13px'}),
+                        ], style={'flex': '1.4', 'minWidth': '200px'}),
+                    ], style={'display': 'flex', 'alignItems': 'center', 'flexWrap': 'wrap'}),
+                ], style={'padding': '12px 18px', 'backgroundColor': '#faf6f0',
+                          'borderRadius': '8px', 'marginBottom': '12px'}),
+                dcc.Graph(id='plot-sp-spectrum', figure=placeholder_fig(), config=_GRAPH_CFG,
+                          style={'marginBottom': '8px'}),
+                html.Div(id='sp-fit-summary', style={'padding': '0 18px 12px'}),
+                dcc.Graph(id='plot-sp-pv', figure=placeholder_fig(), config=_GRAPH_CFG),
+            ]),
+        ]),
+
+        # --- Page 8: interpolation error check --------------------------------
         dcc.Tab(label='Interpolation error', value='interperror', style=_TAB_STYLE,
                 selected_style=_TAB_SEL, children=[
             html.Div(style={'paddingTop': '10px'}, children=[
@@ -3433,7 +4274,7 @@ app.layout = html.Div(
                                      style={'fontSize': '13px'}),
                     ], style={'flex': '1.2', 'minWidth': '160px', 'marginRight': '18px'}),
                     html.Div([
-                        html.Label('Intensity units', style=_CTRL_LABEL),
+                        html.Label('Quantity', style=_CTRL_LABEL),
                         dcc.RadioItems(id='ie-int-idef', options=SIMLINE_IDEF_OPTIONS,
                                        value=SIMLINE_DEFAULT_IDEF, **_RADIO),
                     ], style={**_CTRL_BOX, 'marginRight': '0'}),
@@ -3447,7 +4288,72 @@ app.layout = html.Div(
             ]),
         ]),
 
-        # --- Page 8: observational map fit ----------------------------------
+        # --- Page 9: CR attenuation profiles ----------------------------------
+        dcc.Tab(label='CR attenuation', value='cratten', style=_TAB_STYLE,
+                selected_style=_TAB_SEL, children=[
+            html.Div(style={'paddingTop': '10px'}, children=[
+                html.P('Cosmic-ray ionisation rate ζ<sub>H₂</sub> vs column density, '
+                       'following the KoSens CR_atten_plot notebook. Padovani et al. '
+                       '(2018/2024) reference bands 𝓛, 𝓗, 𝓤 are always available; '
+                       'add one or more KOSMA model profiles from the sliders or overlay grid.',
+                       style=_PAGE_INTRO),
+                html.Div([
+                    html.Div([
+                        html.Label('X axis', style=_CTRL_LABEL),
+                        dcc.RadioItems(id='cr-atten-xaxis', options=CR_ATTEN_XAXIS_OPTIONS,
+                                       value='nh2', **_RADIO),
+                    ], style={'flex': '1', 'minWidth': '160px', 'marginRight': '18px'}),
+                    html.Div([
+                        html.Label('N<sub>H₂</sub> threshold line (cm⁻²)', style=_CTRL_LABEL),
+                        dcc.Input(id='cr-atten-stop-rate', type='number',
+                                  value=cra.DEFAULT_STOPPING_RATE,
+                                  placeholder='1e20',
+                                  style={'width': '100%', 'fontSize': '13px'}),
+                    ], style={'flex': '1', 'minWidth': '160px', 'marginRight': '18px'}),
+                    html.Div([
+                        dcc.Checklist(
+                            id='cr-atten-options',
+                            options=[
+                                {'label': ' Padovani 𝓛 / 𝓗 / 𝓤 bands', 'value': 'padovani'},
+                                {'label': ' Extrapolate profiles to 10²⁵ cm⁻²', 'value': 'extrap'},
+                                {'label': ' Attenuation threshold line', 'value': 'threshold'},
+                            ],
+                            value=['padovani', 'extrap', 'threshold'],
+                            style={'fontSize': '13px'},
+                        ),
+                    ], style={'flex': '1.6', 'minWidth': '240px'}),
+                ], style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
+                          'padding': '12px 18px', 'backgroundColor': '#f3f6fa',
+                          'borderRadius': '8px', 'marginBottom': '10px'}),
+                html.Div([
+                    html.Button('Add current model', id='cr-atten-add', n_clicks=0,
+                                style={'padding': '8px 16px', 'marginRight': '8px',
+                                       'backgroundColor': '#1f77b4', 'color': 'white',
+                                       'border': 'none', 'borderRadius': '6px',
+                                       'cursor': 'pointer', 'fontSize': '13px',
+                                       'fontWeight': '600'}),
+                    html.Button('Add all overlay matches', id='cr-atten-add-overlay', n_clicks=0,
+                                style={'padding': '8px 16px', 'marginRight': '8px',
+                                       'backgroundColor': '#8c564b', 'color': 'white',
+                                       'border': 'none', 'borderRadius': '6px',
+                                       'cursor': 'pointer', 'fontSize': '13px',
+                                       'fontWeight': '600'}),
+                    html.Button('Clear profiles', id='cr-atten-clear', n_clicks=0,
+                                style={'padding': '8px 16px', 'backgroundColor': '#eee',
+                                       'color': '#555', 'border': '1px solid #ccc',
+                                       'borderRadius': '6px', 'cursor': 'pointer',
+                                       'fontSize': '13px'}),
+                ], style={'padding': '0 18px 10px'}),
+                html.Div([
+                    html.Label('Profiles to plot', style=_CTRL_LABEL),
+                    dcc.Checklist(id='cr-atten-active', options=[], value=[],
+                                  style={'fontSize': '13px'}),
+                ], style={'padding': '0 18px 12px'}),
+                dcc.Graph(id='plot-cr-atten', figure=placeholder_fig(), config=_GRAPH_CFG),
+            ]),
+        ]),
+
+        # --- Page 10: observational map fit ---------------------------------
         dcc.Tab(label='Map fit', value='mapfit', style=_TAB_STYLE,
                 selected_style=_TAB_SEL, children=[
             html.Div(style={'paddingTop': '10px'}, children=[
@@ -3459,7 +4365,7 @@ app.layout = html.Div(
                 html.Div([
                     html.Div([
                         html.Label('Intensity units (SIMLINE)', style=_CTRL_LABEL),
-                        dcc.RadioItems(id='fit-idef', options=SIMLINE_IDEF_OPTIONS,
+                        dcc.RadioItems(id='fit-idef', options=SIMLINE_MAPFIT_IDEF_OPTIONS,
                                        value=SIMLINE_DEFAULT_IDEF, **_RADIO),
                     ], style={'flex': '1.2', 'minWidth': '200px', 'marginRight': '18px'}),
                     html.Div([
@@ -4079,6 +4985,8 @@ def handle_chem(n_load, n_clear, directory, recursive, state, cur_species):
     Output('int-species', 'value'),
     Output('ie-int-species', 'options'),
     Output('ie-int-species', 'value'),
+    Output('sp-species', 'options'),
+    Output('sp-species', 'value'),
     Input('btn-load-simline', 'n_clicks'),
     Input('btn-clear-simline', 'n_clicks'),
     State('simline-dir-input', 'value'),
@@ -4086,23 +4994,25 @@ def handle_chem(n_load, n_clear, directory, recursive, state, cur_species):
     State('simline-state', 'data'),
     State('int-species', 'value'),
     State('ie-int-species', 'value'),
+    State('sp-species', 'value'),
     prevent_initial_call=True,
 )
-def handle_simline(n_load, n_clear, directory, recursive, state, cur_species, cur_ie_species):
+def handle_simline(n_load, n_clear, directory, recursive, state,
+                   cur_species, cur_ie_species, cur_sp_species):
     trigger = dash.callback_context.triggered[0]['prop_id'] if dash.callback_context.triggered else ''
     state = (state or 0)
 
     if trigger.startswith('btn-clear-simline'):
         clear_simline()
         return (html.Span('SIMLINE directory cleared.', style={'color': '#888'}),
-                state + 1, [], None, [], None)
+                state + 1, [], None, [], None, [], None)
 
     try:
         sl = scan_simline(directory or '', recursive=bool(recursive))
     except Exception as exc:
         return (html.Span(f'\u2717  {exc}',
                           style={'color': '#d62728', 'fontWeight': '600'}),
-                state + 1, [], None, [], None)
+                state + 1, [], None, [], None, [], None)
 
     preferred = [s for s in ('CO', '13CO', 'C18O', 'HCO+', 'N2H+', 'CS', 'HCN', 'C+', 'CI')
                  if s in sl['species']]
@@ -4112,15 +5022,19 @@ def handle_simline(n_load, n_clear, directory, recursive, state, cur_species, cu
         (SIMLINE_DEFAULT_SPECIES if SIMLINE_DEFAULT_SPECIES in sl['species']
          else (sl['species'][0] if sl['species'] else None))
     ie_value = cur_ie_species if cur_ie_species in sl['species'] else value
+    sp_value = cur_sp_species if cur_sp_species in sl['species'] else value
 
     note = f'  ({sl["n_skipped"]} skipped)' if sl['n_skipped'] else ''
+    pv_note = ''
+    if sl.get('n_pv_files'):
+        pv_note = f', {sl["n_pv_files"]} PV FITS'
     status = html.Span([
         html.Span('\u2713  SIMLINE ', style={'color': '#9467bd', 'fontWeight': '700'}),
         html.Code(sl['directory']),
-        html.Span(f'   {sl["n_files"]} files, {len(sl["species"])} species{note}',
+        html.Span(f'   {sl["n_files"]} files, {len(sl["species"])} species{pv_note}{note}',
                   style={'color': '#555', 'marginLeft': '10px'}),
     ])
-    return (status, state + 1, opts, value, opts, ie_value)
+    return (status, state + 1, opts, value, opts, ie_value, opts, sp_value)
 
 
 @app.callback(
@@ -4151,6 +5065,101 @@ def update_int_transition(species, ie_species, idef, ie_idef, _state, cur_trans,
     ie_value = cur_ie_trans if cur_ie_trans in ie_valid else _default_simline_transition(
         ie_species, ie_idef)
     return dd_opts, value, ie_dd, ie_value
+
+
+@app.callback(
+    Output('sp-transition', 'options'),
+    Output('sp-transition', 'value'),
+    _slider_value_inputs
+    + [Input('sp-species', 'value'),
+       Input('sp-quantity', 'value'),
+       Input('simline-state', 'data')],
+    State('sp-transition', 'value'),
+)
+def update_sp_transition(*args_in):
+    values = list(args_in[:N_PARAMS])
+    species, quantity, _state = args_in[N_PARAMS:N_PARAMS + 3]
+    cur_trans = args_in[-1]
+    if not _simline or not species:
+        return [], []
+    tokens = _tokens_from_values(values)
+    opts = _sp_transition_options(tokens, species, quantity=quantity or SIMLINE_DEFAULT_PV_QUANTITY)
+    dd_opts = [{'label': o['label'], 'value': o['value']} for o in opts]
+    valid = {o['value'] for o in opts}
+    if isinstance(cur_trans, list):
+        kept = [t for t in cur_trans if t in valid]
+    elif cur_trans in valid:
+        kept = [cur_trans]
+    else:
+        kept = []
+    if not kept and opts:
+        kept = [opts[0]['value']]
+    return dd_opts, kept
+
+
+@app.callback(
+    Output('plot-sp-spectrum', 'figure'),
+    Output('sp-fit-summary', 'children'),
+    _slider_value_inputs
+    + [Input('sp-species', 'value'),
+       Input('sp-transition', 'value'),
+       Input('sp-positions', 'value'),
+       Input('sp-quantity', 'value'),
+       Input('obs-fits-path', 'value'),
+       Input('obs-hdu', 'value'),
+       Input('obs-row-mode', 'value'),
+       Input('obs-row-index', 'value'),
+       Input('obs-v-low', 'value'),
+       Input('obs-v-high', 'value'),
+       Input('obs-n-gauss', 'value'),
+       Input('obs-overlay', 'value'),
+       Input('obs-fit', 'value'),
+       Input('simline-state', 'data'),
+       Input('plot-theme', 'value')],
+)
+def update_sp_spectrum(*args_in):
+    values = list(args_in[:N_PARAMS])
+    (species, transition, positions_text, pv_quantity, obs_path, obs_hdu, obs_row_mode,
+     obs_row_index, obs_v_low, obs_v_high, obs_n_gauss,
+     obs_overlay, obs_fit, _state, plot_theme) = args_in[N_PARAMS:]
+    fig, summary, _err = fig_spectra_plot(
+        values, species, transition, positions_text,
+        obs_path=obs_path, obs_hdu=obs_hdu, obs_row_mode=obs_row_mode or 'mean',
+        obs_row_index=obs_row_index, obs_v_low=obs_v_low, obs_v_high=obs_v_high,
+        obs_n_gauss=obs_n_gauss,
+        obs_overlay='on' in (obs_overlay or []),
+        obs_fit='on' in (obs_fit or []),
+        pv_quantity=pv_quantity or SIMLINE_DEFAULT_PV_QUANTITY,
+        theme=_parse_plot_theme(plot_theme),
+    )
+    return fig, summary if summary is not None else html.Div()
+
+
+@app.callback(
+    Output('plot-sp-pv', 'figure'),
+    _slider_value_inputs
+    + [Input('sp-species', 'value'),
+       Input('sp-transition', 'value'),
+       Input('sp-pos-min', 'value'),
+       Input('sp-pos-max', 'value'),
+       Input('sp-zscale', 'value'),
+       Input('sp-colorscale', 'value'),
+       Input('sp-quantity', 'value'),
+       Input('simline-state', 'data'),
+       Input('plot-theme', 'value')],
+)
+def update_sp_pv(*args_in):
+    values = list(args_in[:N_PARAMS])
+    (species, transition, pos_min, pos_max, zscale,
+     colorscale, pv_quantity, _state, plot_theme) = args_in[N_PARAMS:]
+    if isinstance(transition, list):
+        transition = transition[0] if transition else None
+    return fig_simline_pv(
+        values, species, transition, pos_min, pos_max,
+        zscale or 'linear', _parse_grid_colorscale(colorscale),
+        pv_quantity=pv_quantity or SIMLINE_DEFAULT_PV_QUANTITY,
+        theme=_parse_plot_theme(plot_theme),
+    )
 
 
 @app.callback(
@@ -4572,6 +5581,86 @@ def refresh_fit_figures_on_theme(plot_theme, grid_colorscale, _fit_state):
         figs.get('x', empty), figs.get('y', empty),
         figs.get('z', empty),
         figs.get('chi2', placeholder_fig('No reduced χ² map', theme=theme)),
+    )
+
+
+@app.callback(
+    Output('cr-atten-profiles', 'data'),
+    Output('cr-atten-active', 'options'),
+    Output('cr-atten-active', 'value'),
+    Input('cr-atten-add', 'n_clicks'),
+    Input('cr-atten-add-overlay', 'n_clicks'),
+    Input('cr-atten-clear', 'n_clicks'),
+    _slider_value_inputs,
+    State('cr-atten-profiles', 'data'),
+    State('cr-atten-active', 'value'),
+    prevent_initial_call=True,
+)
+def manage_cr_atten_profiles(n_add, n_add_ov, n_clear, *args_in):
+    slider_values = list(args_in[:N_PARAMS])
+    profiles = list(args_in[N_PARAMS] or [])
+    cur_active = list(args_in[N_PARAMS + 1] or [])
+
+    trigger = (dash.callback_context.triggered[0]['prop_id'].split('.')[0]
+               if dash.callback_context.triggered else '')
+
+    def _entry(tokens):
+        tokens = [int(t) for t in tokens]
+        key = ','.join(str(t) for t in tokens)
+        return {'key': key, 'tokens': tokens, 'label': _cr_atten_profile_label(tokens)}
+
+    def _sync_options_active(data, active):
+        opts = [
+            {'label': _cr_atten_profile_label(p['tokens']), 'value': p['key']}
+            for p in data
+        ]
+        valid = {o['value'] for o in opts}
+        active = [k for k in active if k in valid]
+        if not active and opts:
+            active = [o['value'] for o in opts]
+        return opts, active
+
+    if trigger == 'cr-atten-clear':
+        return [], [], []
+
+    existing = {p['key']: p for p in profiles}
+
+    if trigger == 'cr-atten-add':
+        tokens = _tokens_from_values(slider_values)
+        if tokens is not None and _filepath_for_tokens(tokens):
+            existing[_entry(tokens)['key']] = _entry(tokens)
+
+    elif trigger == 'cr-atten-add-overlay':
+        for tokens in _overlay_variants_for_sliders(slider_values):
+            if _filepath_for_tokens(tokens):
+                ent = _entry(tokens)
+                existing[ent['key']] = ent
+
+    profiles = list(existing.values())
+    opts, active = _sync_options_active(profiles, cur_active)
+    return profiles, opts, active
+
+
+@app.callback(
+    Output('plot-cr-atten', 'figure'),
+    Input('cr-atten-profiles', 'data'),
+    Input('cr-atten-active', 'value'),
+    Input('cr-atten-xaxis', 'value'),
+    Input('cr-atten-options', 'value'),
+    Input('cr-atten-stop-rate', 'value'),
+    Input('plot-theme', 'value'),
+)
+def update_cr_atten_plot(profiles, active, x_axis, options, stop_rate, plot_theme):
+    opts = options or []
+    return fig_cr_attenuation(
+        profiles,
+        active,
+        x_axis=x_axis or 'nh2',
+        show_padovani='padovani' in opts,
+        extrapolate='extrap' in opts,
+        stopping_rate=stop_rate,
+        show_threshold='threshold' in opts,
+        theme=_parse_plot_theme(plot_theme),
     )
 
 

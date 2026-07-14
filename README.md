@@ -24,7 +24,9 @@ After loading a main grid on **Load grids**, the other tabs become active:
 | **Grid slices** | 2-D contour maps over n_H, FUV, and ζ |
 | **Chemistry** | Top formation / destruction reactions with contribution metrics |
 | **Intensities** | SIMLINE line-intensity slice maps and spectrum |
+| **Spectra** | SimLine PV FITS velocity spectra and position–velocity diagrams |
 | **Interpolation error** | Native vs resampled grids with decimation error maps (abundance + SIMLINE) |
+| **CR attenuation** | ζ<sub>H₂</sub> vs N<sub>H₂</sub> profiles with Padovani 𝓛/𝓗/𝓤 reference bands |
 | **Map fit** | Fit observed FITS maps to the 3-D SIMLINE model grid (KoSens3D) |
 
 ## How the grid is discovered
@@ -34,7 +36,7 @@ Each model file is named:
 ```
 Model<tag>_DD_MM_FF_ZZ_CC_AA.hdf5
             |  |  |  |  |  |
-            |  |  |  |  |  +-- AA  attenuation tag
+            |  |  |  |  |  +-- AA  attenuation tag (optional; omitted => no attenuation, AA=0)
             |  |  |  |  +----- CC  cosmic-ray ionisation rate   ζ   = 10^(-CC)        s^-1
             |  |  |  +-------- ZZ  metallicity                  Z   = 10^((ZZ-10)/10) Z_sun
             |  |  +----------- FF  FUV field (Draine)           χ   = 10^(FF/10)
@@ -46,6 +48,10 @@ The tool scans the chosen directory, decodes every filename, and creates **one
 slider per parameter that actually varies** on disk. If you later add models at
 different masses (or metallicities, attenuations), the corresponding slider
 simply shows up — no code changes needed.
+
+Non-attenuated model sets may omit the final ``_AA`` token entirely
+(e.g. ``Model100_50_20_00_10_15.hdf5`` instead of ``…_15_00.hdf5``). Those
+files are indexed with ``atten = 0``.
 
 ## Abundance profiles & heating / cooling
 
@@ -157,17 +163,56 @@ control the matching. On the shift panel, **positive** offsets are **red** and
 ## SIMLINE intensities
 
 Load a **SIMLINE directory** on the Load tab (files named
-`jtemp_Model<tag>_DD_MM_FF_ZZ_CC_AA_<species>.smli` or `jerg_…`).
+`jtemp_Model…_<species>.smli`, `jerg_…`, or `tau_…` optical-depth tables; ``.smlc``
+is accepted for ``tau`` as well).
 
 The **Intensities** tab provides:
 
 - Three **2-D slice maps** (same planes as Grid slices) for one chosen transition
 - **Line spectrum** — all transitions for the current slider selection
-- Units: **K km/s** (`jtemp`) or **erg s⁻¹ cm⁻² Hz⁻¹** (`jerg`)
+- Quantities: **K km/s** (`jtemp`), **erg s⁻¹ cm⁻² Hz⁻¹** (`jerg`), or **τ** (`tau`)
 - Same interpolation and x-shift controls as Grid slices
 
 An optional **overlay SIMLINE** directory (attenuated `.smli` files) enables the
 same triple-panel x-shift layout as for HDF5 grid slices.
+
+## SIMLINE spectra (PV FITS)
+
+When SimLine is run with **`-fits`**, position–velocity cubes are written as
+``Model<tag>_DD_MM_FF_ZZ_CC_AA_<species>.<transition>.fits`` (brightness
+temperature) and ``…<transition>-tau.fits`` (optical depth) in the same
+directory as the ``.smli`` files. The **Spectra** tab reads these cubes
+locally via ``simline_spectra.py`` (no KoSens dependency):
+
+- **Quantity** — **T<sub>mb</sub> [K]** (default PV cubes) or **τ** optical depth
+  (``*-tau.fits`` cubes, matching ``tau_Model…`` ``.smli`` tables)
+- **1-D spectrum** — spatial mean over all position columns (default), or
+  comma-separated position offsets in arcsec to overplot individual columns.
+  Select **multiple transitions** to compare lines on the same velocity axis.
+- **PV diagram** — 2-D heatmap for the **first** selected transition only
+  and linear / log brightness scale
+
+Species and transition lists come from the indexed PV FITS files at the current
+grid slider selection.
+
+### Observational overlay and Gaussian fitting
+
+Point **FITS file path** at a CLASS/GILDAS MATRIX table (``hdu_index=1``,
+``SPECTRUM`` column, velocity from ``VELO-LSR`` / ``DELTAV``) or a spectral
+image cube (``hdu_index=0``). Controls:
+
+- **Spectrum selection** — spatial mean, peak-region average (bright half of
+  moment-0), or a single row/pixel index
+- **Line core limits** — velocities *outside* this range define the continuum
+  (polynomial degree 1); inside is the line core for the Gaussian fit
+- **N Gaussians** — multi-component line model (Astropy LevMar, same as KoSens)
+- **Overlay** — plot the observed spectrum on the SimLine 1-D panel
+- **Fit Gaussians** — continuum + sum of Gaussians; shows per-component
+  amplitudes, centres, widths, integrated intensities, and total
+  ``∫I dv`` with propagated uncertainty
+
+Implementation: ``obs_spectrum_fits.py`` (vendored from KoSens ``spectrum_fits``;
+no KoSens import).
 
 ## Interpolation error check
 
@@ -184,6 +229,22 @@ When both data sources are loaded, each slice plane shows:
 
 - **Abundance / diagnostic** row (from the main HDF5 grid quantity dropdown)
 - **SIMLINE intensity** row (species + transition)
+
+## CR attenuation profiles
+
+The **CR attenuation** tab follows the KoSens ``CR_atten_plot`` notebook:
+
+- **ζ<sub>H₂</sub> vs N<sub>H₂</sub>** (or A<sub>V</sub>) from KOSMA structure output
+  (`cosray` × 20/13, `cd_prof_h2`)
+- **Padovani et al. (2018/2024)** reference bands 𝓛, 𝓗, 𝓤 with ± factor-of-2
+  uncertainty shading (on the N<sub>H₂</sub> axis)
+- **Add current model** — snapshot the slider selection; **Add all overlay matches**
+  — add every attenuated model at the current density / mass / FUV / metallicity
+- Optional log-log extrapolation to 10²⁵ cm⁻² and attenuation-threshold vertical
+  line (stopping rate, default 10²⁰ cm⁻²)
+
+No observational data points are plotted. Implementation: ``cr_attenuation.py``
+(vendored Padovani polynomials from KoSens ``functions_for_cratten``).
 
 Controls match the slice tabs (interpolation method, grid size, axis limits) plus
 **error decimation factor**, **error metric**, **relative threshold**,
@@ -283,6 +344,9 @@ Optional: `tqdm` (progress bar during map fitting).
 | `grid_fit.py` | 3-D intensity cubes and FITS map fit |
 | `map_fit.py` | Core FITS-to-grid fitting (`fit_fits_maps_to_grids_3d`) |
 | `map_fit_extras.py` | Ratio grids, chi² analysis helpers for map fitting |
+| `simline_spectra.py` | SimLine PV FITS spectra and PV diagrams (local, no KoSens) |
+| `cr_attenuation.py` | CR attenuation profiles and Padovani reference bands (local, no KoSens) |
+| `obs_spectrum_fits.py` | Observational FITS spectra extraction and Gaussian fitting |
 | `smli_labels.py` | SIMLINE transition label formatting |
 | `model_config.py` | JSON config scan and Model setup panel |
 

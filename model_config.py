@@ -10,6 +10,7 @@ import json
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
+import grid_naming as gn
 from dash import html
 
 # Keys that typically define the grid (shown first when they vary).
@@ -68,15 +69,11 @@ def find_models_root(grid_directory: str) -> Optional[str]:
 
 
 def parse_model_folder_tokens(folder_name: str, n_params: int = 6) -> Optional[Tuple[int, ...]]:
-    """Parse ``Model100_DD_MM_FF_ZZ_CC_AA`` folder names into slider tokens."""
-    parts = folder_name.split('_')
-    mi = next((i for i, p in enumerate(parts) if p.startswith('Model')), None)
-    if mi is None or len(parts) < mi + 1 + n_params:
+    """Parse ``Model100_DD_MM_FF_ZZ_CC[_AA]`` folder names into slider tokens."""
+    tokens = gn.parse_model_tokens_from_stem(folder_name)
+    if tokens is None or len(tokens) != n_params:
         return None
-    try:
-        return tuple(int(parts[mi + k]) for k in range(1, n_params + 1))
-    except (ValueError, IndexError):
-        return None
+    return tokens
 
 
 def _list_signature(value: list) -> tuple:

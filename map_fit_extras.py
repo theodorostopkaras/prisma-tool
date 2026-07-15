@@ -425,6 +425,21 @@ def _detect_3d_meshgrid_keys(grid_data):
             x_key = key
 
     if x_key is None or y_key is None or z_key is None:
+        # Fall back when an axis is constant (single grid point) — assign remaining keys.
+        if z_key is None:
+            for k in coord_keys:
+                if k not in (x_key, y_key):
+                    z_key = k
+                    break
+        pool = [k for k in coord_keys if k != z_key]
+        if x_key is None and y_key is None and len(pool) == 2:
+            y_key, x_key = pool[0], pool[1]
+        elif y_key is None:
+            y_key = pool[1] if pool and pool[0] == x_key else pool[0]
+        elif x_key is None:
+            x_key = pool[1] if pool and pool[0] == y_key else pool[0]
+
+    if x_key is None or y_key is None or z_key is None:
         raise ValueError(
             f"Could not classify x/y/z mesh keys for keys {coord_keys}; "
             f"detected x={x_key}, y={y_key}, z={z_key}"

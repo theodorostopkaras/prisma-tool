@@ -38,12 +38,14 @@ Usage:
 import argparse
 import os
 import glob
+import re
 
 import numpy as np
 import h5py
 
 import dash
 from dash import dcc, html, Input, Output, State
+from dash.exceptions import PreventUpdate
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -65,7 +67,7 @@ OBS_ROW_OPTIONS = [
 ]
 DEFAULT_OBS_V_LOW = -20.0
 DEFAULT_OBS_V_HIGH = 20.0
-DEFAULT_DIR = '/home/teotopkaras/Desktop/new_teo_grid/pdrgrid_hdf5'
+DEFAULT_DIR = '/home/teotopkaras/Desktop/Projects/Models/new_teo_grid/pdrgrid_hdf5'
 
 
 parser = argparse.ArgumentParser(description="KOSMA-tau Grid Explorer")
@@ -105,6 +107,11 @@ DEFAULT_REACT_RANKING = 'fractional_contribution'
 
 SIMLINE_DEFAULT_SPECIES = 'CO'
 SIMLINE_DEFAULT_IDEF = 'jtemp'                      # jtemp, jerg, or tau
+# KoSens-style observational detection limit on jtemp intensity maps (K km/s).
+INT_OBS_BOUNDARY_JTEMP = 0.1
+INT_OBS_BOUNDARY_COLOR = 'red'
+INT_OBS_BOUNDARY_WIDTH = 2.5
+INT_EXTRA_CONTOUR_WIDTH = 1.5
 SIMLINE_IDEF_OPTIONS = [
     {'label': ' I [K km/s]  (jtemp)', 'value': 'jtemp'},
     {'label': ' I [erg s\u207B\u00B9 cm\u207B\u00B2 Hz\u207B\u00B9]  (jerg)', 'value': 'jerg'},
@@ -242,20 +249,19 @@ PARAM_DEFS = [
 N_PARAMS = len(PARAM_DEFS)
 _PARAM_IDX = {p['key']: i for i, p in enumerate(PARAM_DEFS)}
 
-# 2-D contour slice planes: (x, y) axes on the plot; ``slice`` is the third axis
-# controlled by that panel's own slider (independent of the profile sliders).
-SLICE_PLANES = [
-    dict(id='dens-fuv',  x='density', y='fuv',  slice='crir',
-         title='n<sub>H</sub> vs FUV'),
-    dict(id='dens-crir', x='crir', y='density', slice='fuv',
-         title='\u03B6 vs n<sub>H</sub>'),
-    dict(id='fuv-crir',  x='crir', y='fuv',     slice='density',
-         title='\u03B6 vs FUV'),
-]
-_IE_PLANE_LABELS = {
-    'dens-fuv': 'nH vs FUV',
-    'dens-crir': '\u03B6 vs nH',
-    'fuv-crir': '\u03B6 vs FUV',
+# Three fixed UI slots; axes are assigned at load time from varying parameters.
+SLICE_PLANE_SLOT_IDS = ('dens-fuv', 'dens-crir', 'fuv-crir')
+_SLICE_PLANES_ACTIVE = None
+
+SLICE_PLANES = [dict(id=pid) for pid in SLICE_PLANE_SLOT_IDS]
+
+_PLANE_AXIS_SHORT = {
+    'density': ('n<sub>H</sub>', 'nH'),
+    'mass': ('M', 'M'),
+    'fuv': ('FUV \u03C7', 'FUV'),
+    'metal': ('Z', 'Z'),
+    'crir': ('\u03B6', '\u03B6'),
+    'atten': ('atten', 'atten'),
 }
 
 CONTOUR_DIAGNOSTICS = [
@@ -314,6 +320,87 @@ def _dec(x):
 
 
 # --- Grid scanning ------------------------------------------------------------
+
+def _varying_param_keys(axis_tokens):
+    return [p['key'] for p in PARAM_DEFS if len(axis_tokens.get(p['key'], [])) > 1]
+
+
+def _fixed_param_keys(axis_tokens):
+    return [p['key'] for p in PARAM_DEFS if len(axis_tokens.get(p['key'], [])) == 1]
+
+
+def _plane_title_html(xk, yk):
+    xl, _ = _PLANE_AXIS_SHORT.get(xk, (xk, xk))
+    yl, _ = _PLANE_AXIS_SHORT.get(yk, (yk, yk))
+    return f'{xl} vs {yl}'
+
+
+def _plane_title_plain(xk, yk):
+    _, xp = _PLANE_AXIS_SHORT.get(xk, (xk, xk))
+    _, yp = _PLANE_AXIS_SHORT.get(yk, (yk, yk))
+    return f'{xp} vs {yp}'
+
+
+def _inactive_slot_planes():
+    return [dict(id=pid, x=None, y=None, slice=None, title='', active=False)
+            for pid in SLICE_PLANE_SLOT_IDS]
+
+
+def build_slice_planes(axis_tokens):
+    """Build up to three 2-D slice planes from whichever parameters vary."""
+    varying = _varying_param_keys(axis_tokens)
+    fixed = _fixed_param_keys(axis_tokens)
+    combos = []
+    n = len(varying)
+    if n >= 3:
+        v0, v1, v2 = varying[0], varying[1], varying[2]
+        combos = [(v0, v1, v2), (v0, v2, v1), (v1, v2, v0)]
+    elif n == 2:
+        sk = fixed[0] if fixed else varying[0]
+        combos = [(varying[0], varying[1], sk)]
+    elif n == 1:
+        others = [p['key'] for p in PARAM_DEFS if p['key'] != varying[0]]
+        if len(others) >= 2:
+            combos = [(varying[0], others[0], others[1])]
+
+    planes = []
+    for i, pid in enumerate(SLICE_PLANE_SLOT_IDS):
+        if i < len(combos):
+            xk, yk, sk = combos[i]
+            planes.append(dict(
+                id=pid, x=xk, y=yk, slice=sk,
+                title=_plane_title_html(xk, yk), active=True,
+            ))
+        else:
+            planes.append(dict(id=pid, x=None, y=None, slice=None, title='', active=False))
+    return planes
+
+
+def configure_slice_planes(axis_tokens):
+    """Assign slice-plane axes from the parameters that vary on disk."""
+    global _SLICE_PLANES_ACTIVE
+    _SLICE_PLANES_ACTIVE = build_slice_planes(axis_tokens)
+
+
+def active_slice_planes():
+    if _SLICE_PLANES_ACTIVE is not None:
+        return _SLICE_PLANES_ACTIVE
+    return _inactive_slot_planes()
+
+
+def _ie_plane_label(plane_id):
+    for p in active_slice_planes():
+        if p['id'] == plane_id and p.get('active'):
+            return _plane_title_plain(p['x'], p['y'])
+    return ''
+
+
+def _plane_by_slot(slot_id):
+    for p in active_slice_planes():
+        if p['id'] == slot_id:
+            return p
+    return dict(id=slot_id, active=False)
+
 
 def parse_filename(fname):
     """Return a tuple of 6 integer tokens (DD, MM, FF, ZZ, CC, AA) or None.
@@ -396,7 +483,7 @@ def _scan_files(directory, recursive):
         files[tokens] = path
     if not files:
         raise ValueError('Found .hdf5 files but none matched the expected '
-                         'Model_DD_MM_FF_ZZ_CC[_AA] naming convention.')
+                         '<tag>_DD_MM_FF_ZZ_CC[_AA] naming convention.')
 
     axis_tokens = {}
     for d, p in enumerate(PARAM_DEFS):
@@ -429,7 +516,10 @@ def scan_directory(directory, recursive=False):
         species_idx={s: i for i, s in enumerate(species)},
         n_files=len(files),
         n_skipped=skipped,
+        simline_only=False,
+        has_hdf5=True,
     )
+    configure_slice_planes(axis_tokens)
     return _grid
 
 
@@ -561,9 +651,10 @@ def clear_chem():
 
 
 def parse_smli_filename(fname):
-    """Parse ``{jtemp,jerg,tau}_Model<tag>_DD_MM_FF_ZZ_CC_AA_<species>.smli`` (or ``.smlc``).
+    """Parse ``{jtemp,jerg,tau}_<tag>_DD_MM_FF_ZZ_<species>.smli`` (or ``.smlc``).
 
-    Returns (quantity_key, tokens, species) or None.
+    Returns (quantity_key, full_tokens, file_key, species) or None.
+    ``file_key`` is the raw token run stored on disk (4–6 integers).
     """
     base = os.path.basename(fname)
     if base.endswith('.smli'):
@@ -582,18 +673,27 @@ def parse_smli_filename(fname):
         return None
 
     parts = core.split('_')
-    mi = next((i for i, p in enumerate(parts) if p.startswith('Model')), None)
-    if mi is None:
+    tag_idx = gn.find_model_tag_index(parts)
+    if tag_idx is None:
         return None
-    tokens = gn.parse_model_tokens_from_parts(parts, mi)
-    if tokens is None:
+    n_tok = gn.param_token_count(parts, tag_idx)
+    if n_tok < gn.MIN_GRID_PARAMS:
+        return None
+    start = tag_idx + 1
+    try:
+        raw = tuple(int(parts[start + i]) for i in range(n_tok))
+    except (ValueError, IndexError):
+        return None
+    full = gn.expand_partial_tokens(raw)
+    if full is None:
         return None
 
-    sp_start = mi + 1 + gn.param_token_count(parts, mi)
+    sp_start = tag_idx + 1 + n_tok
     if sp_start >= len(parts):
         return None
     species = '_'.join(parts[sp_start:])
-    return idef, tokens, species
+    file_key = gn.simline_file_key(full, n_tok)
+    return idef, full, file_key, species
 
 
 def read_smli_file(path):
@@ -667,16 +767,19 @@ def _scan_simline_directory(directory, recursive, build_by_non_atten=False):
     skipped = 0
     species_set = set()
     transitions = {}
+    filename_token_count = None
     for path in paths:
         parsed = parse_smli_filename(path)
         if parsed is None:
             skipped += 1
             continue
-        idef, tokens, species = parsed
-        key = (tokens, species, idef)
+        idef, _full, file_key, species = parsed
+        if filename_token_count is None:
+            filename_token_count = len(file_key)
+        key = (file_key, species, idef)
         files[key] = path
         if build_by_non_atten:
-            by_non_atten.setdefault((tokens[:N_PARAMS - 1], species, idef), path)
+            by_non_atten.setdefault((file_key[:N_PARAMS - 1], species, idef), path)
         species_set.add(species)
         tkey = (species, idef)
         if tkey not in transitions:
@@ -694,11 +797,12 @@ def _scan_simline_directory(directory, recursive, build_by_non_atten=False):
 
     if not files:
         raise ValueError('Found .smli / .smlc files but none matched the expected '
-                         'jtemp_/jerg_/tau_Model_DD_MM_FF_ZZ_CC_AA_<species> naming convention.')
+                         'jtemp_/jerg_/tau_<tag>_DD_MM_FF_[ZZ]_<species> naming convention.')
 
     out = dict(
         directory=directory,
         files=files,
+        filename_token_count=filename_token_count or gn.N_GRID_PARAMS,
         species=sorted(species_set),
         transitions=transitions,
         n_files=len(files),
@@ -728,26 +832,141 @@ def clear_simline_overlay():
     _smli_cache = {}
 
 
+def _grid_has_hdf5():
+    return bool(_grid and _grid.get('files'))
+
+
+def bootstrap_grid_from_simline():
+    """When no HDF5 grid is loaded, build parameter axes from SIMLINE filenames."""
+    global _grid
+    if not _simline or not _simline.get('files'):
+        return False
+    if _grid_has_hdf5():
+        return False
+
+    token_tuples = sorted({
+        gn.expand_partial_tokens(key[0])
+        for key in _simline['files']
+        if gn.expand_partial_tokens(key[0]) is not None
+    })
+    axis_tokens = gn.axis_tokens_from_tuples(token_tuples)
+    token_cores = {}
+    for key, path in _simline['files'].items():
+        full = gn.expand_partial_tokens(key[0])
+        if full and full not in token_cores:
+            core = gn.model_core_from_simline_path(path)
+            if core:
+                token_cores[full] = core
+
+    species = list(_simline.get('species', []))
+    _grid = dict(
+        directory=_simline['directory'],
+        files={},
+        axis_tokens=axis_tokens,
+        species=species,
+        species_idx={s: i for i, s in enumerate(species)},
+        n_files=len(token_tuples),
+        n_skipped=_simline.get('n_skipped', 0),
+        simline_only=True,
+        has_hdf5=False,
+        token_cores=token_cores,
+        filename_token_count=_simline.get('filename_token_count', gn.N_GRID_PARAMS),
+    )
+    configure_slice_planes(axis_tokens)
+    return True
+
+
+def clear_simline_only_grid():
+    """Drop the virtual parameter index bootstrapped from SIMLINE only."""
+    global _grid, _SLICE_PLANES_ACTIVE
+    if _grid and _grid.get('simline_only') and not _grid_has_hdf5():
+        _grid = {}
+        _SLICE_PLANES_ACTIVE = None
+
+
+def clear_main_grid():
+    """Clear the main HDF5 / virtual grid and related caches."""
+    global _grid, _field_map, _profile_cache, _scalar_cache, _SLICE_PLANES_ACTIVE
+    global _heat_components, _cool_components, _cr_heat_idx, _model_config_summary
+    _grid = {}
+    _field_map = {}
+    _profile_cache = {}
+    _scalar_cache = {}
+    _heat_components = []
+    _cool_components = []
+    _cr_heat_idx = None
+    _model_config_summary = None
+    _SLICE_PLANES_ACTIVE = None
+
+
+def _directory_has_hdf5(directory, recursive=False):
+    """True if ``directory`` contains at least one ``.hdf5`` grid file."""
+    directory = os.path.expanduser((directory or '').strip())
+    if not directory or not os.path.isdir(directory):
+        return False
+    pattern = os.path.join(directory, '**', '*.hdf5') if recursive \
+        else os.path.join(directory, '*.hdf5')
+    return bool(glob.glob(pattern, recursive=recursive))
+
+
+def _prepare_simline_grid_bootstrap(directory, recursive=False):
+    """Drop an unrelated HDF5 grid when loading SIMLINE from a directory with no HDF5."""
+    if _directory_has_hdf5(directory, recursive):
+        return False
+    if _grid_has_hdf5():
+        clear_main_grid()
+        return True
+    return False
+
+
+def _simline_sample_path(tok_tuple):
+    if not _simline or not tok_tuple:
+        return None
+    n = _simline.get('filename_token_count', gn.N_GRID_PARAMS)
+    file_key = gn.simline_file_key(tuple(tok_tuple), n)
+    for file_key_stored, path in _simline['files'].items():
+        if file_key_stored[0] == file_key:
+            return path
+    return None
+
+
 def smli_file(tokens, species, idef, overlay=False):
     """Return the .smli path for one model point, or None."""
     store = _simline_overlay if overlay else _simline
     if not store:
         return None
-    t = tuple(tokens)
-    path = store['files'].get((t, species, idef))
+    n = store.get('filename_token_count', gn.N_GRID_PARAMS)
+    file_key = gn.simline_file_key(tuple(tokens), n)
+    path = store['files'].get((file_key, species, idef))
     if path:
         return path
     if overlay:
-        return store.get('by_non_atten', {}).get((t[:N_PARAMS - 1], species, idef))
+        return store.get('by_non_atten', {}).get((file_key[:N_PARAMS - 1], species, idef))
     return None
 
 
-def model_core_from_tokens(tokens):
-    """HDF5 / SimLine model folder stem for the current slider selection."""
-    path = current_file(tokens)
-    if not path:
+def model_core_from_token_tuple(tok_tuple):
+    """Model folder stem ``Model…_DD_MM_…`` for a full parameter token tuple."""
+    if not tok_tuple:
         return None
-    return os.path.splitext(os.path.basename(path))[0]
+    tok_tuple = tuple(tok_tuple)
+    if _grid and _grid.get('token_cores'):
+        core = _grid['token_cores'].get(tok_tuple)
+        if core:
+            return core
+    if _grid and _grid.get('files'):
+        path = _grid['files'].get(tok_tuple)
+        if path:
+            return os.path.splitext(os.path.basename(path))[0]
+    spath = _simline_sample_path(tok_tuple)
+    if spath:
+        return gn.model_core_from_simline_path(spath)
+    return None
+
+
+def model_core_from_tokens(slider_values):
+    """Model folder stem for the current slider selection."""
+    return model_core_from_token_tuple(_tokens_from_values(slider_values))
 
 
 def pv_fits_path(tokens, species, transition, quantity='intensity'):
@@ -759,7 +978,7 @@ def pv_fits_path(tokens, species, transition, quantity='intensity'):
     path = _simline.get(store_key, {}).get(key)
     if path and os.path.isfile(path):
         return path
-    model_core = model_core_from_tokens(tokens)
+    model_core = model_core_from_token_tuple(tokens)
     if not model_core:
         return None
     candidate = ss.expected_pv_fits_path(
@@ -911,6 +1130,8 @@ def run_map_fit_job(maps_json, errors_json, output_dir, idef,
         except (TypeError, ValueError):
             chi2_pixel = None
 
+    axis_cfg = grids_3d.get('_fit_axis_config') or gf.fit_axis_config(_grid['axis_tokens'])
+
     _fit_results = gf.run_map_fit(
         observed_fits_files=maps,
         obs_errors=errors,
@@ -922,12 +1143,16 @@ def run_map_fit_job(maps_json, errors_json, output_dir, idef,
         create_model_ratios=bool(create_model_ratios and 'model_ratios' in create_model_ratios),
         create_chi2_analysis=bool(chi2_analysis and 'chi2' in chi2_analysis),
         create_uncertainty_maps=bool(uncertainty_maps and 'unc' in uncertainty_maps),
+        axis_config=axis_cfg,
     )
     _fit_results['output_dir'] = out_dir
     _fit_results['grid_shape'] = shape
     _fit_results['lines_fitted'] = line_names
     _fit_results['fits_header'] = fits_header
     _fit_results['reference_fits_path'] = ref_path
+    _fit_results['fit_axes_label'] = (
+        f"{axis_cfg['axis_x']} × {axis_cfg['axis_y']} × {axis_cfg['axis_z']}"
+    )
     return _fit_results
 
 
@@ -1726,12 +1951,45 @@ def _middle_token(key):
     return toks[len(toks) // 2]
 
 
+def _token_list_from_sliders(slider_values):
+    """Full parameter token list from profile sliders, else grid midpoints."""
+    if slider_values is not None:
+        toks = _tokens_from_values(list(slider_values))
+        if toks is not None:
+            return list(toks)
+    return [_middle_token(p['key']) for p in PARAM_DEFS]
+
+
+def _model_point_tokens(slider_values=None, int_slice_indices=None):
+    """Resolve the full model token tuple for the current UI selection."""
+    if not _grid:
+        return None
+    if int_slice_indices and _grid.get('simline_only'):
+        tokens = _token_list_from_sliders(slider_values)
+        for plane, idx in zip(active_slice_planes(), int_slice_indices):
+            if not plane.get('active') or not plane.get('slice'):
+                continue
+            sk = plane['slice']
+            try:
+                tokens[_PARAM_IDX[sk]] = _grid['axis_tokens'][sk][int(idx)]
+            except (IndexError, TypeError, ValueError):
+                pass
+        return tuple(tokens)
+    if slider_values is not None:
+        toks = _tokens_from_values(list(slider_values))
+        if toks is not None:
+            return toks
+    return tuple(_token_list_from_sliders(slider_values))
+
+
 def _param_def(key):
     return PARAM_DEFS[_PARAM_IDX[key]]
 
 
 def _plane_plot_axes(plane):
-    """Return (x_key, y_key, slice_key) with cosmic-ray rate always on the x-axis."""
+    """Return (x_key, y_key, slice_key); prefer ζ on the x-axis when it is plotted."""
+    if not plane.get('active'):
+        return plane.get('x'), plane.get('y'), plane.get('slice')
     xk, yk, sk = plane['x'], plane['y'], plane['slice']
     if yk == 'crir' and xk != 'crir':
         xk, yk = yk, xk
@@ -1916,6 +2174,86 @@ def _contour_trace_kw(theme='light', show_lines=True):
     )
 
 
+def _parse_int_extra_contour_levels(text):
+    """Parse comma/semicolon/whitespace-separated intensity levels (physical units)."""
+    if text is None:
+        return []
+    raw = str(text).strip()
+    if not raw:
+        return []
+    levels = []
+    for part in re.split(r'[,;\s]+', raw):
+        if not part:
+            continue
+        try:
+            v = float(part)
+        except ValueError:
+            continue
+        if np.isfinite(v):
+            levels.append(v)
+    return levels
+
+
+def _physical_to_plot_intensity(level, zscale):
+    """Map a physical intensity level to the Z array used in contour plots."""
+    if level is None or not np.isfinite(level):
+        return None
+    if zscale == 'log':
+        if level <= 0:
+            return None
+        return float(np.log10(level))
+    return float(level)
+
+
+def _build_intensity_line_contours(idef, zscale, show_obs_boundary,
+                                   extra_levels_text, extra_color):
+    """Build line-only contour specs for observational and user levels."""
+    lines = []
+    if show_obs_boundary and idef == 'jtemp':
+        lvl = _physical_to_plot_intensity(INT_OBS_BOUNDARY_JTEMP, zscale)
+        if lvl is not None:
+            lines.append(dict(
+                level=lvl,
+                color=INT_OBS_BOUNDARY_COLOR,
+                width=INT_OBS_BOUNDARY_WIDTH,
+                label=f'obs. limit ({INT_OBS_BOUNDARY_JTEMP:g} K km/s)',
+            ))
+    color = (extra_color or 'black').strip() or 'black'
+    unit = _intensity_unit_label(idef)
+    for phys in _parse_int_extra_contour_levels(extra_levels_text):
+        lvl = _physical_to_plot_intensity(phys, zscale)
+        if lvl is not None:
+            lines.append(dict(
+                level=lvl,
+                color=color,
+                width=INT_EXTRA_CONTOUR_WIDTH,
+                label=f'{phys:g} {unit}',
+            ))
+    return lines
+
+
+def _add_contour_level_lines(fig, x_plot, y_plot, z_plot, line_contours, row=None, col=None):
+    """Overlay constant-intensity contour lines on an existing contour figure."""
+    for spec in line_contours:
+        trace = go.Contour(
+            x=x_plot, y=y_plot, z=z_plot,
+            contours=dict(
+                coloring='none',
+                showlabels=True,
+                start=spec['level'], end=spec['level'], size=1,
+                labelfont=dict(size=10, color=spec['color']),
+            ),
+            line=dict(color=spec['color'], width=spec.get('width', INT_EXTRA_CONTOUR_WIDTH)),
+            showscale=False,
+            hoverinfo='skip',
+            name=spec.get('label', ''),
+        )
+        if row is not None and col is not None:
+            fig.add_trace(trace, row=row, col=col)
+        else:
+            fig.add_trace(trace)
+
+
 def _multi_panel_layout_kw(theme='light', height=420):
     t = _theme_colors(theme)
     return dict(
@@ -2060,7 +2398,8 @@ def _native_abundance_grid(plane, slice_token, quantity):
     return x_phys, y_phys, Z, xdef, ydef
 
 
-def _native_intensity_grid(plane, slice_token, species, idef, transition_idx):
+def _native_intensity_grid(plane, slice_token, species, idef, transition_idx,
+                           slider_values=None):
     """Native (unresampled) 2-D SIMLINE intensity grid for one slice plane."""
     xk, yk, sk = _plane_plot_axes(plane)
     x_tokens = _grid['axis_tokens'][xk]
@@ -2071,7 +2410,7 @@ def _native_intensity_grid(plane, slice_token, species, idef, transition_idx):
     Z = np.full((ny, nx), np.nan)
     for ix, xt in enumerate(x_tokens):
         for iy, yt in enumerate(y_tokens):
-            tokens = [_middle_token(p['key']) for p in PARAM_DEFS]
+            tokens = _token_list_from_sliders(slider_values)
             tokens[_PARAM_IDX[xk]] = xt
             tokens[_PARAM_IDX[yk]] = yt
             tokens[_PARAM_IDX[sk]] = slice_token
@@ -2335,7 +2674,8 @@ def fig_triple_atten_grid(plane, slice_title, Z_ref, Z_atten, x_phys, y_phys,
                           xdef, ydef, zscale, quantity_cbar_title,
                           shift_rtol=X_SHIFT_MATCH_RTOL,
                           shift_scan_direction=X_SHIFT_SCAN_DIRECTION,
-                          colorscale=DEFAULT_GRID_COLORMAP, theme='light'):
+                          colorscale=DEFAULT_GRID_COLORMAP, theme='light',
+                          line_contours=None):
     """Three side-by-side square panels: reference, overlay, horizontal x-shift (dex)."""
     ny, nx = Z_ref.shape
     x_mesh = np.broadcast_to(np.asarray(x_phys, dtype=float), (ny, nx)).copy()
@@ -2422,6 +2762,9 @@ def fig_triple_atten_grid(plane, slice_title, Z_ref, Z_atten, x_phys, y_phys,
                    x=0.01, xanchor='left'),
     )
     fig.update_layout(**layout_kw)
+    if line_contours:
+        _add_contour_level_lines(fig, x_plot, y_plot, p0, line_contours, row=1, col=1)
+        _add_contour_level_lines(fig, x_plot, y_plot, p1, line_contours, row=1, col=2)
     return fig
 
 
@@ -2497,6 +2840,8 @@ def fig_contour_plane(plane, slice_idx, quantity, zscale,
                       interp_config=None,
                       colorscale=DEFAULT_GRID_COLORMAP, theme='light'):
     """Contour plot for one (x, y) slice plane with the third axis on a slider."""
+    if not plane.get('active'):
+        return placeholder_fig(theme=theme)
     if not _grid:
         return placeholder_fig('Load a grid directory', theme=theme)
 
@@ -2566,18 +2911,20 @@ def make_contour_plots(quantity, zscale, slice_indices,
                        shift_scan_direction=X_SHIFT_SCAN_DIRECTION,
                        interp_config=None,
                        colorscale=DEFAULT_GRID_COLORMAP, theme='light'):
-    """Return one contour figure per entry in SLICE_PLANES."""
+    """Return one contour figure per active slice-plane slot."""
     return tuple(
         fig_contour_plane(plane, slice_indices[i], quantity, zscale,
                           shift_rtol=shift_rtol, shift_scan_direction=shift_scan_direction,
                           interp_config=interp_config,
                           colorscale=colorscale, theme=theme)
-        for i, plane in enumerate(SLICE_PLANES)
+        if plane.get('active') else placeholder_fig(theme=theme)
+        for i, plane in enumerate(active_slice_planes())
     )
 
 
 def build_intensity_slice_grid(plane, slice_token, species, idef, transition_idx,
-                               overlay=False, interp_config=None):
+                               overlay=False, interp_config=None,
+                               slider_values=None):
     """Build a 2-D SIMLINE intensity array for one parameter plane."""
     xk, yk, sk = _plane_plot_axes(plane)
     x_tokens = _grid['axis_tokens'][xk]
@@ -2588,7 +2935,7 @@ def build_intensity_slice_grid(plane, slice_token, species, idef, transition_idx
     Z = np.full((ny, nx), np.nan)
     for ix, xt in enumerate(x_tokens):
         for iy, yt in enumerate(y_tokens):
-            tokens = [_middle_token(p['key']) for p in PARAM_DEFS]
+            tokens = _token_list_from_sliders(slider_values)
             tokens[_PARAM_IDX[xk]] = xt
             tokens[_PARAM_IDX[yk]] = yt
             tokens[_PARAM_IDX[sk]] = slice_token
@@ -2613,10 +2960,14 @@ def fig_intensity_contour_plane(plane, slice_idx, species, idef, transition_idx,
                                 shift_rtol=X_SHIFT_MATCH_RTOL,
                                 shift_scan_direction=X_SHIFT_SCAN_DIRECTION,
                                 interp_config=None,
-                                colorscale=DEFAULT_GRID_COLORMAP, theme='light'):
+                                colorscale=DEFAULT_GRID_COLORMAP, theme='light',
+                                slider_values=None,
+                                line_contours=None):
     """Contour plot of SIMLINE intensity on one parameter slice plane."""
+    if not plane.get('active'):
+        return placeholder_fig(theme=theme)
     if not _grid:
-        return placeholder_fig('Load a main grid directory', theme=theme)
+        return placeholder_fig('Load a grid or SIMLINE directory', theme=theme)
     if not _simline:
         return placeholder_fig('Load a SIMLINE directory on the Load tab', theme=theme)
 
@@ -2632,7 +2983,8 @@ def fig_intensity_contour_plane(plane, slice_idx, species, idef, transition_idx,
 
     sdef = _param_def(sk)
     x_phys, y_phys, Z, xdef, ydef = build_intensity_slice_grid(
-        plane, slice_token, species, idef, transition_idx, interp_config=interp_config)
+        plane, slice_token, species, idef, transition_idx, interp_config=interp_config,
+        slider_values=slider_values)
 
     if not np.any(np.isfinite(Z)):
         return placeholder_fig('No SIMLINE data for this slice', theme=theme)
@@ -2666,12 +3018,12 @@ def fig_intensity_contour_plane(plane, slice_idx, species, idef, transition_idx,
     if _simline_overlay:
         _, _, Z_ov, _, _ = build_intensity_slice_grid(
             plane, slice_token, species, idef, transition_idx, overlay=True,
-            interp_config=interp_config)
+            interp_config=interp_config, slider_values=slider_values)
         if np.any(np.isfinite(Z_ov)):
             return fig_triple_atten_grid(
                 plane, slice_title, Z, Z_ov, x_phys, y_phys, xdef, ydef, zscale, cbar_title,
                 shift_rtol=shift_rtol, shift_scan_direction=shift_scan_direction,
-                colorscale=cmap, theme=theme)
+                colorscale=cmap, theme=theme, line_contours=line_contours)
 
     Zplot = Z.astype(float)
     if zscale == 'log':
@@ -2687,6 +3039,8 @@ def fig_intensity_contour_plane(plane, slice_idx, species, idef, transition_idx,
         colorbar=_contour_colorbar(cbar_title),
         **trace_kw,
     ))
+    if line_contours:
+        _add_contour_level_lines(fig, x_plot, y_plot, Zplot, line_contours)
     return _apply_square_contour_layout(
         fig, x_plot, y_plot, xdef, ydef, slice_title,
         fixed_size=True, theme=theme,
@@ -2697,32 +3051,44 @@ def make_intensity_contour_plots(species, idef, transition_idx, zscale, slice_in
                                  shift_rtol=X_SHIFT_MATCH_RTOL,
                                  shift_scan_direction=X_SHIFT_SCAN_DIRECTION,
                                  interp_config=None,
-                                 colorscale=DEFAULT_GRID_COLORMAP, theme='light'):
-    """Return one SIMLINE intensity contour per SLICE_PLANES entry."""
+                                 colorscale=DEFAULT_GRID_COLORMAP, theme='light',
+                                 slider_values=None,
+                                 show_obs_boundary=True,
+                                 extra_contour_levels=None,
+                                 extra_contour_color='black'):
+    """Return one SIMLINE intensity contour per active slice plane."""
     try:
         tidx = int(transition_idx)
     except (TypeError, ValueError):
         tidx = 0
+    idef = idef or SIMLINE_DEFAULT_IDEF
+    line_contours = _build_intensity_line_contours(
+        idef, zscale or 'log', show_obs_boundary,
+        extra_contour_levels, extra_contour_color,
+    )
     return tuple(
         fig_intensity_contour_plane(
-            plane, slice_indices[i], species, idef or SIMLINE_DEFAULT_IDEF, tidx, zscale,
+            plane, slice_indices[i], species, idef, tidx, zscale,
             shift_rtol=shift_rtol, shift_scan_direction=shift_scan_direction,
             interp_config=interp_config,
-            colorscale=colorscale, theme=theme)
-        for i, plane in enumerate(SLICE_PLANES)
+            colorscale=colorscale, theme=theme,
+            slider_values=slider_values,
+            line_contours=line_contours)
+        if plane.get('active') else placeholder_fig(theme=theme)
+        for i, plane in enumerate(active_slice_planes())
     )
 
 
-def fig_intensity_spectrum(values, species, idef, theme='light'):
+def fig_intensity_spectrum(values, species, idef, theme='light', int_slice_indices=None):
     """All SIMLINE line intensities for the selected model point."""
     if not _grid:
-        return placeholder_fig('Load a main grid directory', theme=theme)
+        return placeholder_fig('Load a grid or SIMLINE directory', theme=theme)
     if not _simline:
         return placeholder_fig('Load a SIMLINE directory on the Load tab', theme=theme)
     if not species:
         return placeholder_fig('Select a species', theme=theme)
 
-    tokens = _tokens_from_values(values)
+    tokens = _model_point_tokens(values, int_slice_indices)
     if tokens is None:
         return placeholder_fig('No model file for this parameter combination', theme=theme)
 
@@ -3022,7 +3388,7 @@ def fig_spectra_plot(values, species, transitions, positions_text,
             return placeholder_fig(f'Observational spectrum: {fit_error}', theme=theme), None, fit_error
         if has_simline_request:
             if not _grid:
-                return placeholder_fig('Load a main grid directory', theme=theme), None, None
+                return placeholder_fig('Load a grid or SIMLINE directory', theme=theme), None, None
             if not _simline:
                 return placeholder_fig('Load a SIMLINE directory on the Load tab',
                                        theme=theme), None, None
@@ -3081,7 +3447,7 @@ def fig_simline_pv(values, species, transition, pos_min, pos_max, zscale,
                    colorscale, pv_quantity='intensity', theme='light'):
     """Position-velocity diagram from a SimLine PV FITS cube."""
     if not _grid:
-        return placeholder_fig('Load a main grid directory', theme=theme)
+        return placeholder_fig('Load a grid or SIMLINE directory', theme=theme)
     if not _simline:
         return placeholder_fig('Load a SIMLINE directory on the Load tab', theme=theme)
     if isinstance(transition, (list, tuple)):
@@ -3389,8 +3755,12 @@ def _load_model_pair(values):
 def make_profile_plots(values, xvar, xscale, yscale, custom_species, theme='light'):
     model, overlay = _load_model_pair(values)
     if model is None:
-        bad = placeholder_fig(theme=theme) if not _grid else placeholder_fig(
-            'No model file for this parameter combination', theme=theme)
+        if _grid and _grid.get('simline_only'):
+            bad = placeholder_fig('Depth profiles require an HDF5 grid directory', theme=theme)
+        elif not _grid:
+            bad = placeholder_fig(theme=theme)
+        else:
+            bad = placeholder_fig('No model file for this parameter combination', theme=theme)
         return (bad,) * 4
     x_cross = find_h_h2_transition(model, xvar)
     figs = [
@@ -3407,8 +3777,12 @@ def make_profile_plots(values, xvar, xscale, yscale, custom_species, theme='ligh
 def make_thermal_plots(values, xvar, xscale, yscale, theme='light'):
     model, overlay = _load_model_pair(values)
     if model is None:
-        bad = placeholder_fig(theme=theme) if not _grid else placeholder_fig(
-            'No model file for this parameter combination', theme=theme)
+        if _grid and _grid.get('simline_only'):
+            bad = placeholder_fig('Heating/cooling profiles require an HDF5 grid directory', theme=theme)
+        elif not _grid:
+            bad = placeholder_fig(theme=theme)
+        else:
+            bad = placeholder_fig('No model file for this parameter combination', theme=theme)
         return (bad,) * 3
     return (
         fig_thermal(model, overlay, xvar, xscale, yscale, theme=theme),
@@ -3487,6 +3861,46 @@ def _shift_control_row(prefix=''):
               'padding': '12px 18px', 'backgroundColor': '#faf6f4',
               'borderRadius': '8px', 'marginBottom': '12px',
               'border': '1px dashed #c9a99b'})
+
+
+def _int_contour_overlay_row():
+    """Observational boundary and optional user contour levels for intensity grids."""
+    return html.Div([
+        html.Div([
+            html.Label('Observational boundary', style=_CTRL_LABEL),
+            dcc.Checklist(
+                id='int-obs-boundary',
+                options=[{'label': f'  {INT_OBS_BOUNDARY_JTEMP:g} K km/s detection limit (red)',
+                          'value': 'show'}],
+                value=['show'],
+                style={'fontSize': '13px'},
+            ),
+            html.Span('  jtemp only — KoSens-style observational limit',
+                      style={'fontSize': '11px', 'color': '#888', 'marginLeft': '8px'}),
+        ], style={'flex': '1.6', 'minWidth': '280px', 'marginRight': '18px'}),
+        html.Div([
+            html.Label('Extra contour levels', style=_CTRL_LABEL),
+            dcc.Input(
+                id='int-extra-contours', type='text', value='',
+                placeholder='e.g. 0.5, 1, 5  (physical units of quantity)',
+                style={'width': '100%', 'padding': '7px 9px', 'fontSize': '13px',
+                       'border': '1px solid #bbc', 'borderRadius': '6px'}),
+            html.Span('  comma-separated; drawn on all slice panels',
+                      style={'fontSize': '11px', 'color': '#888', 'marginTop': '4px',
+                             'display': 'block'}),
+        ], style={'flex': '2', 'minWidth': '260px', 'marginRight': '18px'}),
+        html.Div([
+            html.Label('Extra contour color', style=_CTRL_LABEL),
+            dcc.Input(
+                id='int-extra-contour-color', type='text', value='black',
+                placeholder='CSS color, e.g. black, #00ff00, cyan',
+                style={'width': '100%', 'padding': '7px 9px', 'fontSize': '13px',
+                       'border': '1px solid #bbc', 'borderRadius': '6px'}),
+        ], style={'flex': '1', 'minWidth': '140px'}),
+    ], style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
+              'padding': '12px 18px', 'backgroundColor': '#faf8f4',
+              'borderRadius': '8px', 'marginBottom': '12px',
+              'border': '1px dashed #d4c4b8'})
 
 
 def _interp_control_row(prefix=''):
@@ -3626,70 +4040,64 @@ _SLICE_PANELS_COL_STYLE = {
 }
 
 
-def _slice_panel(plane):
-    """One 2-D contour panel with its own third-axis slider."""
-    pid = plane['id']
-    sdef = _param_def(plane['slice'])
-    unit = f'  ({sdef["unit"]})' if sdef['unit'] else ''
+def _slice_panel(slot_id):
+    """One 2-D contour panel with its own third-axis slider (axes set at load time)."""
     return html.Div([
         html.Div([
-            html.Label(f'Fixed: {sdef["name"]}{unit}', style={**_CTRL_LABEL, 'fontSize': '12px'}),
-            dcc.Slider(id=f'slice-slider-{pid}', min=0, max=1, step=1, value=0, marks={},
+            html.Label(id=f'slice-fixed-label-{slot_id}',
+                       style={**_CTRL_LABEL, 'fontSize': '12px'}),
+            dcc.Slider(id=f'slice-slider-{slot_id}', min=0, max=1, step=1, value=0, marks={},
                        tooltip={'placement': 'top', 'always_visible': False}),
-            html.Div(id=f'slice-label-{pid}',
-                     style={'textAlign': 'center', 'color': sdef['color'],
-                            'fontSize': '11px', 'marginTop': '2px', 'fontWeight': '600'}),
+            html.Div(id=f'slice-label-{slot_id}',
+                     style={'textAlign': 'center', 'fontSize': '11px',
+                            'marginTop': '2px', 'fontWeight': '600'}),
         ], style={'padding': '0 4px 8px'}),
-        dcc.Graph(id=f'plot-contour-{pid}', figure=placeholder_fig(),
+        dcc.Graph(id=f'plot-contour-{slot_id}', figure=placeholder_fig(),
                   config=_SLICE_GRAPH_CFG,
                   style=_SLICE_GRAPH_STYLE),
-    ], id=f'slice-panel-{pid}', style=_SLICE_PANEL_ROW)
+    ], id=f'slice-panel-{slot_id}', style=_SLICE_PANEL_ROW)
 
 
-def _int_slice_panel(plane):
+def _int_slice_panel(slot_id):
     """One SIMLINE intensity contour panel with its own third-axis slider."""
-    pid = plane['id']
-    sdef = _param_def(plane['slice'])
-    unit = f'  ({sdef["unit"]})' if sdef['unit'] else ''
     return html.Div([
         html.Div([
-            html.Label(f'Fixed: {sdef["name"]}{unit}', style={**_CTRL_LABEL, 'fontSize': '12px'}),
-            dcc.Slider(id=f'int-slice-slider-{pid}', min=0, max=1, step=1, value=0, marks={},
+            html.Label(id=f'int-slice-fixed-label-{slot_id}',
+                       style={**_CTRL_LABEL, 'fontSize': '12px'}),
+            dcc.Slider(id=f'int-slice-slider-{slot_id}', min=0, max=1, step=1, value=0, marks={},
                        tooltip={'placement': 'top', 'always_visible': False}),
-            html.Div(id=f'int-slice-label-{pid}',
-                     style={'textAlign': 'center', 'color': sdef['color'],
-                            'fontSize': '11px', 'marginTop': '2px', 'fontWeight': '600'}),
+            html.Div(id=f'int-slice-label-{slot_id}',
+                     style={'textAlign': 'center', 'fontSize': '11px',
+                            'marginTop': '2px', 'fontWeight': '600'}),
         ], style={'padding': '0 4px 8px'}),
-        dcc.Graph(id=f'plot-int-contour-{pid}', figure=placeholder_fig(),
+        dcc.Graph(id=f'plot-int-contour-{slot_id}', figure=placeholder_fig(),
                   config=_SLICE_GRAPH_CFG,
                   style=_SLICE_GRAPH_STYLE),
-    ], id=f'int-slice-panel-{pid}', style=_SLICE_PANEL_ROW)
+    ], id=f'int-slice-panel-{slot_id}', style=_SLICE_PANEL_ROW)
 
 
-def _ie_plane_section(plane):
+def _ie_plane_section(slot_id):
     """One slice plane on the interpolation-error tab (abundance + intensity rows)."""
-    pid = plane['id']
-    sdef = _param_def(plane['slice'])
-    unit = f'  ({sdef["unit"]})' if sdef['unit'] else ''
     slider_block = html.Div([
-        html.Label(f'Fixed: {sdef["name"]}{unit}', style={**_CTRL_LABEL, 'fontSize': '12px'}),
-        dcc.Slider(id=f'ie-slice-slider-{pid}', min=0, max=1, step=1, value=0, marks={},
+        html.Label(id=f'ie-slice-fixed-label-{slot_id}',
+                   style={**_CTRL_LABEL, 'fontSize': '12px'}),
+        dcc.Slider(id=f'ie-slice-slider-{slot_id}', min=0, max=1, step=1, value=0, marks={},
                    tooltip={'placement': 'top', 'always_visible': False}),
-        html.Div(id=f'ie-slice-label-{pid}',
-                 style={'textAlign': 'center', 'color': sdef['color'],
-                        'fontSize': '11px', 'marginTop': '2px', 'fontWeight': '600'}),
+        html.Div(id=f'ie-slice-label-{slot_id}',
+                 style={'textAlign': 'center', 'fontSize': '11px',
+                        'marginTop': '2px', 'fontWeight': '600'}),
     ], style={'padding': '0 4px 8px', 'maxWidth': f'{COMPACT_FIG_WIDTH}px'})
     return html.Div([
-        html.H4(_IE_PLANE_LABELS.get(pid, pid), style={'fontSize': '14px', 'margin': '8px 0 4px',
+        html.H4(id=f'ie-plane-title-{slot_id}', style={'fontSize': '14px', 'margin': '8px 0 4px',
                                                         'color': '#333', 'fontWeight': '600'}),
         slider_block,
-        html.Div(id=f'ie-abund-wrap-{pid}', children=[
-            dcc.Graph(id=f'plot-ie-abund-{pid}', figure=placeholder_fig(),
+        html.Div(id=f'ie-abund-wrap-{slot_id}', children=[
+            dcc.Graph(id=f'plot-ie-abund-{slot_id}', figure=placeholder_fig(),
                       config=_SLICE_GRAPH_CFG,
                       style={'width': '100%', 'height': 'auto', 'marginBottom': '8px'}),
         ]),
-        html.Div(id=f'ie-int-wrap-{pid}', children=[
-            dcc.Graph(id=f'plot-ie-int-{pid}', figure=placeholder_fig(),
+        html.Div(id=f'ie-int-wrap-{slot_id}', children=[
+            dcc.Graph(id=f'plot-ie-int-{slot_id}', figure=placeholder_fig(),
                       config=_SLICE_GRAPH_CFG,
                       style={'width': '100%', 'height': 'auto'}),
         ]),
@@ -3709,7 +4117,7 @@ app.layout = html.Div(
                 style={'margin': '0 0 4px', 'color': '#1a1a2e',
                        'fontSize': '26px', 'fontWeight': '700'}),
         html.P('Interactive browser for KoSens3D photodissociation-region model grids '
-               '(one HDF5 file per model point).',
+               '(HDF5 per model point, and/or SIMLINE line output).',
                style={'margin': '0', 'color': '#666', 'fontSize': '13px'}),
     ], style={'borderBottom': '2px solid #1f77b4',
               'paddingBottom': '10px', 'marginBottom': '14px'}),
@@ -3770,13 +4178,17 @@ app.layout = html.Div(
         dcc.Tab(label='Load grids', value='load', style=_TAB_STYLE, selected_style=_TAB_SEL,
                 children=[
             html.Div(style={'paddingTop': '14px'}, children=[
-                html.P('Load the main model grid and, optionally, an overlay grid '
-                       '(e.g. attenuated models), a chemistry reaction-rate grid, '
-                       'and a SIMLINE intensity directory.',
+                html.P('Load the main HDF5 model grid and/or a SIMLINE intensity directory. '
+                       'If you only have SIMLINE output, load that directory alone — '
+                       'density, FUV, CRIR, mass, and other parameters are read from the '
+                       'filenames and drive the parameter sliders. HDF5-dependent tabs '
+                       '(profiles, chemistry, CR attenuation, etc.) stay disabled until '
+                       'a grid directory is loaded.',
                        style=_PAGE_INTRO),
 
                 html.Div([
-                    html.Label('Grid directory', style=_CTRL_LABEL),
+                    html.Label('Grid directory  (optional if SIMLINE is loaded)',
+                               style=_CTRL_LABEL),
                     html.Div([
                         dcc.Input(id='dir-input', type='text', value=args.dir,
                                   placeholder='/path/to/pdrgrid_hdf5',
@@ -3891,8 +4303,8 @@ app.layout = html.Div(
                 dcc.Store(id='chem-state', data=0),
 
                 html.Div([
-                    html.Label('SIMLINE directory  (optional \u2014 line intensities; '
-                               'enables the Intensities tab)', style=_CTRL_LABEL),
+                    html.Label('SIMLINE directory  (line intensities / spectra; can be loaded '
+                               'without HDF5)', style=_CTRL_LABEL),
                     html.Div([
                         dcc.Input(id='simline-dir-input', type='text', value='',
                                   placeholder='/path/to/simlineoutput',
@@ -4020,7 +4432,7 @@ app.layout = html.Div(
                           'borderRadius': '8px', 'marginBottom': '12px'}),
                 _interp_control_row(prefix=''),
                 _shift_control_row(prefix=''),
-                html.Div([_slice_panel(plane) for plane in SLICE_PLANES],
+                html.Div([_slice_panel(p['id']) for p in SLICE_PLANES],
                          id='slice-panels-wrap',
                          style=_SLICE_PANELS_ROW_STYLE),
             ]),
@@ -4111,9 +4523,10 @@ app.layout = html.Div(
                           'borderRadius': '8px', 'marginBottom': '12px'}),
                 _interp_control_row(prefix='int-'),
                 _shift_control_row(prefix='int-'),
+                _int_contour_overlay_row(),
                 dcc.Graph(id='plot-int-spectrum', figure=placeholder_fig(), config=_GRAPH_CFG,
                           style={'marginBottom': '12px'}),
-                html.Div([_int_slice_panel(plane) for plane in SLICE_PLANES],
+                html.Div([_int_slice_panel(p['id']) for p in SLICE_PLANES],
                          id='int-slice-panels-wrap',
                          style=_SLICE_PANELS_ROW_STYLE),
             ]),
@@ -4283,7 +4696,7 @@ app.layout = html.Div(
                           'borderRadius': '8px', 'marginBottom': '12px'}),
                 _interp_control_row(prefix='ie-'),
                 _interp_error_control_row(),
-                html.Div([_ie_plane_section(plane) for plane in SLICE_PLANES],
+                html.Div([_ie_plane_section(p['id']) for p in SLICE_PLANES],
                          id='ie-panels-wrap', style=_SLICE_PANELS_COL_STYLE),
             ]),
         ]),
@@ -4359,8 +4772,10 @@ app.layout = html.Div(
             html.Div(style={'paddingTop': '10px'}, children=[
                 html.P('Fit observational FITS intensity maps to the 3-D SIMLINE model grid '
                        '(KoSens3D ``fit_fits_maps_to_grids_3d``). Requires a main grid and '
-                       'SIMLINE directory on the Load tab. Axes: density (x), FUV (y), '
-                       'cosmic-ray rate (z).',
+                       'SIMLINE directory on the Load tab. The three fit axes are chosen '
+                       'automatically from the varying parameters in the loaded grid '
+                       '(density × FUV × ζ when all three vary; otherwise the first three '
+                       'varying axes, e.g. density × mass × FUV for 4-token grids).',
                        style=_PAGE_INTRO),
                 html.Div([
                     html.Div([
@@ -4487,6 +4902,43 @@ app.layout = html.Div(
                     html.Div([
                         dcc.Graph(id='plot-fit-chi2', figure=placeholder_fig(),
                                   config=_GRAPH_CFG, style={'width': '100%'}),
+                    ], style={'padding': '0 18px', 'marginBottom': '12px'}),
+                    html.Div([
+                        dcc.Graph(id='plot-fit-dominant', figure=placeholder_fig(),
+                                  config=_GRAPH_CFG, style={'width': '100%'}),
+                    ], style={'padding': '0 18px', 'marginBottom': '12px'}),
+                    html.H4('Fitted parameter distributions', style={'padding': '0 18px',
+                                                                    'margin': '8px 0 4px',
+                                                                    'fontSize': '15px', 'color': '#444'}),
+                    html.Div([
+                        dcc.Graph(id='plot-fit-kde', figure=placeholder_fig(),
+                                  config=_GRAPH_CFG, style={'width': '100%'}),
+                    ], style={'padding': '0 18px', 'marginBottom': '12px'}),
+                    html.H4('χ² analysis at pixel', style={'padding': '0 18px', 'margin': '8px 0 4px',
+                                                           'fontSize': '15px', 'color': '#444'}),
+                    html.P('Set row/column above and re-run the fit, or change the pixel after a fit '
+                             'to refresh the detailed χ² plots.',
+                           style={'padding': '0 18px', 'margin': '0 0 8px', 'fontSize': '12px',
+                                  'color': '#666'}),
+                    html.Div([
+                        dcc.Graph(id='plot-fit-chi2-pixel', figure=placeholder_fig(),
+                                  config=_GRAPH_CFG, style={'width': '100%'}),
+                    ], style={'padding': '0 18px', 'marginBottom': '12px'}),
+                    html.Div([
+                        dcc.Graph(id='plot-fit-chi2-corner', figure=placeholder_fig(),
+                                  config=_GRAPH_CFG, style={'width': '100%'}),
+                    ], style={'padding': '0 18px', 'marginBottom': '12px'}),
+                    html.Div([
+                        dcc.Graph(id='plot-fit-chi2-z', figure=placeholder_fig(),
+                                  config=_GRAPH_CFG, style={'width': '100%'}),
+                    ], style={'padding': '0 18px', 'marginBottom': '12px'}),
+                    html.Div([
+                        dcc.Graph(id='plot-fit-chi2-bars', figure=placeholder_fig(),
+                                  config=_GRAPH_CFG, style={'width': '100%'}),
+                    ], style={'padding': '0 18px', 'marginBottom': '12px'}),
+                    html.Div([
+                        dcc.Graph(id='plot-fit-species-contours', figure=placeholder_fig(),
+                                  config=_GRAPH_CFG, style={'width': '100%'}),
                     ], style={'padding': '0 18px'}),
                 ]),
             ]),
@@ -4574,6 +5026,109 @@ def _default_contour_quantity(species_idx):
     return 'tgas'
 
 
+def _slider_wrap_styles():
+    hidden = {'display': 'none', 'flex': '1 1 240px', 'minWidth': '210px',
+              'marginRight': '24px', 'marginBottom': '8px'}
+    shown = {**hidden, 'display': 'block'}
+    return hidden, shown
+
+
+def _ui_slider_config(axis_tokens):
+    """Build Dash slider outputs from an ``axis_tokens`` dict."""
+    hidden, shown = _slider_wrap_styles()
+    slider_cfg = []
+    for d, p in enumerate(PARAM_DEFS):
+        tokens = axis_tokens[p['key']]
+        n = len(tokens)
+        varies = n > 1
+        marks = build_marks(p)
+        value = n // 2
+        slider_cfg += [max(n - 1, 0), marks, value, (shown if varies else hidden)]
+
+    slice_cfg = []
+    for plane in active_slice_planes():
+        if plane.get('active') and plane.get('slice'):
+            sdef = _param_def(plane['slice'])
+            tokens = axis_tokens[plane['slice']]
+            n = len(tokens)
+            slice_cfg += [max(n - 1, 0), build_marks(sdef), n // 2]
+        else:
+            slice_cfg += [1, {}, 0]
+    return slider_cfg, slice_cfg, hidden
+
+
+def _empty_param_slider_ui(hidden):
+    empty = []
+    for _ in range(N_PARAMS):
+        empty += [1, {}, 0, hidden]
+    return empty
+
+
+def _empty_slice_slider_ui():
+    empty = []
+    for _ in SLICE_PLANES:
+        empty += [1, {}, 0]
+    return empty
+
+
+def _species_dropdown_cfg(species, species_idx):
+    sp_opts = [{'label': s, 'value': s} for s in species]
+    defaults = [s for s in DEFAULT_CUSTOM if s in species_idx][:3]
+    cq_opts = _contour_quantity_options(species)
+    cq_val = _default_contour_quantity(species_idx)
+    return sp_opts, defaults, cq_opts, cq_val, list(cq_opts), cq_val
+
+
+_grid_sync_outputs = [Output('grid-loaded', 'data', allow_duplicate=True)]
+for d in range(N_PARAMS):
+    _grid_sync_outputs += [
+        Output(f'slider-{d}', 'max', allow_duplicate=True),
+        Output(f'slider-{d}', 'marks', allow_duplicate=True),
+        Output(f'slider-{d}', 'value', allow_duplicate=True),
+        Output({'role': 'slider-wrap', 'idx': d}, 'style', allow_duplicate=True),
+    ]
+for plane in SLICE_PLANES:
+    pid = plane['id']
+    _grid_sync_outputs += [
+        Output(f'slice-slider-{pid}', 'max', allow_duplicate=True),
+        Output(f'slice-slider-{pid}', 'marks', allow_duplicate=True),
+        Output(f'slice-slider-{pid}', 'value', allow_duplicate=True),
+        Output(f'int-slice-slider-{pid}', 'max', allow_duplicate=True),
+        Output(f'int-slice-slider-{pid}', 'marks', allow_duplicate=True),
+        Output(f'int-slice-slider-{pid}', 'value', allow_duplicate=True),
+        Output(f'ie-slice-slider-{pid}', 'max', allow_duplicate=True),
+        Output(f'ie-slice-slider-{pid}', 'marks', allow_duplicate=True),
+        Output(f'ie-slice-slider-{pid}', 'value', allow_duplicate=True),
+    ]
+_grid_sync_outputs += [
+    Output('species-selector', 'options', allow_duplicate=True),
+    Output('species-selector', 'value', allow_duplicate=True),
+    Output('contour-quantity', 'options', allow_duplicate=True),
+    Output('contour-quantity', 'value', allow_duplicate=True),
+    Output('ie-quantity', 'options', allow_duplicate=True),
+    Output('ie-quantity', 'value', allow_duplicate=True),
+]
+_N_GRID_SYNC = len(_grid_sync_outputs)
+
+
+def _empty_grid_sync(loaded=False):
+    hidden, _ = _slider_wrap_styles()
+    empty = _empty_param_slider_ui(hidden)
+    empty_slice = _empty_slice_slider_ui()
+    empty_dropdowns = [[], [], [], None, [], None]
+    return [loaded] + empty + empty_slice + empty_slice + empty_slice + empty_dropdowns
+
+
+def _grid_sync_from_axis_tokens(axis_tokens):
+    slider_cfg, slice_cfg, _ = _ui_slider_config(axis_tokens)
+    species = _grid.get('species', [])
+    species_idx = _grid.get('species_idx', {})
+    sp_opts, defaults, cq_opts, cq_val, ie_cq_opts, ie_cq_val = _species_dropdown_cfg(
+        species, species_idx)
+    return ([True] + slider_cfg + slice_cfg + slice_cfg + slice_cfg
+            + [sp_opts, defaults, cq_opts, cq_val, ie_cq_opts, ie_cq_val])
+
+
 @app.callback(
     [Output('load-status', 'children'),
      Output('grid-loaded', 'data')]
@@ -4593,13 +5148,8 @@ def _default_contour_quantity(species_idx):
     prevent_initial_call=True,
 )
 def handle_load(n_clicks, directory, recursive):
-    hidden = {'display': 'none', 'flex': '1 1 240px', 'minWidth': '210px',
-              'marginRight': '24px', 'marginBottom': '8px'}
-    shown = {**hidden, 'display': 'block'}
-
-    empty_slice = []
-    for _ in SLICE_PLANES:
-        empty_slice += [1, {}, 0]
+    hidden, shown = _slider_wrap_styles()
+    empty_slice = _empty_slice_slider_ui()
     empty_int_slice = list(empty_slice)
     empty_ie_slice = list(empty_slice)
 
@@ -4607,36 +5157,13 @@ def handle_load(n_clicks, directory, recursive):
         grid = scan_directory(directory or '', recursive=bool(recursive))
     except Exception as exc:
         err = html.Span(f'\u2717  {exc}', style={'color': '#d62728', 'fontWeight': '600'})
-        empty = []
-        for _ in range(N_PARAMS):
-            empty += [1, {}, 0, hidden]
+        empty = _empty_param_slider_ui(hidden)
         return ([err, False] + empty + empty_slice + empty_int_slice + empty_ie_slice
                 + [[], [], [], None, [], None])
 
-    # Build per-slider configuration.
-    slider_cfg = []
-    for d, p in enumerate(PARAM_DEFS):
-        tokens = grid['axis_tokens'][p['key']]
-        n = len(tokens)
-        varies = n > 1
-        marks = build_marks(p)
-        value = n // 2
-        slider_cfg += [max(n - 1, 0), marks, value, (shown if varies else hidden)]
-
-    slice_cfg = []
-    for plane in SLICE_PLANES:
-        sdef = _param_def(plane['slice'])
-        tokens = grid['axis_tokens'][plane['slice']]
-        n = len(tokens)
-        slice_cfg += [max(n - 1, 0), build_marks(sdef), n // 2]
-
-    species = grid['species']
-    sp_opts = [{'label': s, 'value': s} for s in species]
-    defaults = [s for s in DEFAULT_CUSTOM if s in grid['species_idx']][:3]
-    cq_opts = _contour_quantity_options(species)
-    cq_val = _default_contour_quantity(grid['species_idx'])
-    ie_cq_opts = list(cq_opts)
-    ie_cq_val = cq_val
+    slider_cfg, slice_cfg, _ = _ui_slider_config(grid['axis_tokens'])
+    sp_opts, defaults, cq_opts, cq_val, ie_cq_opts, ie_cq_val = _species_dropdown_cfg(
+        grid['species'], grid['species_idx'])
 
     cube = ' \u00D7 '.join(
         f'{len(grid["axis_tokens"][p["key"]])} {p["name"].split()[0]}'
@@ -4677,17 +5204,22 @@ def show_controls(tab, loaded):
     Output('controls-axis-wrap', 'style'),
     Output('model-info', 'style'),
     Input('plot-theme', 'value'),
+    Input('grid-loaded', 'data'),
+    Input('simline-state', 'data'),
 )
-def apply_plot_theme(theme):
+def apply_plot_theme(theme, loaded, _simline_state):
     t = _theme_colors(theme)
     root = {'fontFamily': 'Arial, sans-serif', 'maxWidth': '1460px',
             'margin': '0 auto', 'padding': '14px 22px', 'backgroundColor': t['page_bg']}
     sliders = {'display': 'flex', 'flexWrap': 'wrap', 'alignItems': 'flex-start',
                  'padding': '14px 18px', 'marginTop': '4px',
                  'backgroundColor': t['controls_bg'], 'borderRadius': '8px'}
-    axis = {'display': 'flex', 'alignItems': 'flex-start',
-            'padding': '10px 18px', 'marginTop': '8px',
-            'backgroundColor': t['controls_bg'], 'borderRadius': '8px'}
+    if loaded and _grid and _grid.get('simline_only'):
+        axis = {'display': 'none'}
+    else:
+        axis = {'display': 'flex', 'alignItems': 'flex-start',
+                'padding': '10px 18px', 'marginTop': '8px',
+                'backgroundColor': t['controls_bg'], 'borderRadius': '8px'}
     info = {'display': 'flex', 'flexWrap': 'wrap', 'gap': '8px', 'alignItems': 'center',
             'backgroundColor': t['controls_bg'], 'padding': '7px 16px', 'borderRadius': '6px',
             'marginTop': '8px', 'marginBottom': '4px', 'fontSize': '13px', 'color': t['font']}
@@ -4742,33 +5274,79 @@ def update_labels(*values):
                    'opacity': 1.0 if varies else 0.55}))
 
     filepath = current_file(values)
-    fname = os.path.basename(filepath) if filepath else '(no matching file)'
+    if filepath:
+        fname = os.path.basename(filepath)
+    elif _grid.get('simline_only'):
+        tok = _tokens_from_values(values)
+        spath = _simline_sample_path(tok)
+        if spath:
+            fname = f'{os.path.basename(spath)}  (SIMLINE only — no HDF5)'
+        else:
+            fname = 'SIMLINE model point (no HDF5)'
+    else:
+        fname = '(no matching file)'
     info.append(html.Span(fname, style={'color': '#999', 'fontSize': '12px'}))
     return labels + [info]
 
 
+def _slice_axis_ui(plane, idx):
+    """Return fixed-axis label, value label, and value style for one slice slot."""
+    if not _grid or not plane.get('active') or not plane.get('slice'):
+        return '', '', {'display': 'none'}
+    sdef = _param_def(plane['slice'])
+    tokens = _grid['axis_tokens'][plane['slice']]
+    varies = len(tokens) > 1
+    try:
+        tok = tokens[int(idx)]
+    except (IndexError, TypeError, ValueError):
+        tok = tokens[0]
+    if sdef['key'] == 'atten':
+        disp = f'{tok:02d}'
+    else:
+        disp = f'{sdef["decode"](tok):.4g}'
+    unit = f' {sdef["unit"]}' if sdef['unit'] else ''
+    role = 'Slice' if varies else 'Fixed'
+    fixed_lbl = f'{role}: {sdef["name"]}{unit}'
+    value_style = {
+        'textAlign': 'center', 'color': sdef['color'],
+        'fontSize': '11px', 'marginTop': '2px', 'fontWeight': '600',
+    }
+    return fixed_lbl, f'{disp}{unit}', value_style
+
+
+_slice_fixed_label_outputs = [Output(f'slice-fixed-label-{p["id"]}', 'children')
+                              for p in SLICE_PLANES]
+_slice_value_style_outputs = [Output(f'slice-label-{p["id"]}', 'style')
+                              for p in SLICE_PLANES]
+_int_slice_fixed_label_outputs = [Output(f'int-slice-fixed-label-{p["id"]}', 'children')
+                                  for p in SLICE_PLANES]
+_int_slice_value_style_outputs = [Output(f'int-slice-label-{p["id"]}', 'style')
+                                    for p in SLICE_PLANES]
+_ie_slice_fixed_label_outputs = [Output(f'ie-slice-fixed-label-{p["id"]}', 'children')
+                                 for p in SLICE_PLANES]
+_ie_plane_title_outputs = [Output(f'ie-plane-title-{p["id"]}', 'children')
+                           for p in SLICE_PLANES]
+
+
 @app.callback(
-    _slice_label_outputs,
-    _slice_slider_inputs,
+    _slice_label_outputs + _slice_fixed_label_outputs + _slice_value_style_outputs,
+    _slice_slider_inputs
+    + [Input('grid-loaded', 'data'), Input('simline-state', 'data')],
 )
-def update_slice_labels(*slice_indices):
+def update_slice_labels(*args_in):
+    n = len(SLICE_PLANES)
+    slice_indices = list(args_in[:n])
     if not _grid:
-        return [''] * len(SLICE_PLANES)
-    labels = []
-    for plane, idx in zip(SLICE_PLANES, slice_indices):
-        sdef = _param_def(plane['slice'])
-        tokens = _grid['axis_tokens'][plane['slice']]
-        try:
-            tok = tokens[int(idx)]
-        except (IndexError, TypeError, ValueError):
-            tok = tokens[0]
-        if sdef['key'] == 'atten':
-            disp = f'{tok:02d}'
-        else:
-            disp = f'{sdef["decode"](tok):.4g}'
-        unit = f' {sdef["unit"]}' if sdef['unit'] else ''
-        labels.append(f'{disp}{unit}')
-    return labels
+        empty = [''] * n
+        hide = {'display': 'none'}
+        return empty + empty + [hide] * n
+    labels, fixed_labels, styles = [], [], []
+    for plane, idx in zip(active_slice_planes(), slice_indices):
+        fixed, val, style = _slice_axis_ui(plane, idx)
+        fixed_labels.append(fixed)
+        labels.append(val)
+        styles.append(style if val else {'display': 'none'})
+    return labels + fixed_labels + styles
 
 
 _slice_panel_style_outputs = [Output(f'slice-panel-{p["id"]}', 'style') for p in SLICE_PLANES]
@@ -4777,25 +5355,38 @@ _int_slice_panel_style_outputs = [Output(f'int-slice-panel-{p["id"]}', 'style') 
 _int_contour_graph_style_outputs = [Output(f'plot-int-contour-{p["id"]}', 'style') for p in SLICE_PLANES]
 
 
+def _slice_panel_row_style(active, full_width=False):
+    if not active:
+        return {'display': 'none'}
+    return _SLICE_PANEL_ROW_FULL if full_width else _SLICE_PANEL_ROW
+
+
 @app.callback(
     [Output('slice-panels-wrap', 'style'),
      *_slice_panel_style_outputs,
      *_contour_graph_style_outputs],
     Input('overlay-state', 'data'),
+    Input('grid-loaded', 'data'),
+    Input('simline-state', 'data'),
 )
-def update_slice_panels_layout(_overlay_state):
-    """Side-by-side equal-size panels without overlay; full-width rows with overlay."""
+def update_slice_panels_layout(_overlay_state, _loaded, _simline_state):
+    """Side-by-side equal-size panels without overlay; hide unused slice slots."""
     if _overlay:
-        return (
-            _SLICE_PANELS_COL_STYLE,
-            *([_SLICE_PANEL_ROW_FULL] * len(SLICE_PLANES)),
-            *([_SLICE_GRAPH_STYLE_FULL] * len(SLICE_PLANES)),
-        )
-    return (
-        _SLICE_PANELS_ROW_STYLE,
-        *([_SLICE_PANEL_ROW] * len(SLICE_PLANES)),
-        *([_SLICE_GRAPH_STYLE_COMPACT] * len(SLICE_PLANES)),
-    )
+        wrap = _SLICE_PANELS_COL_STYLE
+        full = True
+    else:
+        wrap = _SLICE_PANELS_ROW_STYLE
+        full = False
+    panel_styles = [
+        _slice_panel_row_style(p.get('active'), full_width=full)
+        for p in active_slice_planes()
+    ]
+    graph_styles = [
+        _SLICE_GRAPH_STYLE_FULL if full and p.get('active') else
+        (_SLICE_GRAPH_STYLE_COMPACT if p.get('active') else {'display': 'none'})
+        for p in active_slice_planes()
+    ]
+    return (wrap, *panel_styles, *graph_styles)
 
 
 @app.callback(
@@ -4803,19 +5394,26 @@ def update_slice_panels_layout(_overlay_state):
      *_int_slice_panel_style_outputs,
      *_int_contour_graph_style_outputs],
     Input('simline-overlay-state', 'data'),
+    Input('grid-loaded', 'data'),
+    Input('simline-state', 'data'),
 )
-def update_int_slice_panels_layout(_simline_overlay_state):
+def update_int_slice_panels_layout(_simline_overlay_state, _loaded, _simline_state):
     if _simline_overlay:
-        return (
-            _SLICE_PANELS_COL_STYLE,
-            *([_SLICE_PANEL_ROW_FULL] * len(SLICE_PLANES)),
-            *([_SLICE_GRAPH_STYLE_FULL] * len(SLICE_PLANES)),
-        )
-    return (
-        _SLICE_PANELS_ROW_STYLE,
-        *([_SLICE_PANEL_ROW] * len(SLICE_PLANES)),
-        *([_SLICE_GRAPH_STYLE_COMPACT] * len(SLICE_PLANES)),
-    )
+        wrap = _SLICE_PANELS_COL_STYLE
+        full = True
+    else:
+        wrap = _SLICE_PANELS_ROW_STYLE
+        full = False
+    panel_styles = [
+        _slice_panel_row_style(p.get('active'), full_width=full)
+        for p in active_slice_planes()
+    ]
+    graph_styles = [
+        _SLICE_GRAPH_STYLE_FULL if full and p.get('active') else
+        (_SLICE_GRAPH_STYLE_COMPACT if p.get('active') else {'display': 'none'})
+        for p in active_slice_planes()
+    ]
+    return (wrap, *panel_styles, *graph_styles)
 
 
 @app.callback(
@@ -4979,14 +5577,15 @@ def handle_chem(n_load, n_clear, directory, recursive, state, cur_species):
 
 
 @app.callback(
-    Output('simline-status', 'children'),
-    Output('simline-state', 'data'),
-    Output('int-species', 'options'),
-    Output('int-species', 'value'),
-    Output('ie-int-species', 'options'),
-    Output('ie-int-species', 'value'),
-    Output('sp-species', 'options'),
-    Output('sp-species', 'value'),
+    [Output('simline-status', 'children'),
+     Output('simline-state', 'data'),
+     Output('int-species', 'options'),
+     Output('int-species', 'value'),
+     Output('ie-int-species', 'options'),
+     Output('ie-int-species', 'value'),
+     Output('sp-species', 'options'),
+     Output('sp-species', 'value')]
+    + _grid_sync_outputs,
     Input('btn-load-simline', 'n_clicks'),
     Input('btn-clear-simline', 'n_clicks'),
     State('simline-dir-input', 'value'),
@@ -5001,18 +5600,27 @@ def handle_simline(n_load, n_clear, directory, recursive, state,
                    cur_species, cur_ie_species, cur_sp_species):
     trigger = dash.callback_context.triggered[0]['prop_id'] if dash.callback_context.triggered else ''
     state = (state or 0)
+    no_grid_sync = [dash.no_update] * _N_GRID_SYNC
 
     if trigger.startswith('btn-clear-simline'):
+        was_simline_only = bool(_grid and _grid.get('simline_only'))
         clear_simline()
-        return (html.Span('SIMLINE directory cleared.', style={'color': '#888'}),
-                state + 1, [], None, [], None, [], None)
+        clear_simline_only_grid()
+        grid_sync = _empty_grid_sync(loaded=False) if was_simline_only else no_grid_sync
+        return ([html.Span('SIMLINE directory cleared.', style={'color': '#888'}),
+                 state + 1, [], None, [], None, [], None]
+                + grid_sync)
 
     try:
         sl = scan_simline(directory or '', recursive=bool(recursive))
     except Exception as exc:
-        return (html.Span(f'\u2717  {exc}',
-                          style={'color': '#d62728', 'fontWeight': '600'}),
-                state + 1, [], None, [], None, [], None)
+        return ([html.Span(f'\u2717  {exc}',
+                           style={'color': '#d62728', 'fontWeight': '600'}),
+                state + 1, [], None, [], None, [], None]
+                + no_grid_sync)
+
+    replaced_grid = _prepare_simline_grid_bootstrap(sl['directory'], recursive=bool(recursive))
+    bootstrapped = bootstrap_grid_from_simline()
 
     preferred = [s for s in ('CO', '13CO', 'C18O', 'HCO+', 'N2H+', 'CS', 'HCN', 'C+', 'CI')
                  if s in sl['species']]
@@ -5028,13 +5636,25 @@ def handle_simline(n_load, n_clear, directory, recursive, state,
     pv_note = ''
     if sl.get('n_pv_files'):
         pv_note = f', {sl["n_pv_files"]} PV FITS'
+    mode_note = ''
+    if bootstrapped:
+        cube = ' \u00D7 '.join(
+            f'{len(_grid["axis_tokens"][p["key"]])} {p["name"].split()[0]}'
+            for p in PARAM_DEFS if len(_grid['axis_tokens'][p['key']]) > 1
+        ) or 'single model'
+        mode_note = f'   \u2014   grid from filenames: {cube}  (SIMLINE-only mode)'
+    if replaced_grid:
+        mode_note += '   \u2014   replaced previous HDF5 grid (no .hdf5 in SIMLINE directory)'
+    grid_sync = (_grid_sync_from_axis_tokens(_grid['axis_tokens']) if bootstrapped
+                 else no_grid_sync)
     status = html.Span([
         html.Span('\u2713  SIMLINE ', style={'color': '#9467bd', 'fontWeight': '700'}),
         html.Code(sl['directory']),
-        html.Span(f'   {sl["n_files"]} files, {len(sl["species"])} species{pv_note}{note}',
+        html.Span(f'   {sl["n_files"]} files, {len(sl["species"])} species{pv_note}{note}{mode_note}',
                   style={'color': '#555', 'marginLeft': '10px'}),
     ])
-    return (status, state + 1, opts, value, opts, ie_value, opts, sp_value)
+    return ([status, state + 1, opts, value, opts, ie_value, opts, sp_value]
+            + grid_sync)
 
 
 @app.callback(
@@ -5163,27 +5783,24 @@ def update_sp_pv(*args_in):
 
 
 @app.callback(
-    _int_slice_label_outputs,
-    _int_slice_slider_inputs,
+    _int_slice_label_outputs + _int_slice_fixed_label_outputs + _int_slice_value_style_outputs,
+    _int_slice_slider_inputs
+    + [Input('grid-loaded', 'data'), Input('simline-state', 'data')],
 )
-def update_int_slice_labels(*slice_indices):
+def update_int_slice_labels(*args_in):
+    n = len(SLICE_PLANES)
+    slice_indices = list(args_in[:n])
     if not _grid:
-        return [''] * len(SLICE_PLANES)
-    labels = []
-    for plane, idx in zip(SLICE_PLANES, slice_indices):
-        sdef = _param_def(plane['slice'])
-        tokens = _grid['axis_tokens'][plane['slice']]
-        try:
-            tok = tokens[int(idx)]
-        except (IndexError, TypeError, ValueError):
-            tok = tokens[0]
-        if sdef['key'] == 'atten':
-            disp = f'{tok:02d}'
-        else:
-            disp = f'{sdef["decode"](tok):.4g}'
-        unit = f' {sdef["unit"]}' if sdef['unit'] else ''
-        labels.append(f'{disp}{unit}')
-    return labels
+        empty = [''] * n
+        hide = {'display': 'none'}
+        return empty + empty + [hide] * n
+    labels, fixed_labels, styles = [], [], []
+    for plane, idx in zip(active_slice_planes(), slice_indices):
+        fixed, val, style = _slice_axis_ui(plane, idx)
+        fixed_labels.append(fixed)
+        labels.append(val)
+        styles.append(style if val else {'display': 'none'})
+    return labels + fixed_labels + styles
 
 
 def _ie_slice_token(plane, idx):
@@ -5207,27 +5824,23 @@ def _ie_quantity_unit(quantity):
 
 
 @app.callback(
-    _ie_slice_label_outputs,
-    _ie_slice_slider_inputs,
+    _ie_slice_label_outputs + _ie_slice_fixed_label_outputs + _ie_plane_title_outputs,
+    _ie_slice_slider_inputs
+    + [Input('grid-loaded', 'data'), Input('simline-state', 'data')],
 )
-def update_ie_slice_labels(*slice_indices):
+def update_ie_slice_labels(*args_in):
+    n = len(SLICE_PLANES)
+    slice_indices = list(args_in[:n])
     if not _grid:
-        return [''] * len(SLICE_PLANES)
-    labels = []
-    for plane, idx in zip(SLICE_PLANES, slice_indices):
-        sdef = _param_def(plane['slice'])
-        tokens = _grid['axis_tokens'][plane['slice']]
-        try:
-            tok = tokens[int(idx)]
-        except (IndexError, TypeError, ValueError):
-            tok = tokens[0]
-        if sdef['key'] == 'atten':
-            disp = f'{tok:02d}'
-        else:
-            disp = f'{sdef["decode"](tok):.4g}'
-        unit = f' {sdef["unit"]}' if sdef['unit'] else ''
-        labels.append(f'{disp}{unit}')
-    return labels
+        empty = [''] * n
+        return empty + empty + empty
+    labels, fixed_labels, titles = [], [], []
+    for plane, idx in zip(active_slice_planes(), slice_indices):
+        fixed, val, _ = _slice_axis_ui(plane, idx)
+        fixed_labels.append(fixed)
+        labels.append(val)
+        titles.append(_plane_title_plain(plane['x'], plane['y']) if plane.get('active') else '')
+    return labels + fixed_labels + titles
 
 
 @app.callback(
@@ -5251,13 +5864,20 @@ def update_ie_slice_labels(*slice_indices):
      Input('ie-interp-y-lim', 'value'),
      Input('ie-interp-method', 'value'),
      Input('ie-interp-clip', 'value')]
+    + _slider_value_inputs
     + _ie_slice_slider_inputs,
 )
-def update_ie_panels(quantity, ie_species, ie_transition, ie_idef, flux_scale, grid_colorscale,
-                     plot_theme, error_metric, plot_contours, decimation, rel_threshold,
-                     _grid_loaded, _simline_state,
-                     interp_ny, interp_nx, interp_x_lim, interp_y_lim,
-                     interp_method, interp_clip, *slice_indices):
+def update_ie_panels(*args_in):
+    n_sl = N_PARAMS
+    n_ie = len(_ie_slice_slider_inputs)
+    n_fixed = len(args_in) - n_sl - n_ie
+    slider_values = list(args_in[n_fixed:n_fixed + n_sl])
+    slice_indices = list(args_in[n_fixed + n_sl:])
+    (quantity, ie_species, ie_transition, ie_idef, flux_scale, grid_colorscale,
+     plot_theme, error_metric, plot_contours, decimation, rel_threshold,
+     _grid_loaded, _simline_state,
+     interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+     interp_method, interp_clip) = args_in[:n_fixed]
     n = len(SLICE_PLANES)
     theme = _parse_plot_theme(plot_theme)
     colorscale = _parse_grid_colorscale(grid_colorscale)
@@ -5267,7 +5887,7 @@ def update_ie_panels(quantity, ie_species, ie_transition, ie_idef, flux_scale, g
     )
     zscale = flux_scale or 'log'
     err_metric = _parse_error_metric(error_metric)
-    show_abund = bool(_grid and quantity)
+    show_abund = bool(_grid and quantity and _grid_has_hdf5())
     show_int = bool(_grid and _simline and ie_species and ie_transition is not None)
 
     abund_figs, int_figs = [], []
@@ -5275,7 +5895,7 @@ def update_ie_panels(quantity, ie_species, ie_transition, ie_idef, flux_scale, g
     wrap_show = {'display': 'block', 'marginBottom': '8px'}
     wrap_hide = {'display': 'none'}
 
-    for plane, sidx in zip(SLICE_PLANES, slice_indices):
+    for plane, sidx in zip(active_slice_planes(), slice_indices):
         xdef = ydef = None
         if show_abund:
             slice_token = _ie_slice_token(plane, sidx)
@@ -5295,7 +5915,7 @@ def update_ie_panels(quantity, ie_species, ie_transition, ie_idef, flux_scale, g
                 else:
                     slice_disp = f'{sdef["decode"](slice_token):.4g}'
                 unit_l = _ie_quantity_unit(quantity)
-                title = (f'Abundance / diagnostic &mdash; {_IE_PLANE_LABELS.get(plane["id"], "")}'
+                title = (f'Abundance / diagnostic &mdash; {_ie_plane_label(plane["id"])}'
                          f'<br><sup>{_quantity_label(quantity)}'
                          f'  (fixed {sdef["name"]} = {slice_disp})</sup>')
                 abund_figs.append(fig_interpolation_comparison(
@@ -5320,7 +5940,8 @@ def update_ie_panels(quantity, ie_species, ie_transition, ie_idef, flux_scale, g
             except (TypeError, ValueError):
                 tidx = 0
             x_phys, y_phys, Z, xdef, ydef = _native_intensity_grid(
-                plane, slice_token, ie_species, ie_idef or SIMLINE_DEFAULT_IDEF, tidx)
+                plane, slice_token, ie_species, ie_idef or SIMLINE_DEFAULT_IDEF, tidx,
+                slider_values=slider_values)
             if np.any(np.isfinite(Z)):
                 result = gi.analyze_slice_interpolation(
                     x_phys, y_phys, Z,
@@ -5338,7 +5959,7 @@ def update_ie_panels(quantity, ie_species, ie_transition, ie_idef, flux_scale, g
                 tlabel = trans_rows[tidx]['label'] if 0 <= tidx < len(trans_rows) else str(tidx)
                 unit_l = _intensity_unit_label(ie_idef or SIMLINE_DEFAULT_IDEF)
                 sp_html = format_species_html(ie_species)
-                title = (f'Intensity &mdash; {_IE_PLANE_LABELS.get(plane["id"], "")}'
+                title = (f'Intensity &mdash; {_ie_plane_label(plane["id"])}'
                          f'<br><sup>{sp_html} {tlabel}'
                          f'  (fixed {sdef["name"]} = {slice_disp})</sup>')
                 int_figs.append(fig_interpolation_comparison(
@@ -5376,15 +5997,25 @@ def update_ie_panels(quantity, ie_species, ie_transition, ie_idef, flux_scale, g
      Input('int-interp-y-lim', 'value'),
      Input('int-interp-method', 'value'),
      Input('int-interp-clip', 'value'),
+     Input('int-obs-boundary', 'value'),
+     Input('int-extra-contours', 'value'),
+     Input('int-extra-contour-color', 'value'),
      Input('plot-theme', 'value'),
      Input('grid-colorscale', 'value')]
+    + _slider_value_inputs
     + _int_slice_slider_inputs,
 )
-def update_intensity_contours(species, idef, transition, zscale, _state, _ov_state,
-                              shift_dir, shift_rtol,
-                              interp_ny, interp_nx, interp_x_lim, interp_y_lim,
-                              interp_method, interp_clip, plot_theme, grid_colorscale,
-                              *slice_indices):
+def update_intensity_contours(*args_in):
+    n_sl = N_PARAMS
+    n_int = len(_int_slice_slider_inputs)
+    n_fixed = len(args_in) - n_sl - n_int
+    slider_values = list(args_in[n_fixed:n_fixed + n_sl])
+    slice_indices = list(args_in[n_fixed + n_sl:])
+    (species, idef, transition, zscale, _state, _ov_state,
+     shift_dir, shift_rtol,
+     interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+     interp_method, interp_clip, obs_boundary, extra_contours, extra_contour_color,
+     plot_theme, grid_colorscale) = args_in[:n_fixed]
     theme = _parse_plot_theme(plot_theme)
     colorscale = _parse_grid_colorscale(grid_colorscale)
     if not _grid or not _simline or not species or transition is None:
@@ -5393,26 +6024,38 @@ def update_intensity_contours(species, idef, transition, zscale, _state, _ov_sta
     icfg = _interp_config(interp_ny, interp_nx, interp_x_lim, interp_y_lim,
                           interp_method, interp_clip)
     return make_intensity_contour_plots(
-        species, idef, transition, zscale or 'log', list(slice_indices),
+        species, idef, transition, zscale or 'log', slice_indices,
         shift_rtol=_parse_shift_rtol(shift_rtol),
         shift_scan_direction=_parse_shift_scan_direction(shift_dir),
         interp_config=icfg,
         colorscale=colorscale, theme=theme,
+        slider_values=slider_values,
+        show_obs_boundary=bool(obs_boundary and 'show' in obs_boundary),
+        extra_contour_levels=extra_contours,
+        extra_contour_color=extra_contour_color,
     )
 
 
 @app.callback(
     Output('plot-int-spectrum', 'figure'),
     _slider_value_inputs
+    + _int_slice_slider_inputs
     + [Input('int-species', 'value'),
        Input('int-idef', 'value'),
        Input('simline-state', 'data'),
+       Input('grid-loaded', 'data'),
        Input('plot-theme', 'value')],
 )
 def update_intensity_spectrum(*args_in):
+    n_int = len(_int_slice_slider_inputs)
     values = list(args_in[:N_PARAMS])
-    species, idef, _state, plot_theme = args_in[N_PARAMS:]
-    return fig_intensity_spectrum(values, species, idef, theme=_parse_plot_theme(plot_theme))
+    int_slices = list(args_in[N_PARAMS:N_PARAMS + n_int])
+    species, idef, _state, _loaded, plot_theme = args_in[N_PARAMS + n_int:]
+    return fig_intensity_spectrum(
+        values, species, idef,
+        theme=_parse_plot_theme(plot_theme),
+        int_slice_indices=int_slices,
+    )
 
 
 @app.callback(
@@ -5495,6 +6138,14 @@ def update_fit_available_lines(_simline_state, idef):
     ])
 
 
+def _chi2_detail_figure(figs, key, default_msg, *, theme='light'):
+    """Return a chi² analysis figure or a themed placeholder."""
+    fig = figs.get(key)
+    if fig is not None:
+        return fig
+    return placeholder_fig(default_msg, theme=theme)
+
+
 @app.callback(
     Output('fit-status', 'children'),
     Output('fit-state', 'data'),
@@ -5502,6 +6153,13 @@ def update_fit_available_lines(_simline_state, idef):
     Output('plot-fit-y', 'figure'),
     Output('plot-fit-z', 'figure'),
     Output('plot-fit-chi2', 'figure'),
+    Output('plot-fit-dominant', 'figure'),
+    Output('plot-fit-kde', 'figure'),
+    Output('plot-fit-chi2-pixel', 'figure'),
+    Output('plot-fit-chi2-corner', 'figure'),
+    Output('plot-fit-chi2-z', 'figure'),
+    Output('plot-fit-chi2-bars', 'figure'),
+    Output('plot-fit-species-contours', 'figure'),
     Input('btn-run-map-fit', 'n_clicks'),
     State('fit-maps-json', 'value'),
     State('fit-errors-json', 'value'),
@@ -5525,8 +6183,11 @@ def handle_map_fit(n_clicks, maps_json, errors_json, output_dir, idef,
     theme = _parse_plot_theme(plot_theme)
     colorscale = _parse_grid_colorscale(grid_colorscale)
     empty = placeholder_fig('Run a map fit', theme=theme)
+    chi2_empty = placeholder_fig('Enable “χ² analysis at pixel” and run a fit', theme=theme)
+    kde_empty = placeholder_fig('Run a map fit to see parameter KDEs', theme=theme)
     if not n_clicks:
-        return dash.no_update, dash.no_update, empty, empty, empty, empty
+        return (dash.no_update, dash.no_update, empty, empty, empty, empty, empty, kde_empty,
+                chi2_empty, chi2_empty, chi2_empty, chi2_empty, chi2_empty)
 
     opts = fit_options or []
     try:
@@ -5537,15 +6198,17 @@ def handle_map_fit(n_clicks, maps_json, errors_json, output_dir, idef,
     except Exception as exc:
         err = html.Span(f'\u2717  {exc}',
                         style={'color': '#d62728', 'fontWeight': '600'})
-        return err, (state or 0) + 1, empty, empty, empty, empty
+        return (err, (state or 0) + 1, empty, empty, empty, empty, empty, kde_empty,
+                chi2_empty, chi2_empty, chi2_empty, chi2_empty, chi2_empty)
 
     # WCS from the reference observed FITS (stored on the result)
     figs = gf.fit_result_figures(result, theme=theme, colorscale=colorscale)
     ref = result.get('reference_line', '')
     nlines = len(result.get('lines_fitted') or [])
+    axes_label = result.get('fit_axes_label') or result.get('fit_axis_config', {}).get('axis_x', '')
     status = html.Span([
         html.Span('\u2713  Map fit complete. ', style={'color': '#2ca02c', 'fontWeight': '700'}),
-        html.Span(f'{nlines} line(s), reference footprint: {ref}. '),
+        html.Span(f'{nlines} line(s), fit axes: {axes_label}, reference footprint: {ref}. '),
         html.Span('FITS saved to '),
         html.Code(result.get('output_dir', '')),
         html.Span(f"  \u2014  x: {os.path.basename(result.get('x_fits_path', ''))}, "
@@ -5553,10 +6216,20 @@ def handle_map_fit(n_clicks, maps_json, errors_json, output_dir, idef,
                   f"z: {os.path.basename(result.get('z_fits_path', ''))}"),
     ])
     chi2_fig = figs.get('chi2', placeholder_fig('No reduced χ² map', theme=theme))
+    dom_fig = figs.get(
+        'chi2_dominant',
+        placeholder_fig('No dominant χ² contributor map', theme=theme),
+    )
     return (
         status, (state or 0) + 1,
         figs.get('x', empty), figs.get('y', empty),
-        figs.get('z', empty), chi2_fig,
+        figs.get('z', empty), chi2_fig, dom_fig,
+        _chi2_detail_figure(figs, 'kde', 'No KDE (need ≥2 valid pixels per axis)', theme=theme),
+        _chi2_detail_figure(figs, 'chi2_pixel_map', 'No χ² map (run fit with χ² analysis)', theme=theme),
+        _chi2_detail_figure(figs, 'chi2_corner', 'No χ² corner plot (enable χ² analysis)', theme=theme),
+        _chi2_detail_figure(figs, 'chi2_z_profile', 'No third-axis χ² profile', theme=theme),
+        _chi2_detail_figure(figs, 'chi2_bars', 'No observed vs model bars', theme=theme),
+        _chi2_detail_figure(figs, 'species_contours', 'No species contours (enable χ² analysis)', theme=theme),
     )
 
 
@@ -5565,6 +6238,13 @@ def handle_map_fit(n_clicks, maps_json, errors_json, output_dir, idef,
     Output('plot-fit-y', 'figure', allow_duplicate=True),
     Output('plot-fit-z', 'figure', allow_duplicate=True),
     Output('plot-fit-chi2', 'figure', allow_duplicate=True),
+    Output('plot-fit-dominant', 'figure', allow_duplicate=True),
+    Output('plot-fit-kde', 'figure', allow_duplicate=True),
+    Output('plot-fit-chi2-pixel', 'figure', allow_duplicate=True),
+    Output('plot-fit-chi2-corner', 'figure', allow_duplicate=True),
+    Output('plot-fit-chi2-z', 'figure', allow_duplicate=True),
+    Output('plot-fit-chi2-bars', 'figure', allow_duplicate=True),
+    Output('plot-fit-species-contours', 'figure', allow_duplicate=True),
     Input('plot-theme', 'value'),
     Input('grid-colorscale', 'value'),
     Input('fit-state', 'data'),
@@ -5572,7 +6252,7 @@ def handle_map_fit(n_clicks, maps_json, errors_json, output_dir, idef,
 )
 def refresh_fit_figures_on_theme(plot_theme, grid_colorscale, _fit_state):
     if not _fit_results:
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return (dash.no_update,) * 11
     theme = _parse_plot_theme(plot_theme)
     colorscale = _parse_grid_colorscale(grid_colorscale)
     figs = gf.fit_result_figures(_fit_results, theme=theme, colorscale=colorscale)
@@ -5581,6 +6261,64 @@ def refresh_fit_figures_on_theme(plot_theme, grid_colorscale, _fit_state):
         figs.get('x', empty), figs.get('y', empty),
         figs.get('z', empty),
         figs.get('chi2', placeholder_fig('No reduced χ² map', theme=theme)),
+        figs.get('chi2_dominant', placeholder_fig('No dominant χ² contributor map', theme=theme)),
+        _chi2_detail_figure(figs, 'kde', 'No KDE (need ≥2 valid pixels per axis)', theme=theme),
+        _chi2_detail_figure(figs, 'chi2_pixel_map', 'No χ² map (run fit with χ² analysis)', theme=theme),
+        _chi2_detail_figure(figs, 'chi2_corner', 'No χ² corner plot (enable χ² analysis)', theme=theme),
+        _chi2_detail_figure(figs, 'chi2_z_profile', 'No third-axis χ² profile', theme=theme),
+        _chi2_detail_figure(figs, 'chi2_bars', 'No observed vs model bars', theme=theme),
+        _chi2_detail_figure(figs, 'species_contours', 'No species contours (enable χ² analysis)', theme=theme),
+    )
+
+
+@app.callback(
+    Output('plot-fit-chi2-pixel', 'figure', allow_duplicate=True),
+    Output('plot-fit-chi2-corner', 'figure', allow_duplicate=True),
+    Output('plot-fit-chi2-z', 'figure', allow_duplicate=True),
+    Output('plot-fit-chi2-bars', 'figure', allow_duplicate=True),
+    Output('plot-fit-species-contours', 'figure', allow_duplicate=True),
+    Input('fit-chi2-i', 'value'),
+    Input('fit-chi2-j', 'value'),
+    Input('fit-state', 'data'),
+    State('plot-theme', 'value'),
+    State('grid-colorscale', 'value'),
+    prevent_initial_call=True,
+)
+def refresh_chi2_at_pixel(chi2_i, chi2_j, _fit_state, plot_theme, grid_colorscale):
+    """Re-run χ² analysis when the pixel row/col changes after a fit."""
+    global _fit_results
+    theme = _parse_plot_theme(plot_theme)
+    colorscale = _parse_grid_colorscale(grid_colorscale)
+    chi2_empty = placeholder_fig('Run a map fit with χ² analysis enabled', theme=theme)
+    if not _fit_results or not _fit_results.get('chi2_reanalysis'):
+        return chi2_empty, chi2_empty, chi2_empty, chi2_empty, chi2_empty
+    if chi2_i is None or chi2_j is None:
+        figs = gf.chi2_analysis_figures(_fit_results, theme=theme, colorscale=colorscale)
+    else:
+        try:
+            pixel = (int(chi2_i), int(chi2_j))
+        except (TypeError, ValueError):
+            figs = gf.chi2_analysis_figures(_fit_results, theme=theme, colorscale=colorscale)
+        else:
+            updated = gf.run_chi2_at_pixel(_fit_results, pixel)
+            if updated:
+                _fit_results.update({
+                    k: updated[k]
+                    for k in (
+                        'chi2_analysis', 'chi2_analysis_pixel', 'chi2_observed_values',
+                        'chi2_observed_errors', 'chi2_subtitle',
+                    )
+                    if k in updated
+                })
+            figs = gf.chi2_analysis_figures(
+                _fit_results, theme=theme, colorscale=colorscale, chi2_pixel=pixel,
+            )
+    return (
+        _chi2_detail_figure(figs, 'chi2_pixel_map', 'No χ² map', theme=theme),
+        _chi2_detail_figure(figs, 'chi2_corner', 'No χ² corner plot at this pixel', theme=theme),
+        _chi2_detail_figure(figs, 'chi2_z_profile', 'No third-axis χ² profile', theme=theme),
+        _chi2_detail_figure(figs, 'chi2_bars', 'No observed vs model bars', theme=theme),
+        _chi2_detail_figure(figs, 'species_contours', 'No species contours at this pixel', theme=theme),
     )
 
 

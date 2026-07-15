@@ -56,7 +56,7 @@ def parse_pv_fits_filename(path: str) -> Optional[Tuple[str, str, str, str]]:
         return None
     species = namebase.rsplit('_', 1)[-1]
     model_core = namebase[: -(len(species) + 1)]
-    if not model_core.startswith('Model'):
+    if gn.parse_model_tokens_from_stem(model_core) is None:
         return None
     return model_core, species, transition, quantity
 

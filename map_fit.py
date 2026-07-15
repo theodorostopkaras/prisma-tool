@@ -11,6 +11,8 @@ import numpy as np
 from astropy.io import fits
 from astropy.wcs import WCS
 
+import grid_naming as gn
+
 try:
     from tqdm import tqdm
 except ImportError:  # pragma: no cover
@@ -35,6 +37,7 @@ from map_fit_extras import (
     NC,
     ORANGE,
     RED,
+    _CHI2_MAX_CONTRIB,
     _chi2_contribution,
     _chi2_plot_surface,
     _infer_axis_display_label,
@@ -2254,6 +2257,128 @@ def _fit_pixel_3d_with_uncertainty(obs_values, obs_errs, grid_arrays,
 
     return best_x, best_y, best_z, sigma_x, sigma_y, sigma_z, chi2_min, chi2_reduced
 #-----------------------------------------------------------------------------------------------------------
+def _chi2_contributions_at_minimum(chi2_grid, obs_values, obs_errs, grid_arrays):
+    """Per-line chi^2 contributions at the discrete chi^2 minimum grid cell."""
+    finite_grid = np.where(np.isfinite(chi2_grid), chi2_grid, np.inf)
+    min_z_idx, min_y_idx, min_x_idx = np.unravel_index(
+        np.argmin(finite_grid), chi2_grid.shape,
+    )
+
+    contributions = {}
+    for data_name, obs_val in obs_values.items():
+        if data_name not in grid_arrays:
+            continue
+        model_val = grid_arrays[data_name][min_z_idx, min_y_idx, min_x_idx]
+        obs_err = obs_errs[data_name]
+        with np.errstate(divide='ignore', invalid='ignore'):
+            contrib = ((model_val - obs_val) / obs_err) ** 2
+        if not np.isfinite(contrib):
+            contrib = _CHI2_MAX_CONTRIB
+        contributions[data_name] = float(min(contrib, _CHI2_MAX_CONTRIB))
+
+    return contributions
+#-----------------------------------------------------------------------------------------------------------
+def _dominant_chi2_contributor(chi2_grid, obs_values, obs_errs, grid_arrays):
+    """Return the line/ratio with the largest chi^2 contribution at chi^2 minimum."""
+    contributions = _chi2_contributions_at_minimum(
+        chi2_grid, obs_values, obs_errs, grid_arrays,
+    )
+    if not contributions:
+        return None, contributions
+    dominant = max(contributions, key=contributions.get)
+    return dominant, contributions
+#-----------------------------------------------------------------------------------------------------------
+def _plot_chi2_dominant_species_map(index_map,
+                                    species_labels,
+                                    *,
+                                    fits_header=None,
+                                    fig_dir_PATH=False,
+                                    or_PATH=False,
+                                    output_name='fitted_chi2_dominant',
+                                    plot_format='pdf',
+                                    font_size=19,
+                                    fig_size=None):
+    """Categorical sky map coloured by the dominant chi^2 contributor per pixel."""
+    if plt is None:
+        return None
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+    from matplotlib.patches import Patch
+
+    index_map = np.asarray(index_map, dtype=float)
+    finite_idx = index_map[np.isfinite(index_map)]
+    if finite_idx.size == 0:
+        print(
+            f"{ORANGE}Warning: chi^2 dominant-species map has no finite values; "
+            f"skipping plot.{NC}"
+        )
+        return None
+
+    n_species = len(species_labels)
+    if n_species == 0:
+        print(f"{ORANGE}Warning: no species labels for chi^2 dominant map; skipping.{NC}")
+        return None
+
+    base_cmap = plt.cm.get_cmap('tab20', max(n_species, 1))
+    colors = [base_cmap(i) for i in range(n_species)]
+    cmap = ListedColormap(colors)
+    bounds = np.arange(n_species + 1) - 0.5
+    norm = BoundaryNorm(bounds, cmap.N)
+
+    wcs = None
+    if fits_header is not None:
+        try:
+            wcs_full = WCS(fits_header)
+            wcs = wcs_full.celestial if wcs_full.naxis > 2 else wcs_full
+            if wcs.naxis != 2:
+                wcs = None
+        except Exception:
+            wcs = None
+
+    if fig_size is None:
+        fig_size = (9, 7.5)
+    fig, ax = plt.subplots(figsize=fig_size, subplot_kw={'projection': wcs} if wcs else {})
+
+    plot_data = np.ma.masked_invalid(index_map)
+    ax.imshow(plot_data, origin='lower', cmap=cmap, norm=norm, aspect='auto', interpolation='nearest')
+
+    present = sorted({int(v) for v in finite_idx if 0 <= int(v) < n_species})
+    legend_handles = [
+        Patch(facecolor=colors[idx], edgecolor='0.3', label=species_labels[idx])
+        for idx in present
+    ]
+    if legend_handles:
+        ax.legend(
+            handles=legend_handles,
+            loc='center left',
+            bbox_to_anchor=(1.02, 0.5),
+            fontsize=max(font_size - 4, 8),
+            frameon=True,
+            title='Dominant line',
+            title_fontsize=max(font_size - 3, 9),
+        )
+
+    if wcs:
+        ax.set_xlabel('RA', fontsize=font_size)
+        ax.set_ylabel('Dec', fontsize=font_size)
+    else:
+        ax.set_xlabel('x pixel', fontsize=font_size)
+        ax.set_ylabel('y pixel', fontsize=font_size)
+    ax.set_title(
+        r'Dominant $\chi^2$ contributor at best-fit grid point',
+        fontsize=font_size,
+    )
+    ax.tick_params(axis='both', labelsize=font_size - 2)
+    plt.tight_layout()
+
+    plot_path = None
+    if fig_dir_PATH and or_PATH:
+        os.chdir(fig_dir_PATH)
+        plot_path = f'{output_name}.{plot_format}'
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        os.chdir(or_PATH)
+    plt.show()
+    return plot_path
+#-----------------------------------------------------------------------------------------------------------
 def _plot_2d_diagnostic_map(data_map, title, cbar_label, output_name,
                             fits_header=None, fig_dir_PATH=False, or_PATH=False,
                             plot_format='pdf', font_size=19, fig_size=None,
@@ -2453,8 +2578,7 @@ def interactive_pixel_map(source,
     )
     # Keep row 0 at the bottom (matches origin='lower' parameter maps).
     fig.update_yaxes(autorange=True)
-    fig.show()
-    # return fig
+    return fig
 #-----------------------------------------------------------------------------------------------------------
 def fit_fits_maps_to_grids_3d(observed_fits_files,
                               grid_dicts_3d,
@@ -2496,6 +2620,8 @@ def fit_fits_maps_to_grids_3d(observed_fits_files,
                               chi2_species_slices_lines_only=True,
                               chi2_species_slices_max=8,
                               chi2_corner_cmap='viridis_r',
+                              create_chi2_dominant_map=True,
+                              chi2_dominant_data_names=None,
                               target_units='K km/s',
                               species_info=None,
                               create_ratios=False,
@@ -2547,6 +2673,13 @@ def fit_fits_maps_to_grids_3d(observed_fits_files,
     chi2_species_slices_list : list of str, optional
         Lines/ratios to include on the slice plots. If None, uses intensity
         lines only (no ratios), up to ``chi2_species_slices_max``.
+    create_chi2_dominant_map : bool, optional
+        If True, build a per-pixel map of which observed line/ratio contributes
+        the most to chi^2 at the best-fit grid point, save it as FITS, and plot
+        a categorical sky map. Default is True.
+    chi2_dominant_data_names : list of str, optional
+        Subset of ``all_data_names`` to consider for the dominant chi^2 map.
+        If None, all fitted lines and ratios are used.
     create_model_ratios : bool, optional
         Build missing 3D model ratio grids via ``create_transition_ratios_3d``.
     create_ratios : bool, optional
@@ -2556,7 +2689,8 @@ def fit_fits_maps_to_grids_3d(observed_fits_files,
     -------
     dict
         ``x_param_map``, ``y_param_map``, ``z_param_map``, FITS paths, and
-        ``chi2_analysis`` (results dict from ``chi2_analysis_3d``, or None).
+        ``chi2_analysis`` (results dict from ``chi2_analysis_3d``, or None),
+        and when enabled ``chi2_dominant_index_map`` / ``chi2_dominant_species``.
     """
     if not isinstance(observed_fits_files, dict) or not isinstance(grid_dicts_3d, dict):
         raise ValueError("observed_fits_files and grid_dicts_3d must be dictionaries")
@@ -2648,17 +2782,18 @@ def fit_fits_maps_to_grids_3d(observed_fits_files,
         all_observed_errors.update(ratio_errors)
 
     first_grid = grid_dicts_3d[line_names_only[0]]
+    _MESH_FALLBACK_KEYS = list(gn.PARAM_MESH_KEYS.values())
     x_mesh = _find_axis_mesh(
         first_grid, x_axis_name,
-        ['densities', 'crir_values', 'fuv_values', 'fuv_habing', 'fuv_draine'],
+        _MESH_FALLBACK_KEYS,
     )
     y_mesh = _find_axis_mesh(
         first_grid, y_axis_name,
-        ['crir_values', 'fuv_values', 'fuv_habing', 'fuv_draine', 'densities'],
+        _MESH_FALLBACK_KEYS,
     )
     z_mesh = _find_axis_mesh(
         first_grid, z_axis_name,
-        ['mass_values', 'mass', 'crir_values', 'fuv_values', 'fuv_habing', 'fuv_draine'],
+        _MESH_FALLBACK_KEYS,
     )
     if x_mesh is None or y_mesh is None or z_mesh is None:
         raise ValueError(
@@ -2690,6 +2825,13 @@ def fit_fits_maps_to_grids_3d(observed_fits_files,
                 f"Grid shape mismatch for {data_name}: "
                 f"{grid_arrays[data_name].shape} != {X_mesh.shape}"
             )
+
+    dominant_species_order = [n for n in all_data_names if n in grid_arrays]
+    if chi2_dominant_data_names is not None:
+        dominant_species_order = [
+            n for n in chi2_dominant_data_names if n in grid_arrays
+        ]
+    dominant_species_index = {name: idx for idx, name in enumerate(dominant_species_order)}
 
     def _valid_pixel_mask(data_map, err_map):
         return np.isfinite(data_map) & np.isfinite(err_map) & (err_map > 0)
@@ -2724,12 +2866,22 @@ def fit_fits_maps_to_grids_3d(observed_fits_files,
     y_param_map = np.full((ny, nx), np.nan)
     z_param_map = np.full((ny, nx), np.nan)
 
+    store_chi2_maps = create_chi2_dominant_map or create_uncertainty_maps
+    chi2_min_map = None
+    chi2_red_map = None
+    if store_chi2_maps:
+        chi2_min_map = np.full((ny, nx), np.nan)
+        chi2_red_map = np.full((ny, nx), np.nan)
+
     if create_uncertainty_maps:
         x_sigma_map = np.full((ny, nx), np.nan)
         y_sigma_map = np.full((ny, nx), np.nan)
         z_sigma_map = np.full((ny, nx), np.nan)
-        chi2_min_map = np.full((ny, nx), np.nan)
-        chi2_red_map = np.full((ny, nx), np.nan)
+
+    if create_chi2_dominant_map and dominant_species_order:
+        chi2_dominant_index_map = np.full((ny, nx), np.nan)
+    else:
+        chi2_dominant_index_map = None
 
     for i in tqdm(range(ny), desc="Processing rows"):
         for j in range(nx):
@@ -2753,21 +2905,55 @@ def fit_fits_maps_to_grids_3d(observed_fits_files,
             if valid_constraints < 1:
                 continue
 
-            if create_uncertainty_maps:
-                (x_param, y_param, z_param,
-                 x_sigma, y_sigma, z_sigma,
-                 chi2_min_pix, chi2_red_pix) = _fit_pixel_3d_with_uncertainty(
-                    obs_values, obs_errs, grid_arrays, X_mesh, Y_mesh, Z_mesh,
-                    x_values_1d, y_values_1d, z_values_1d, uncertainty_delta_chi2,
+            need_chi2_grid = create_uncertainty_maps or (
+                create_chi2_dominant_map and chi2_dominant_index_map is not None
+            )
+            if need_chi2_grid:
+                chi2_grid = _compute_chi2_grid(obs_values, obs_errs, grid_arrays)
+                if chi2_grid is None or not np.any(np.isfinite(chi2_grid)):
+                    continue
+
+                x_param, y_param, z_param = _best_fit_from_chi2(
+                    chi2_grid, X_mesh, Y_mesh, Z_mesh,
                 )
-                x_sigma_map[i, j] = x_sigma
-                y_sigma_map[i, j] = y_sigma
-                z_sigma_map[i, j] = z_sigma
-                chi2_min_map[i, j] = chi2_min_pix
-                chi2_red_map[i, j] = chi2_red_pix
+
+                chi2_min_pix = float(np.nanmin(chi2_grid))
+                n_obs = len(obs_values)
+                dof = max(n_obs - 3, 1)
+                chi2_red_pix = chi2_min_pix / dof
+                if store_chi2_maps:
+                    chi2_min_map[i, j] = chi2_min_pix
+                    chi2_red_map[i, j] = chi2_red_pix
+
+                if create_uncertainty_maps:
+                    x_sigma_map[i, j] = _parameter_confidence_width_dex(
+                        chi2_grid, x_values_1d, 2, chi2_min_pix, uncertainty_delta_chi2,
+                    )
+                    y_sigma_map[i, j] = _parameter_confidence_width_dex(
+                        chi2_grid, y_values_1d, 1, chi2_min_pix, uncertainty_delta_chi2,
+                    )
+                    z_sigma_map[i, j] = _parameter_confidence_width_dex(
+                        chi2_grid, z_values_1d, 0, chi2_min_pix, uncertainty_delta_chi2,
+                    )
+
+                if create_chi2_dominant_map and chi2_dominant_index_map is not None:
+                    dom_obs = {
+                        k: v for k, v in obs_values.items()
+                        if k in dominant_species_index
+                    }
+                    dom_errs = {
+                        k: v for k, v in obs_errs.items()
+                        if k in dominant_species_index
+                    }
+                    if dom_obs:
+                        dominant_name, _ = _dominant_chi2_contributor(
+                            chi2_grid, dom_obs, dom_errs, grid_arrays,
+                        )
+                        if dominant_name is not None:
+                            chi2_dominant_index_map[i, j] = dominant_species_index[dominant_name]
             else:
                 x_param, y_param, z_param = _fit_pixel_3d(
-                    obs_values, obs_errs, grid_arrays, X_mesh, Y_mesh, Z_mesh
+                    obs_values, obs_errs, grid_arrays, X_mesh, Y_mesh, Z_mesh,
                 )
             x_param_map[i, j] = x_param
             y_param_map[i, j] = y_param
@@ -2840,7 +3026,40 @@ def fit_fits_maps_to_grids_3d(observed_fits_files,
         finally:
             os.chdir(or_PATH if (fig_dir_PATH and or_PATH) else original_dir)
 
+    chi2_dominant_fits_path = None
+    if chi2_dominant_index_map is not None:
+        dom_fname = f"{output_prefix}_chi2_dominant.fits"
+        dom_header = _create_output_header(
+            first_header, 'chi2_dominant', 'index', chi2_dominant_index_map,
+        )
+        dom_header['COMMENT'] = (
+            'Integer index of the line/ratio with the largest chi^2 contribution '
+            'at the best-fit grid point; see SPECIES_* keywords.'
+        )
+        for idx, name in enumerate(dominant_species_order):
+            dom_header[f'HIERARCH SPECIES_{idx}'] = name
+
+        print('-'*30)
+        print(f"{BLUE}Saving chi^2 dominant-species FITS map{NC}")
+        print('-'*30)
+        original_dir = os.getcwd()
+        try:
+            if fig_dir_PATH and or_PATH:
+                os.chdir(fits_output_dir)
+            fits.PrimaryHDU(
+                data=chi2_dominant_index_map, header=dom_header,
+            ).writeto(dom_fname, overwrite=True)
+        finally:
+            os.chdir(or_PATH if (fig_dir_PATH and or_PATH) else original_dir)
+        chi2_dominant_fits_path = os.path.join(fits_output_dir, dom_fname)
+        print(f"{GREEN}Saved chi^2 dominant map: {chi2_dominant_fits_path}{NC}")
+    elif create_chi2_dominant_map:
+        print(f"{ORANGE}Warning: no lines available for chi^2 dominant map; skipping.{NC}")
+
     chi2_results = None
+    corner_obs = {}
+    corner_err = {}
+    corner_subtitle = ''
     if create_plots:
         plot_fitted_parameter_maps(
             x_param_map, y_param_map,
@@ -2906,6 +3125,20 @@ def fit_fits_maps_to_grids_3d(observed_fits_files,
             plot_format=plot_format, font_size=unc_font, fig_size=fig_size, cmap=uncertainty_cmap,
         )
 
+    if create_plots and chi2_dominant_index_map is not None:
+        dom_font = font_size if font_size else 19
+        _plot_chi2_dominant_species_map(
+            chi2_dominant_index_map,
+            dominant_species_order,
+            fits_header=first_header,
+            fig_dir_PATH=fig_dir_PATH,
+            or_PATH=or_PATH,
+            output_name=f'{output_prefix}_chi2_dominant',
+            plot_format=plot_format,
+            font_size=dom_font,
+            fig_size=fig_size,
+        )
+
     if create_chi2_analysis:
         corner_obs, corner_err, corner_subtitle = _pixel_observations_for_chi2_analysis(
             all_observed_data,
@@ -2954,13 +3187,40 @@ def fit_fits_maps_to_grids_3d(observed_fits_files,
         'reference_line': ref_name,
         'data_names': all_data_names,
     }
+    if create_chi2_analysis:
+        result.update({
+            'chi2_analysis_pixel': chi2_analysis_pixel,
+            'chi2_reanalysis': {
+                'all_observed_data': all_observed_data,
+                'all_observed_errors': all_observed_errors,
+                'ref_mask': ref_mask,
+                'grid_dicts_3d': grid_dicts_3d,
+                'set_x_name': set_x_name,
+                'set_y_name': set_y_name,
+                'set_z_name': set_z_name,
+                'set_mass_name': set_mass_name,
+            },
+        })
+        if corner_obs:
+            result['chi2_observed_values'] = corner_obs
+            result['chi2_observed_errors'] = corner_err
+            result['chi2_subtitle'] = corner_subtitle
+    if store_chi2_maps:
+        result.update({
+            'chi2_min_map': chi2_min_map,
+            'chi2_reduced_map': chi2_red_map,
+        })
     if create_uncertainty_maps:
         result.update({
             'x_sigma_map': x_sigma_map,
             'y_sigma_map': y_sigma_map,
             'z_sigma_map': z_sigma_map,
-            'chi2_min_map': chi2_min_map,
-            'chi2_reduced_map': chi2_red_map,
             'uncertainty_fits_paths': uncertainty_fits_paths,
+        })
+    if chi2_dominant_index_map is not None:
+        result.update({
+            'chi2_dominant_index_map': chi2_dominant_index_map,
+            'chi2_dominant_species': dominant_species_order,
+            'chi2_dominant_fits_path': chi2_dominant_fits_path,
         })
     return result

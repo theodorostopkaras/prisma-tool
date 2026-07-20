@@ -167,8 +167,20 @@ GRID_COLORMAP_OPTIONS = [
 ]
 DEFAULT_GRID_COLORMAP = 'Viridis'
 PLOT_THEME_OPTIONS = [
-    {'label': ' Light', 'value': 'light'},
-    {'label': ' Dark', 'value': 'dark'},
+    {
+        'label': html.Span([
+            html.Span(className='theme-ico theme-ico-sun'),
+            html.Span('Light', className='theme-opt-text'),
+        ], className='theme-opt'),
+        'value': 'light',
+    },
+    {
+        'label': html.Span([
+            html.Span(className='theme-ico theme-ico-moon'),
+            html.Span('Dark', className='theme-opt-text'),
+        ], className='theme-opt'),
+        'value': 'dark',
+    },
 ]
 DEFAULT_PLOT_THEME = 'light'
 PLOT_THEMES = {
@@ -179,6 +191,8 @@ PLOT_THEMES = {
         axis_line='#bbbbbb',
         title='#333333',
         font='#333333',
+        muted='#666666',
+        heading='#1a1a2e',
         legend_bg='rgba(255,255,255,0.85)',
         legend_border='#cccccc',
         placeholder='#aaaaaa',
@@ -187,6 +201,14 @@ PLOT_THEMES = {
         vline='rgba(60,60,60,0.45)',
         controls_bg='#f0f4ff',
         page_bg='#ffffff',
+        card_bg='#f5f7ff',
+        card_border='#99aabb',
+        input_bg='#ffffff',
+        input_border='#bbbbcc',
+        tab_border='#ddddee',
+        tab_bg='#fafbff',
+        tab_sel_bg='#f5f7ff',
+        accent='#1f77b4',
     ),
     'dark': dict(
         paper_bg='#1a1a2e',
@@ -195,6 +217,8 @@ PLOT_THEMES = {
         axis_line='#4a5a7a',
         title='#e8eaf0',
         font='#e0e0e0',
+        muted='#9aa3b2',
+        heading='#e8eaf0',
         legend_bg='rgba(26,26,46,0.92)',
         legend_border='#4a5a7a',
         placeholder='#888888',
@@ -203,6 +227,14 @@ PLOT_THEMES = {
         vline='rgba(220,220,230,0.45)',
         controls_bg='#1e293b',
         page_bg='#0f1419',
+        card_bg='#1e293b',
+        card_border='#334155',
+        input_bg='#0f172a',
+        input_border='#475569',
+        tab_border='#334155',
+        tab_bg='#121528',
+        tab_sel_bg='#1e293b',
+        accent='#3b82f6',
     ),
 }
 DEFAULT_ERROR_DECIMATION = 2
@@ -218,6 +250,7 @@ KEY_AV    = 'av'             # visual extinction profile (Positions, col 0)
 KEY_NH    = 'protdens'       # proton/H nucleus density profile (Gas state, col 0)
 KEY_TGAS  = 'tgas'           # gas temperature  (Gas state, col 2)
 KEY_TDUST = 'tdust'          # dust temperature (Gas state, col 3)
+KEY_NELECTR = 'n_electr'     # electron density n(e-) (Densities)
 KEY_HEAT_CR = 'heatrate_cr'  # cosmic-ray heating component (Heating rates, col 3)
 KEY_COSRAY  = 'cosray'       # CR ionisation rate profile (Gas state)
 KEY_NH2_PROFILE = 'cd_prof_h2'  # H2 column-density profile (Local quantities)
@@ -266,8 +299,10 @@ _PLANE_AXIS_SHORT = {
 
 CONTOUR_DIAGNOSTICS = [
     ('tgas', 'T<sub>gas</sub> (cloud edge)'),
+    ('tgas_col', 'T<sub>gas</sub> (column avg)'),
     ('tdust', 'T<sub>dust</sub> (cloud edge)'),
     ('nh', 'n<sub>H</sub> (cloud edge)'),
+    ('xe', 'x<sub>e</sub> = n(e<sup>-</sup>)/n<sub>H</sub> (cloud edge)'),
 ]
 CONTOUR_DEFAULT_QUANTITY = 'species:CO'
 
@@ -320,6 +355,18 @@ def _dec(x):
 
 
 # --- Grid scanning ------------------------------------------------------------
+
+def _sorted_axis_tokens(key, tokens):
+    """Sort filename tokens by decoded physical value (needed for CRIR: token↑ ⇒ ζ↓)."""
+    pdef = PARAM_DEFS[_PARAM_IDX[key]]
+    return sorted(set(tokens), key=lambda t: (pdef['decode'](t), t))
+
+
+def order_axis_tokens_physically(axis_tokens):
+    """Return axis_tokens with each axis ordered by ascending physical value."""
+    return {p['key']: _sorted_axis_tokens(p['key'], axis_tokens.get(p['key']) or [])
+            for p in PARAM_DEFS}
+
 
 def _varying_param_keys(axis_tokens):
     return [p['key'] for p in PARAM_DEFS if len(axis_tokens.get(p['key'], [])) > 1]
@@ -487,7 +534,7 @@ def _scan_files(directory, recursive):
 
     axis_tokens = {}
     for d, p in enumerate(PARAM_DEFS):
-        axis_tokens[p['key']] = sorted({tok[d] for tok in files})
+        axis_tokens[p['key']] = _sorted_axis_tokens(p['key'], {tok[d] for tok in files})
     return directory, files, axis_tokens, skipped
 
 
@@ -849,7 +896,7 @@ def bootstrap_grid_from_simline():
         for key in _simline['files']
         if gn.expand_partial_tokens(key[0]) is not None
     })
-    axis_tokens = gn.axis_tokens_from_tuples(token_tuples)
+    axis_tokens = order_axis_tokens_physically(gn.axis_tokens_from_tuples(token_tuples))
     token_cores = {}
     for key, path in _simline['files'].items():
         full = gn.expand_partial_tokens(key[0])
@@ -1198,6 +1245,7 @@ def get_model(filepath):
             nH     = _read_field(hf, KEY_NH),
             tgas   = _read_field(hf, KEY_TGAS),
             tdust  = _read_field(hf, KEY_TDUST),
+            nelectr = _read_field(hf, KEY_NELECTR),
             cosray = _read_field(hf, KEY_COSRAY),
             nh2_profile = _read_field(hf, KEY_NH2_PROFILE),
             radius = _read_field(hf, KEY_RADIUS),
@@ -1221,16 +1269,30 @@ def species_abundance(model, name, yscale):
     return ab
 
 
-def _integrate_sphere(radius_pc, profile):
-    """Volume integral 4 pi r^2 n(r) dr (KoSens Abundance_Calculator convention)."""
+def _los_profiles(radius_pc, profile):
+    """Flip + pad radius/profile for KoSens line-of-sight integrals.
+
+    Matches ``column_density_func``: reverse the depth grid, insert r=0, convert
+    pc → cm, and repeat the first flipped profile sample at the centre.
+    """
     radius = np.asarray(radius_pc, dtype=float)
     profile = np.asarray(profile, dtype=float)
-    if radius.size == 0 or profile.size != radius.size:
-        return np.nan
+    n = min(radius.size, profile.size)
+    if n == 0:
+        return None, None
+    radius, profile = radius[:n], profile[:n]
     flipped_radius = radius[::-1]
     radius_cm = np.insert(flipped_radius, 0, 0.0) * PC_TO_CM
     flipped_prof = profile[::-1]
     prof_cm = np.insert(flipped_prof, 0, flipped_prof[0])
+    return radius_cm, prof_cm
+
+
+def _integrate_sphere(radius_pc, profile):
+    """Volume integral 4 pi r^2 n(r) dr (KoSens Abundance_Calculator convention)."""
+    radius_cm, prof_cm = _los_profiles(radius_pc, profile)
+    if radius_cm is None:
+        return np.nan
     return float(np.trapezoid(4.0 * np.pi * radius_cm ** 2 * prof_cm, radius_cm))
 
 
@@ -1345,6 +1407,46 @@ def integrated_rel_abundance(model, species):
     if not np.isfinite(m_total) or m_total <= 0:
         return np.nan
     return m_sp / m_total
+
+
+def column_averaged_tgas(model):
+    """n_H-weighted column-averaged gas temperature (KoSens LOS convention).
+
+    ⟨T_gas⟩ = ∫ T_gas(r) n_H(r) ds / ∫ n_H(r) ds, with the same radius flip/pad
+    as ``column_density_func`` / ``pdr_grid`` column integrals.
+    """
+    radius = model.get('radius')
+    tgas = model.get('tgas')
+    nH = model.get('nH')
+    if radius is None or tgas is None or nH is None:
+        return np.nan
+    radius_cm, nH_cm = _los_profiles(radius, nH)
+    _, tgas_cm = _los_profiles(radius, tgas)
+    if radius_cm is None or tgas_cm is None:
+        return np.nan
+    # Profiles may differ in raw length; _los_profiles already truncates each
+    # pair, so re-align to the common LOS length.
+    n = min(radius_cm.size, nH_cm.size, tgas_cm.size)
+    if n < 2:
+        return np.nan
+    radius_cm, nH_cm, tgas_cm = radius_cm[:n], nH_cm[:n], tgas_cm[:n]
+    denom = float(np.trapezoid(nH_cm, radius_cm))
+    if not np.isfinite(denom) or denom <= 0:
+        return np.nan
+    return float(np.trapezoid(tgas_cm * nH_cm, radius_cm) / denom)
+
+
+def electron_fraction_edge(model):
+    """Cloud-edge electron fraction x_e = n(e-) / n_H (protdens)."""
+    ne = model.get('nelectr')
+    nH = model.get('nH')
+    if ne is None or nH is None:
+        return np.nan
+    ne0 = float(np.asarray(ne, dtype=float)[0])
+    nH0 = float(np.asarray(nH, dtype=float)[0])
+    if not np.isfinite(ne0) or not np.isfinite(nH0) or nH0 <= 0:
+        return np.nan
+    return ne0 / nH0
 
 
 def _rate_total(matrix, yscale):
@@ -1474,9 +1576,9 @@ def param_value_label(param, token):
     return _sci_label(val)
 
 
-def build_marks(param):
+def build_marks(param, axis_tokens=None):
     """Slider marks for a parameter (decoded values), thinned to <=9 labels."""
-    tokens = _grid['axis_tokens'][param['key']]
+    tokens = (axis_tokens or _grid['axis_tokens'])[param['key']]
     n = len(tokens)
     max_marks = 9
     step = max(1, (n - 1) // (max_marks - 1)) if n > 1 else 1
@@ -1556,14 +1658,23 @@ def _apply_layout(fig, title, xlabel, xtype, xrange, ylabel, ytype, theme='light
     fig.update_layout(
         **_base_layout(theme),
         title=dict(text=title, font=dict(size=13, color=t['title']), x=0.02, xanchor='left'),
-        xaxis=dict(**_axis_style(theme), title=dict(text=xlabel, font=dict(size=12)),
-                   type=xtype, range=xrange),
-        yaxis=dict(**_axis_style(theme), title=dict(text=ylabel, font=dict(size=12)), type=ytype),
+        # Reset zoom/colorbar when log↔linear changes (uirevision must change).
+        uirevision=f'{xtype}|{ytype}|{_parse_plot_theme(theme)}',
+        xaxis=dict(**_axis_style(theme),
+                   title=dict(text=xlabel, font=dict(size=12, color=t['font'])),
+                   type=xtype, range=xrange, autorange=False),
+        yaxis=dict(**_axis_style(theme),
+                   title=dict(text=ylabel, font=dict(size=12, color=t['font'])),
+                   type=ytype, autorange=True),
     )
 
 
 def _xvals(model, xvar, xscale):
-    """Return (x_array, x_label, x_type, x_range) with an explicit axis range."""
+    """Return (x_array, x_label, x_type, x_range) with an explicit axis range.
+
+    For ``type='log'`` Plotly expects ``range`` in log10 units.  For linear axes
+    the range is in physical data units.
+    """
     if xvar == 'nH':
         xv = np.asarray(model['nH'], dtype=float)
         xl = 'n<sub>H</sub> (cm<sup>-3</sup>)'
@@ -1582,16 +1693,20 @@ def _xvals(model, xvar, xscale):
             xv = np.where(xv >= av_floor, xv, np.nan)
         else:
             xv = np.where(xv > 0, xv, np.nan)
-        xrange = [lo_exp, np.ceil(np.log10(pos.max()))]
+        xrange = [float(lo_exp), float(np.ceil(np.log10(pos.max())))]
+        xtype = 'log'
     else:
         if xvar == 'Av':
             lo = av_floor
             xv = np.where(xv >= av_floor, xv, np.nan)
         else:
             lo = float(np.nanmin(xv))
-        xrange = [lo, float(np.nanmax(xv)) * 1.02]
-        xscale = 'linear'
-    return xv, xl, xscale, xrange
+        hi = float(np.nanmax(xv))
+        if not np.isfinite(hi) or hi <= lo:
+            hi = lo * 1.02 if lo else 1.0
+        xrange = [lo, hi * 1.02]
+        xtype = 'linear'
+    return xv, xl, xtype, xrange
 
 
 def _x_array(model, xvar, xscale):
@@ -2011,10 +2126,14 @@ def _axis_label(pdef):
 def _quantity_label(quantity):
     if quantity == 'tgas':
         return 'T<sub>gas</sub> (K)'
+    if quantity == 'tgas_col':
+        return '⟨T<sub>gas</sub>⟩<sub>N</sub> (K)'
     if quantity == 'tdust':
         return 'T<sub>dust</sub> (K)'
     if quantity == 'nh':
         return 'n<sub>H</sub> (cm<sup>-3</sup>)'
+    if quantity == 'xe':
+        return 'x<sub>e</sub> = n(e<sup>-</sup>)/n<sub>H</sub>'
     if quantity.startswith('species:'):
         sp = quantity.split(':', 1)[1]
         return f'X<sub>{format_species_html(sp)}</sub>'
@@ -2022,7 +2141,7 @@ def _quantity_label(quantity):
 
 
 def get_grid_scalar(filepath, quantity):
-    """Scalar for contour grids (species: integrated X; diagnostics: cloud edge)."""
+    """Scalar for contour grids (species: integrated X; diagnostics: see labels)."""
     cache_key = (filepath, quantity)
     if cache_key in _scalar_cache:
         return _scalar_cache[cache_key]
@@ -2030,10 +2149,14 @@ def get_grid_scalar(filepath, quantity):
         model = get_model(filepath)
         if quantity == 'tgas':
             val = float(np.asarray(model['tgas'], float)[0])
+        elif quantity == 'tgas_col':
+            val = column_averaged_tgas(model)
         elif quantity == 'tdust':
             val = float(np.asarray(model['tdust'], float)[0])
         elif quantity == 'nh':
             val = float(np.asarray(model['nH'], float)[0])
+        elif quantity == 'xe':
+            val = electron_fraction_edge(model)
         elif quantity.startswith('species:'):
             sp = quantity.split(':', 1)[1]
             val = integrated_rel_abundance(model, sp)
@@ -2081,10 +2204,18 @@ def _contour_data_aspect(x_plot, y_plot):
     return _plot_coord_span(y_plot) / _plot_coord_span(x_plot)
 
 
-def _contour_colorbar(title):
-    """Fixed colorbar geometry so every slice figure shares the same figsize."""
+def _contour_colorbar(title, theme='light', zscale='log'):
+    """Fixed colorbar geometry; tick formatting matches log vs linear Z."""
+    t = _theme_colors(theme)
+    # Log mode plots log10(Z), so plain decimal ticks.  Linear mode often spans
+    # many decades → scientific exponents on the colorbar.
+    if zscale == 'log':
+        tick_kw = dict(exponentformat='none', showexponent='none')
+    else:
+        tick_kw = dict(exponentformat='e', showexponent='all')
     return dict(
-        title=dict(text=title, font=dict(size=11)),
+        title=dict(text=title, font=dict(size=11, color=t['font'])),
+        tickfont=dict(size=10, color=t['font']),
         len=0.82,
         thickness=14,
         x=1.02,
@@ -2092,12 +2223,30 @@ def _contour_colorbar(title):
         y=0.5,
         yanchor='middle',
         outlinewidth=0,
+        **tick_kw,
     )
+
+
+def _apply_zscale(Z, zscale):
+    """Map physical Z to plot values; return (Zplot, zmin, zmax)."""
+    Zplot = np.asarray(Z, dtype=float)
+    if zscale == 'log':
+        Zplot = np.where(Zplot > 0, np.log10(Zplot), np.nan)
+    fin = Zplot[np.isfinite(Zplot)]
+    if fin.size == 0:
+        return Zplot, None, None
+    zmin = float(np.nanmin(fin))
+    zmax = float(np.nanmax(fin))
+    if zmin == zmax:
+        pad = 0.5 if zscale == 'log' else (abs(zmin) * 0.05 + 1e-30)
+        zmin, zmax = zmin - pad, zmax + pad
+    return Zplot, zmin, zmax
 
 
 def _apply_square_contour_layout(fig, x_plot, y_plot, xdef, ydef, title,
                                  panel_w=DEFAULT_CONTOUR_PANEL_W,
-                                 fixed_size=False, theme='light'):
+                                 fixed_size=False, theme='light',
+                                 zscale='log'):
     """Layout for a single contour panel.
 
     ``fixed_size=True`` — identical figsize for every panel in a side-by-side row
@@ -2109,7 +2258,10 @@ def _apply_square_contour_layout(fig, x_plot, y_plot, xdef, ydef, title,
     axis_common = dict(
         type='linear', showgrid=True, gridcolor=t['grid'],
         linecolor=t['axis_line'], tickfont=dict(color=t['font']),
+        autorange=True,
     )
+    # Include zscale so colorbar range resets when switching log↔linear.
+    uirev = f'contour|{zscale}|{_parse_plot_theme(theme)}'
     if fixed_size:
         fig.update_layout(
             title=title_kw,
@@ -2120,6 +2272,7 @@ def _apply_square_contour_layout(fig, x_plot, y_plot, xdef, ydef, title,
             autosize=False,
             margin=_COMPACT_FIG_MARGIN,
             font=dict(family='Arial, sans-serif', size=12, color=t['font']),
+            uirevision=uirev,
             xaxis=dict(
                 title=dict(text=_axis_label_contour(xdef), font=dict(size=11, color=t['font'])),
                 domain=_COMPACT_XDOMAIN,
@@ -2148,6 +2301,7 @@ def _apply_square_contour_layout(fig, x_plot, y_plot, xdef, ydef, title,
         autosize=False,
         margin=dict(l=60, r=80, t=52, b=54),
         font=dict(family='Arial, sans-serif', size=12, color=t['font']),
+        uirevision=uirev,
         xaxis=dict(
             title=dict(text=_axis_label_contour(xdef), font=dict(size=12, color=t['font'])),
             constrain='domain',
@@ -2443,11 +2597,12 @@ def fig_interpolation_comparison(result, xdef, ydef, *, title, zscale, color_map
     stats = result['error_stats']
 
     if zscale == 'log':
-        z0 = np.where(orig > 0, np.log10(orig), np.nan)
-        z1 = np.where(interp > 0, np.log10(interp), np.nan)
+        z0, z0a, z0b = _apply_zscale(orig, 'log')
+        z1, z1a, z1b = _apply_zscale(interp, 'log')
         flux_cbar = f'log<sub>10</sub>({unit_label})'
     else:
-        z0, z1 = orig.astype(float), interp.astype(float)
+        z0, z0a, z0b = _apply_zscale(orig, 'linear')
+        z1, z1a, z1b = _apply_zscale(interp, 'linear')
         flux_cbar = unit_label
 
     if error_metric == 'relative':
@@ -2465,6 +2620,12 @@ def fig_interpolation_comparison(result, xdef, ydef, *, title, zscale, color_map
         contour_kw['contours'] = dict(coloring='heatmap', showlines=False,
                                       labelfont=dict(color='white', size=9))
         contour_kw['line']['width'] = 0
+    cbar_tick = dict(exponentformat='none' if zscale == 'log' else 'e',
+                     showexponent='none' if zscale == 'log' else 'all',
+                     tickfont=dict(size=9, color=t['font']))
+    flux_z = {}
+    if z0a is not None and z1a is not None:
+        flux_z = dict(zmin=min(z0a, z1a), zmax=max(z0b, z1b), zauto=False)
 
     mean_e = stats.get('mean_error', np.nan)
     max_e = stats.get('max_error', np.nan)
@@ -2481,17 +2642,18 @@ def fig_interpolation_comparison(result, xdef, ydef, *, title, zscale, color_map
     fig.add_trace(go.Contour(
         x=x_plot_n, y=y_plot_n, z=z0, colorscale=cmap,
         colorbar=dict(title=dict(text=flux_cbar, font=dict(size=10, color=t['font'])),
-                      len=0.88, thickness=12, x=0.28, xref='paper'),
-        **contour_kw), row=1, col=1)
+                      len=0.88, thickness=12, x=0.28, xref='paper', **cbar_tick),
+        **flux_z, **contour_kw), row=1, col=1)
     fig.add_trace(go.Contour(
         x=x_plot_f, y=y_plot_f, z=z1, colorscale=cmap,
         colorbar=dict(title=dict(text=flux_cbar, font=dict(size=10, color=t['font'])),
-                      len=0.88, thickness=12, x=0.635, xref='paper'),
-        **contour_kw), row=1, col=2)
+                      len=0.88, thickness=12, x=0.635, xref='paper', **cbar_tick),
+        **flux_z, **contour_kw), row=1, col=2)
     fig.add_trace(go.Contour(
         x=x_plot_n, y=y_plot_n, z=err, colorscale=ERROR_PANEL_CMAP,
         colorbar=dict(title=dict(text=err_cbar, font=dict(size=10, color=t['font'])),
-                      len=0.88, thickness=12, x=1.01, xref='paper'),
+                      len=0.88, thickness=12, x=1.01, xref='paper',
+                      tickfont=dict(size=9, color=t['font'])),
         connectgaps=False,
         hovertemplate='x=%{x:.3g}<br>y=%{y:.3g}<br>z=%{z:.3g}<extra></extra>',
     ), row=1, col=3)
@@ -2509,6 +2671,7 @@ def fig_interpolation_comparison(result, xdef, ydef, *, title, zscale, color_map
     fig.update_layout(
         title=dict(text=f'{title}<br><sup style="font-size:11px">{stats_note}</sup>',
                    font=dict(size=13, color=t['title']), x=0.01, xanchor='left'),
+        uirevision=f'interp|{zscale}|{_parse_plot_theme(theme)}',
         **_multi_panel_layout_kw(theme, height=420),
     )
     return fig
@@ -2688,11 +2851,8 @@ def fig_triple_atten_grid(plane, slice_title, Z_ref, Z_atten, x_phys, y_phys,
     y_plot = _axis_plot_coords(y_phys, ydef)
 
     with np.errstate(divide='ignore'):
-        if zscale == 'log':
-            p0 = np.where(Z_ref > 0, np.log10(Z_ref), np.nan)
-            p1 = np.where(Z_atten > 0, np.log10(Z_atten), np.nan)
-        else:
-            p0, p1 = Z_ref.astype(float), Z_atten.astype(float)
+        p0, z0min, z0max = _apply_zscale(Z_ref, zscale)
+        p1, z1min, z1max = _apply_zscale(Z_atten, zscale)
     cbar_ref = quantity_cbar_title
 
     fin3 = shift[np.isfinite(shift)]
@@ -2711,6 +2871,9 @@ def fig_triple_atten_grid(plane, slice_title, Z_ref, Z_atten, x_phys, y_phys,
     contour_kw = _contour_trace_kw(theme, show_lines=True)
     contour_kw['contours']['labelfont'] = dict(color='white', size=9)
     contour_kw['line']['width'] = 0.6
+    cbar_tick = dict(exponentformat='none' if zscale == 'log' else 'e',
+                     showexponent='none' if zscale == 'log' else 'all',
+                     tickfont=dict(size=9, color=t['font']))
 
     panel = 380
     fig = make_subplots(
@@ -2727,16 +2890,19 @@ def fig_triple_atten_grid(plane, slice_title, Z_ref, Z_atten, x_phys, y_phys,
         zmin=shift_vmin, zmax=shift_vmax,
         **({} if scan_dir == 'rightward' else {'zmid': 0}),
     )
+    flux_z = {}
+    if z0min is not None and z1min is not None:
+        flux_z = dict(zmin=min(z0min, z1min), zmax=max(z0max, z1max), zauto=False)
     fig.add_trace(go.Contour(
         x=x_plot, y=y_plot, z=p0, colorscale=cmap,
         colorbar=dict(title=dict(text=cbar_ref, font=dict(size=10, color=t['font'])),
-                      len=0.88, thickness=12, x=0.30, xref='paper'),
-        **contour_kw), row=1, col=1)
+                      len=0.88, thickness=12, x=0.30, xref='paper', **cbar_tick),
+        **flux_z, **contour_kw), row=1, col=1)
     fig.add_trace(go.Contour(
         x=x_plot, y=y_plot, z=p1, colorscale=cmap,
         colorbar=dict(title=dict(text=cbar_ref, font=dict(size=10, color=t['font'])),
-                      len=0.88, thickness=12, x=0.635, xref='paper'),
-        **contour_kw), row=1, col=2)
+                      len=0.88, thickness=12, x=0.635, xref='paper', **cbar_tick),
+        **flux_z, **contour_kw), row=1, col=2)
     fig.add_trace(go.Contour(
         x=x_plot, y=y_plot, z=shift, colorscale=shift_cmap,
         colorbar=dict(title=dict(text=_shift_panel_colorbar_title(xdef),
@@ -2760,6 +2926,7 @@ def fig_triple_atten_grid(plane, slice_title, Z_ref, Z_atten, x_phys, y_phys,
         font=dict(family='Arial, sans-serif', size=11, color=t['font']),
         title=dict(text=slice_title, font=dict(size=13, color=t['title']),
                    x=0.01, xanchor='left'),
+        uirevision=f'triple|{zscale}|{_parse_plot_theme(theme)}',
     )
     fig.update_layout(**layout_kw)
     if line_contours:
@@ -2886,23 +3053,23 @@ def fig_contour_plane(plane, slice_idx, quantity, zscale,
                 shift_rtol=shift_rtol, shift_scan_direction=shift_scan_direction,
                 colorscale=cmap, theme=theme)
 
-    Zplot = Z.astype(float)
-    if zscale == 'log':
-        Zplot = np.where(Zplot > 0, np.log10(Zplot), np.nan)
+    Zplot, zmin, zmax = _apply_zscale(Z, zscale)
 
     x_plot = _axis_plot_coords(x_phys, xdef)
     y_plot = _axis_plot_coords(y_phys, ydef)
 
     trace_kw = _contour_trace_kw(theme, show_lines=True)
+    if zmin is not None:
+        trace_kw = {**trace_kw, 'zmin': zmin, 'zmax': zmax, 'zauto': False}
     fig = go.Figure(go.Contour(
         x=x_plot, y=y_plot, z=Zplot,
         colorscale=cmap,
-        colorbar=_contour_colorbar(cbar_title),
+        colorbar=_contour_colorbar(cbar_title, theme=theme, zscale=zscale),
         **trace_kw,
     ))
     return _apply_square_contour_layout(
         fig, x_plot, y_plot, xdef, ydef, slice_title,
-        fixed_size=True, theme=theme,
+        fixed_size=True, theme=theme, zscale=zscale,
     )
 
 
@@ -3025,25 +3192,25 @@ def fig_intensity_contour_plane(plane, slice_idx, species, idef, transition_idx,
                 shift_rtol=shift_rtol, shift_scan_direction=shift_scan_direction,
                 colorscale=cmap, theme=theme, line_contours=line_contours)
 
-    Zplot = Z.astype(float)
-    if zscale == 'log':
-        Zplot = np.where(Zplot > 0, np.log10(Zplot), np.nan)
+    Zplot, zmin, zmax = _apply_zscale(Z, zscale)
 
     x_plot = _axis_plot_coords(x_phys, xdef)
     y_plot = _axis_plot_coords(y_phys, ydef)
 
     trace_kw = _contour_trace_kw(theme, show_lines=True)
+    if zmin is not None:
+        trace_kw = {**trace_kw, 'zmin': zmin, 'zmax': zmax, 'zauto': False}
     fig = go.Figure(go.Contour(
         x=x_plot, y=y_plot, z=Zplot,
         colorscale=cmap,
-        colorbar=_contour_colorbar(cbar_title),
+        colorbar=_contour_colorbar(cbar_title, theme=theme, zscale=zscale),
         **trace_kw,
     ))
     if line_contours:
         _add_contour_level_lines(fig, x_plot, y_plot, Zplot, line_contours)
     return _apply_square_contour_layout(
         fig, x_plot, y_plot, xdef, ydef, slice_title,
-        fixed_size=True, theme=theme,
+        fixed_size=True, theme=theme, zscale=zscale,
     )
 
 
@@ -3480,40 +3647,50 @@ def fig_simline_pv(values, species, transition, pos_min, pos_max, zscale,
         return placeholder_fig(f'Could not read PV FITS: {exc}', theme=theme)
 
     zplot = np.asarray(data, dtype=float)
-    if zscale == 'log' and pv_quantity != 'tau':
-        zplot = np.where(zplot > 0, zplot, np.nan)
-
+    bunit = ss.brightness_unit_from_header(header)
     if pv_quantity == 'tau':
+        zplot, zmin, zmax = _apply_zscale(zplot, 'linear')
         z_label = '\u03c4'
         z_hover = '\u03c4 = %{z:.4g}'
+        cbar_zscale = 'linear'
+    elif zscale == 'log':
+        zplot, zmin, zmax = _apply_zscale(zplot, 'log')
+        z_label = f'log<sub>10</sub>(T<sub>mb</sub>) ({bunit})'
+        z_hover = 'log<sub>10</sub> T<sub>mb</sub> = %{z:.4g}'
+        cbar_zscale = 'log'
     else:
-        bunit = ss.brightness_unit_from_header(header)
+        zplot, zmin, zmax = _apply_zscale(zplot, 'linear')
         z_label = f'T<sub>mb</sub> ({bunit})'
         z_hover = 'T<sub>mb</sub> = %{z:.4g}'
+        cbar_zscale = 'linear'
     tr_label = ss.transition_from_header(header) or _smli_transition_label(transition)
     sp_html = format_species_html(species)
     t = _theme_colors(theme)
 
-    fig = go.Figure(go.Heatmap(
+    heat_kw = dict(
         x=positions, y=velocities, z=zplot,
         colorscale=colorscale or 'Inferno',
-        colorbar=dict(title=dict(text=z_label)),
+        colorbar=_contour_colorbar(z_label, theme=theme, zscale=cbar_zscale),
         hovertemplate=(
             'offset = %{x:.3f}"<br>v = %{y:.3g} km/s'
             f'<br>{z_hover}<extra></extra>'
         ),
-    ))
+    )
+    if zmin is not None:
+        heat_kw.update(zmin=zmin, zmax=zmax, zauto=False)
+    fig = go.Figure(go.Heatmap(**heat_kw))
     layout_kw = {
         **_base_layout(theme),
         'height': 520,
+        'uirevision': f'pv|{cbar_zscale}|{_parse_plot_theme(theme)}',
         'title': dict(
             text=f'PV diagram — {sp_html} {tr_label}',
             font=dict(size=13, color=t['title']), x=0.02, xanchor='left'),
         'xaxis': dict(**_axis_style(theme),
-                      title=dict(text='Position offset (arcsec)', font=dict(size=12)),
+                      title=dict(text='Position offset (arcsec)', font=dict(size=12, color=t['font'])),
                       type='linear'),
         'yaxis': dict(**_axis_style(theme),
-                      title=dict(text='Velocity (km/s)', font=dict(size=12)),
+                      title=dict(text='Velocity (km/s)', font=dict(size=12, color=t['font'])),
                       type='linear'),
     }
     fig.update_layout(**layout_kw)
@@ -3815,7 +3992,15 @@ _SLICE_GRAPH_CFG = {**_GRAPH_CFG, 'responsive': False}
 _TAB_STYLE = {'padding': '10px 18px', 'fontWeight': '600', 'fontSize': '13px'}
 _TAB_SEL = {'borderTop': '3px solid #1f77b4', 'padding': '10px 18px',
             'fontWeight': '700', 'fontSize': '13px', 'backgroundColor': '#f5f7ff'}
-_PAGE_INTRO = {'margin': '0 0 12px', 'color': '#666', 'fontSize': '13px'}
+_PAGE_INTRO = {'margin': '0 0 12px', 'fontSize': '13px', 'opacity': 0.88}
+_PANEL_ROW = {
+    'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
+    'padding': '12px 18px', 'marginBottom': '12px',
+}
+_INPUT_STYLE = {
+    'padding': '7px 9px', 'fontSize': '13px',
+    'border': '1px solid #bbc', 'borderRadius': '6px',
+}
 
 
 def _slider_block(d):
@@ -3846,21 +4031,19 @@ def _shift_control_row(prefix=''):
             dcc.Dropdown(
                 id=scan_id, options=X_SHIFT_DIRECTION_OPTIONS,
                 value=X_SHIFT_SCAN_DIRECTION, clearable=False,
-                style={'fontSize': '13px'}),
+                className='kosma-dropdown', style={'fontSize': '13px'}),
         ], style={'flex': '2', 'minWidth': '240px', 'marginRight': '18px'}),
         html.Div([
             html.Label('Intensity match tolerance (rtol)', style=_CTRL_LABEL),
             dcc.Input(id=rtol_id, type='number', value=X_SHIFT_MATCH_RTOL,
                       min=0, max=1, step=0.005,
-                      style={'width': '100px', 'padding': '7px 9px', 'fontSize': '13px',
-                             'border': '1px solid #bbc', 'borderRadius': '6px'}),
+                      className='kosma-input',
+                      style={**_INPUT_STYLE, 'width': '100px'}),
             html.Span('  relative band around target intensity',
-                      style={'fontSize': '11px', 'color': '#888', 'marginLeft': '8px'}),
+                      className='kosma-muted',
+                      style={'fontSize': '11px', 'marginLeft': '8px'}),
         ], style={'flex': '1.2', 'minWidth': '200px'}),
-    ], style={'display': 'flex', 'alignItems': 'flex-end',
-              'padding': '12px 18px', 'backgroundColor': '#faf6f4',
-              'borderRadius': '8px', 'marginBottom': '12px',
-              'border': '1px dashed #c9a99b'})
+    ], className='kosma-panel kosma-panel-dashed', style=_PANEL_ROW)
 
 
 def _int_contour_overlay_row():
@@ -3876,17 +4059,19 @@ def _int_contour_overlay_row():
                 style={'fontSize': '13px'},
             ),
             html.Span('  jtemp only — KoSens-style observational limit',
-                      style={'fontSize': '11px', 'color': '#888', 'marginLeft': '8px'}),
+                      className='kosma-muted',
+                      style={'fontSize': '11px', 'marginLeft': '8px'}),
         ], style={'flex': '1.6', 'minWidth': '280px', 'marginRight': '18px'}),
         html.Div([
             html.Label('Extra contour levels', style=_CTRL_LABEL),
             dcc.Input(
                 id='int-extra-contours', type='text', value='',
                 placeholder='e.g. 0.5, 1, 5  (physical units of quantity)',
-                style={'width': '100%', 'padding': '7px 9px', 'fontSize': '13px',
-                       'border': '1px solid #bbc', 'borderRadius': '6px'}),
+                className='kosma-input',
+                style={**_INPUT_STYLE, 'width': '100%'}),
             html.Span('  comma-separated; drawn on all slice panels',
-                      style={'fontSize': '11px', 'color': '#888', 'marginTop': '4px',
+                      className='kosma-muted',
+                      style={'fontSize': '11px', 'marginTop': '4px',
                              'display': 'block'}),
         ], style={'flex': '2', 'minWidth': '260px', 'marginRight': '18px'}),
         html.Div([
@@ -3894,13 +4079,10 @@ def _int_contour_overlay_row():
             dcc.Input(
                 id='int-extra-contour-color', type='text', value='black',
                 placeholder='CSS color, e.g. black, #00ff00, cyan',
-                style={'width': '100%', 'padding': '7px 9px', 'fontSize': '13px',
-                       'border': '1px solid #bbc', 'borderRadius': '6px'}),
+                className='kosma-input',
+                style={**_INPUT_STYLE, 'width': '100%'}),
         ], style={'flex': '1', 'minWidth': '140px'}),
-    ], style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
-              'padding': '12px 18px', 'backgroundColor': '#faf8f4',
-              'borderRadius': '8px', 'marginBottom': '12px',
-              'border': '1px dashed #d4c4b8'})
+    ], className='kosma-panel kosma-panel-dashed', style=_PANEL_ROW)
 
 
 def _interp_control_row(prefix=''):
@@ -3911,38 +4093,39 @@ def _interp_control_row(prefix=''):
     ylim_id = f'{prefix}interp-y-lim'
     method_id = f'{prefix}interp-method'
     clip_id = f'{prefix}interp-clip'
-    input_style = {'width': '72px', 'padding': '7px 9px', 'fontSize': '13px',
-                   'border': '1px solid #bbc', 'borderRadius': '6px'}
+    input_style = {**_INPUT_STYLE, 'width': '72px'}
     return html.Div([
         html.Div([
             html.Label('Interpolated grid size (ny \u00d7 nx)', style=_CTRL_LABEL),
             html.Div([
                 dcc.Input(id=ny_id, type='number', value=DEFAULT_INTERP_NY,
-                          min=2, max=500, step=1, style=input_style),
-                html.Span(' \u00d7 ', style={'margin': '0 6px', 'color': '#666'}),
+                          min=2, max=500, step=1, className='kosma-input', style=input_style),
+                html.Span(' \u00d7 ', className='kosma-muted', style={'margin': '0 6px'}),
                 dcc.Input(id=nx_id, type='number', value=DEFAULT_INTERP_NX,
-                          min=2, max=500, step=1, style=input_style),
+                          min=2, max=500, step=1, className='kosma-input', style=input_style),
             ]),
         ], style={'flex': '1.1', 'minWidth': '170px', 'marginRight': '18px'}),
         html.Div([
             html.Label('X-axis log\u2081\u2080 limit (upper)', style=_CTRL_LABEL),
             dcc.Input(id=xlim_id, type='number', value=None, placeholder='no limit',
-                      style={**input_style, 'width': '100px'}),
+                      className='kosma-input', style={**input_style, 'width': '100px'}),
             html.Span('  keep points with log\u2081\u2080(x) < limit',
-                      style={'fontSize': '11px', 'color': '#888', 'marginLeft': '6px'}),
+                      className='kosma-muted',
+                      style={'fontSize': '11px', 'marginLeft': '6px'}),
         ], style={'flex': '1.4', 'minWidth': '220px', 'marginRight': '18px'}),
         html.Div([
             html.Label('Y-axis log\u2081\u2080 limit (upper)', style=_CTRL_LABEL),
             dcc.Input(id=ylim_id, type='number', value=None, placeholder='no limit',
-                      style={**input_style, 'width': '100px'}),
+                      className='kosma-input', style={**input_style, 'width': '100px'}),
             html.Span('  keep points with log\u2081\u2080(y) < limit',
-                      style={'fontSize': '11px', 'color': '#888', 'marginLeft': '6px'}),
+                      className='kosma-muted',
+                      style={'fontSize': '11px', 'marginLeft': '6px'}),
         ], style={'flex': '1.4', 'minWidth': '220px', 'marginRight': '18px'}),
         html.Div([
             html.Label('Interpolation method', style=_CTRL_LABEL),
             dcc.Dropdown(id=method_id, options=INTERP_METHOD_OPTIONS,
                          value=DEFAULT_INTERP_METHOD, clearable=False,
-                         style={'fontSize': '13px'}),
+                         className='kosma-dropdown', style={'fontSize': '13px'}),
         ], style={'flex': '1', 'minWidth': '130px', 'marginRight': '18px'}),
         html.Div([
             html.Label('Clip to bounds', style=_CTRL_LABEL),
@@ -3950,23 +4133,20 @@ def _interp_control_row(prefix=''):
                                                 'value': 'clip'}],
                           value=[], style={'fontSize': '13px'}),
         ], style={'flex': '1', 'minWidth': '160px'}),
-    ], style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
-              'padding': '12px 18px', 'backgroundColor': '#f4f8f4',
-              'borderRadius': '8px', 'marginBottom': '12px',
-              'border': '1px dashed #9cb89c'})
+    ], className='kosma-panel kosma-panel-dashed', style=_PANEL_ROW)
 
 
 def _interp_error_control_row():
     """Decimation / error-metric controls for the interpolation-error tab."""
-    input_style = {'width': '72px', 'padding': '7px 9px', 'fontSize': '13px',
-                   'border': '1px solid #bbc', 'borderRadius': '6px'}
+    input_style = {**_INPUT_STYLE, 'width': '72px'}
     return html.Div([
         html.Div([
             html.Label('Error decimation factor', style=_CTRL_LABEL),
             dcc.Input(id='ie-decimation', type='number', value=DEFAULT_ERROR_DECIMATION,
-                      min=2, max=8, step=1, style=input_style),
+                      min=2, max=8, step=1, className='kosma-input', style=input_style),
             html.Span('  checkerboard decimation (KoSens default: 2)',
-                      style={'fontSize': '11px', 'color': '#888', 'marginLeft': '8px'}),
+                      className='kosma-muted',
+                      style={'fontSize': '11px', 'marginLeft': '8px'}),
         ], style={'flex': '1.3', 'minWidth': '220px', 'marginRight': '18px'}),
         html.Div([
             html.Label('Error metric', style=_CTRL_LABEL),
@@ -3977,9 +4157,10 @@ def _interp_error_control_row():
             html.Label('Relative threshold', style=_CTRL_LABEL),
             dcc.Input(id='ie-rel-threshold', type='number',
                       value=DEFAULT_ERROR_REL_THRESHOLD, min=0, max=1, step=0.01,
-                      style={**input_style, 'width': '90px'}),
+                      className='kosma-input', style={**input_style, 'width': '90px'}),
             html.Span('  mask relative error below this fraction of max',
-                      style={'fontSize': '11px', 'color': '#888', 'marginLeft': '8px'}),
+                      className='kosma-muted',
+                      style={'fontSize': '11px', 'marginLeft': '8px'}),
         ], style={'flex': '1.5', 'minWidth': '260px', 'marginRight': '18px'}),
         html.Div([
             html.Label('Flux / abundance scale', style=_CTRL_LABEL),
@@ -3993,10 +4174,7 @@ def _interp_error_control_row():
                                     'value': 'contours'}],
                           value=['contours'], style={'fontSize': '13px'}),
         ], style={'flex': '1.4', 'minWidth': '220px'}),
-    ], style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
-              'padding': '12px 18px', 'backgroundColor': '#faf4f8',
-              'borderRadius': '8px', 'marginBottom': '12px',
-              'border': '1px dashed #c9a0c0'})
+    ], className='kosma-panel kosma-panel-dashed', style=_PANEL_ROW)
 
 
 _SLICE_GRAPH_STYLE_COMPACT = {
@@ -4107,20 +4285,51 @@ def _ie_plane_section(slot_id):
 
 app.layout = html.Div(
     id='app-root',
+    className='theme-light',
     style={'fontFamily': 'Arial, sans-serif', 'maxWidth': '1460px',
-           'margin': '0 auto', 'padding': '14px 22px', 'backgroundColor': '#fff'},
+           'margin': '0 auto', 'padding': '14px 22px', 'backgroundColor': '#fff',
+           'color': '#333', 'minHeight': '100vh'},
     children=[
 
-    # Header
-    html.Div([
-        html.H1('KOSMA-\u03C4 Grid Explorer',
-                style={'margin': '0 0 4px', 'color': '#1a1a2e',
-                       'fontSize': '26px', 'fontWeight': '700'}),
-        html.P('Interactive browser for KoSens3D photodissociation-region model grids '
-               '(HDF5 per model point, and/or SIMLINE line output).',
-               style={'margin': '0', 'color': '#666', 'fontSize': '13px'}),
-    ], style={'borderBottom': '2px solid #1f77b4',
-              'paddingBottom': '10px', 'marginBottom': '14px'}),
+    # Header + site-wide theme toggle (top-right)
+    html.Div(id='app-header', children=[
+        html.Div(id='app-brand', className='app-brand', children=[
+            html.Span('KoSens3D \u00b7 PDR models', className='app-brand-kicker'),
+            html.H1([
+                html.Span('KOSMA-', className='app-brand-name'),
+                html.Span('\u03C4', className='app-brand-tau'),
+                html.Span(' Grid Explorer Toolkit', className='app-brand-name'),
+            ], id='app-title', className='app-brand-title'),
+            html.P(
+                'Browse photodissociation-region (PDR) model grids from KOSMA-\u03C4 models: '
+                'depth profiles, heating & cooling, chemistry, and SIMLINE line intensities '
+                'across density, FUV, cosmic-ray rate, and related parameters.',
+                id='app-subtitle',
+                className='app-brand-lead',
+            ),
+            html.P(
+                'Load an HDF5 model directory and/or a SIMLINE output folder, then use the tabs '
+                'to explore profiles, 2-D grid slices, spectra, and map fits.',
+                id='app-blurb',
+                className='app-brand-blurb',
+            ),
+        ]),
+        html.Div(id='theme-toggle-wrap', className='theme-sticker', children=[
+            html.Span('Theme', className='theme-sticker-caption'),
+            dcc.RadioItems(
+                id='plot-theme',
+                options=PLOT_THEME_OPTIONS,
+                value=DEFAULT_PLOT_THEME,
+                className='theme-seg',
+                inputClassName='theme-seg-input',
+                labelClassName='theme-seg-btn',
+                labelStyle={'display': 'inline-flex', 'margin': '0'},
+            ),
+        ]),
+    ], style={'display': 'flex', 'alignItems': 'flex-start',
+              'justifyContent': 'space-between', 'gap': '16px',
+              'borderBottom': '2px solid #1f77b4',
+              'paddingBottom': '14px', 'marginBottom': '14px'}),
 
     dcc.Store(id='grid-loaded', data=False),
 
@@ -4128,21 +4337,16 @@ app.layout = html.Div(
     html.Div(id='controls-wrap', style={'display': 'none'}, children=[
         html.Div([_slider_block(d) for d in range(N_PARAMS)],
                  id='controls-sliders-wrap',
+                 className='kosma-panel',
                  style={'display': 'flex', 'flexWrap': 'wrap', 'alignItems': 'flex-start',
-                        'padding': '14px 18px', 'marginTop': '4px',
-                        'backgroundColor': '#f0f4ff', 'borderRadius': '8px'}),
+                        'padding': '14px 18px', 'marginTop': '4px'}),
 
         html.Div([
-            html.Div([
-                html.Label('Plot theme', style=_CTRL_LABEL),
-                dcc.RadioItems(id='plot-theme', options=PLOT_THEME_OPTIONS,
-                               value=DEFAULT_PLOT_THEME, **_RADIO),
-            ], style={**_CTRL_BOX, 'minWidth': '100px'}),
             html.Div([
                 html.Label('Grid colormap', style=_CTRL_LABEL),
                 dcc.Dropdown(id='grid-colorscale', options=GRID_COLORMAP_OPTIONS,
                              value=DEFAULT_GRID_COLORMAP, clearable=False,
-                             style={'fontSize': '13px'}),
+                             className='kosma-dropdown', style={'fontSize': '13px'}),
             ], style={'flex': '1.2', 'minWidth': '140px', 'marginRight': '18px'}),
             html.Div([
                 html.Label('X-axis', style=_CTRL_LABEL),
@@ -4157,14 +4361,14 @@ app.layout = html.Div(
                 dcc.RadioItems(id='yscale', options=_SCALE_OPTIONS, value='log', **_RADIO),
             ], style={**_CTRL_BOX, 'marginRight': '0'}),
         ], id='controls-axis-wrap',
+           className='kosma-panel',
            style={'display': 'flex', 'alignItems': 'flex-start',
-                  'padding': '10px 18px', 'marginTop': '8px',
-                  'backgroundColor': '#f0f4ff', 'borderRadius': '8px'}),
+                  'padding': '10px 18px', 'marginTop': '8px'}),
 
-        html.Div(id='model-info', style={
+        html.Div(id='model-info', className='kosma-panel', style={
             'display': 'flex', 'flexWrap': 'wrap', 'gap': '8px', 'alignItems': 'center',
-            'backgroundColor': '#e8f4f8', 'padding': '7px 16px', 'borderRadius': '6px',
-            'marginTop': '8px', 'marginBottom': '4px', 'fontSize': '13px', 'color': '#333'}),
+            'padding': '7px 16px',
+            'marginTop': '8px', 'marginBottom': '4px', 'fontSize': '13px'}),
     ]),
 
     dcc.Tabs(
@@ -4205,8 +4409,8 @@ app.layout = html.Div(
                                            'color': 'white', 'border': 'none', 'borderRadius': '6px',
                                            'cursor': 'pointer', 'fontSize': '13px', 'fontWeight': '600'}),
                     ], style={'display': 'flex', 'alignItems': 'stretch'}),
-                ], style={'padding': '14px 18px', 'backgroundColor': '#f5f7ff',
-                          'borderRadius': '8px', 'border': '1px dashed #9ab'}),
+                ], className='kosma-panel kosma-panel-dashed',
+                          style={'padding': '14px 18px'}),
 
                 html.Div(id='load-status',
                          style={'marginTop': '7px', 'fontSize': '13px', 'minHeight': '22px'}),
@@ -4234,9 +4438,8 @@ app.layout = html.Div(
                                            'color': '#555', 'border': '1px solid #ccc',
                                            'borderRadius': '6px', 'cursor': 'pointer', 'fontSize': '13px'}),
                     ], style={'display': 'flex', 'alignItems': 'stretch'}),
-                ], style={'padding': '12px 18px', 'marginTop': '10px',
-                          'backgroundColor': '#faf6f4', 'borderRadius': '8px',
-                          'border': '1px dashed #c9a99b'}),
+                ], className='kosma-panel kosma-panel-dashed',
+                style={'padding': '12px 18px', 'marginTop': '10px'}),
 
                 html.Div(id='overlay-status',
                          style={'marginTop': '6px', 'fontSize': '13px', 'minHeight': '20px'}),
@@ -4263,9 +4466,8 @@ app.layout = html.Div(
                                            'color': '#555', 'border': '1px solid #ccc',
                                            'borderRadius': '6px', 'cursor': 'pointer', 'fontSize': '13px'}),
                     ], style={'display': 'flex', 'alignItems': 'stretch'}),
-                ], style={'padding': '10px 18px', 'marginTop': '8px',
-                          'backgroundColor': '#faf6f4', 'borderRadius': '8px',
-                          'border': '1px dashed #c9a99b'}),
+                ], className='kosma-panel kosma-panel-dashed',
+                style={'padding': '10px 18px', 'marginTop': '8px'}),
                 html.Div(id='simline-overlay-status',
                          style={'marginTop': '6px', 'fontSize': '13px', 'minHeight': '20px'}),
                 dcc.Store(id='overlay-state', data=0),
@@ -4294,9 +4496,8 @@ app.layout = html.Div(
                                            'color': '#555', 'border': '1px solid #ccc',
                                            'borderRadius': '6px', 'cursor': 'pointer', 'fontSize': '13px'}),
                     ], style={'display': 'flex', 'alignItems': 'stretch'}),
-                ], style={'padding': '12px 18px', 'marginTop': '10px',
-                          'backgroundColor': '#f3f9f1', 'borderRadius': '8px',
-                          'border': '1px dashed #a9c79b'}),
+                ], className='kosma-panel kosma-panel-dashed',
+                style={'padding': '12px 18px', 'marginTop': '10px'}),
 
                 html.Div(id='chem-status',
                          style={'marginTop': '6px', 'fontSize': '13px', 'minHeight': '20px'}),
@@ -4325,9 +4526,8 @@ app.layout = html.Div(
                                            'color': '#555', 'border': '1px solid #ccc',
                                            'borderRadius': '6px', 'cursor': 'pointer', 'fontSize': '13px'}),
                     ], style={'display': 'flex', 'alignItems': 'stretch'}),
-                ], style={'padding': '12px 18px', 'marginTop': '10px',
-                          'backgroundColor': '#f7f3fa', 'borderRadius': '8px',
-                          'border': '1px dashed #b9a3c9'}),
+                ], className='kosma-panel kosma-panel-dashed',
+                style={'padding': '12px 18px', 'marginTop': '10px'}),
 
                 html.Div(id='simline-status',
                          style={'marginTop': '6px', 'fontSize': '13px', 'minHeight': '20px'}),
@@ -4417,7 +4617,7 @@ app.layout = html.Div(
                        style=_PAGE_INTRO),
                 html.Div([
                     html.Div([
-                        html.Label('Contoured quantity (cloud edge)', style=_CTRL_LABEL),
+                        html.Label('Contoured quantity', style=_CTRL_LABEL),
                         dcc.Dropdown(id='contour-quantity', options=[], value=None,
                                      placeholder='Load a grid\u2026',
                                      style={'fontSize': '13px'}),
@@ -4427,9 +4627,9 @@ app.layout = html.Div(
                         dcc.RadioItems(id='contour-zscale', options=_SCALE_OPTIONS,
                                        value='log', **_RADIO),
                     ], style={**_CTRL_BOX, 'marginRight': '0'}),
-                ], style={'display': 'flex', 'alignItems': 'flex-start',
-                          'padding': '12px 18px', 'backgroundColor': '#f0f4ff',
-                          'borderRadius': '8px', 'marginBottom': '12px'}),
+                ], className='kosma-panel',
+                style={'display': 'flex', 'alignItems': 'flex-start',
+                       'padding': '12px 18px', 'marginBottom': '12px'}),
                 _interp_control_row(prefix=''),
                 _shift_control_row(prefix=''),
                 html.Div([_slice_panel(p['id']) for p in SLICE_PLANES],
@@ -4466,9 +4666,9 @@ app.layout = html.Div(
                         dcc.RadioItems(id='react-ranking', options=REACT_RANKING_OPTIONS,
                                        value=DEFAULT_REACT_RANKING, **_RADIO),
                     ], style={**_CTRL_BOX, 'marginRight': '0'}),
-                ], style={'display': 'flex', 'alignItems': 'flex-start',
-                          'padding': '12px 18px', 'backgroundColor': '#f3f9f1',
-                          'borderRadius': '8px'}),
+                ], className='kosma-panel',
+                style={'display': 'flex', 'alignItems': 'flex-start',
+                       'padding': '12px 18px'}),
                 html.Div([
                     html.Div([
                         dcc.Graph(id='plot-react-formation', figure=placeholder_fig(), config=_GRAPH_CFG,
@@ -4518,9 +4718,9 @@ app.layout = html.Div(
                         dcc.RadioItems(id='int-zscale', options=_SCALE_OPTIONS,
                                        value='log', **_RADIO),
                     ], style={**_CTRL_BOX, 'marginRight': '0'}),
-                ], style={'display': 'flex', 'alignItems': 'flex-start',
-                          'padding': '12px 18px', 'backgroundColor': '#f7f3fa',
-                          'borderRadius': '8px', 'marginBottom': '12px'}),
+                ], className='kosma-panel',
+                style={'display': 'flex', 'alignItems': 'flex-start',
+                       'padding': '12px 18px', 'marginBottom': '12px'}),
                 _interp_control_row(prefix='int-'),
                 _shift_control_row(prefix='int-'),
                 _int_contour_overlay_row(),
@@ -4577,9 +4777,9 @@ app.layout = html.Div(
                                      value=DEFAULT_GRID_COLORMAP,
                                      style={'fontSize': '13px'}),
                     ], style={'flex': '1', 'minWidth': '120px'}),
-                ], style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
-                          'padding': '12px 18px', 'backgroundColor': '#f3f6fa',
-                          'borderRadius': '8px', 'marginBottom': '12px'}),
+                ], className='kosma-panel',
+                style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
+                       'padding': '12px 18px'}),
                 html.Div([
                     html.Div([
                         html.Label('PV position min (arcsec)', style=_CTRL_LABEL),
@@ -4647,8 +4847,8 @@ app.layout = html.Div(
                             ], value=['on'], style={'fontSize': '13px'}),
                         ], style={'flex': '1.4', 'minWidth': '200px'}),
                     ], style={'display': 'flex', 'alignItems': 'center', 'flexWrap': 'wrap'}),
-                ], style={'padding': '12px 18px', 'backgroundColor': '#faf6f0',
-                          'borderRadius': '8px', 'marginBottom': '12px'}),
+                ], className='kosma-panel',
+                          style={'padding': '12px 18px', 'marginBottom': '12px'}),
                 dcc.Graph(id='plot-sp-spectrum', figure=placeholder_fig(), config=_GRAPH_CFG,
                           style={'marginBottom': '8px'}),
                 html.Div(id='sp-fit-summary', style={'padding': '0 18px 12px'}),
@@ -4691,9 +4891,9 @@ app.layout = html.Div(
                         dcc.RadioItems(id='ie-int-idef', options=SIMLINE_IDEF_OPTIONS,
                                        value=SIMLINE_DEFAULT_IDEF, **_RADIO),
                     ], style={**_CTRL_BOX, 'marginRight': '0'}),
-                ], style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
-                          'padding': '12px 18px', 'backgroundColor': '#f7f5fa',
-                          'borderRadius': '8px', 'marginBottom': '12px'}),
+                ], className='kosma-panel',
+                style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
+                       'padding': '12px 18px'}),
                 _interp_control_row(prefix='ie-'),
                 _interp_error_control_row(),
                 html.Div([_ie_plane_section(p['id']) for p in SLICE_PLANES],
@@ -4736,7 +4936,7 @@ app.layout = html.Div(
                         ),
                     ], style={'flex': '1.6', 'minWidth': '240px'}),
                 ], style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
-                          'padding': '12px 18px', 'backgroundColor': '#f3f6fa',
+                          'padding': '12px 18px',
                           'borderRadius': '8px', 'marginBottom': '10px'}),
                 html.Div([
                     html.Button('Add current model', id='cr-atten-add', n_clicks=0,
@@ -4822,9 +5022,9 @@ app.layout = html.Div(
                                          'fontSize': '13px', 'border': '1px solid #bbc',
                                          'borderRadius': '6px'}),
                     ], style={'flex': '2', 'minWidth': '220px'}),
-                ], style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
-                          'padding': '12px 18px', 'backgroundColor': '#f4f6fa',
-                          'borderRadius': '8px', 'marginBottom': '12px'}),
+                ], className='kosma-panel',
+                style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
+                       'padding': '12px 18px'}),
                 html.Div([
                     html.Div([
                         html.Label('Observed FITS maps (JSON: line \u2192 path)', style=_CTRL_LABEL),
@@ -4879,9 +5079,9 @@ app.layout = html.Div(
                                            'color': 'white', 'border': 'none',
                                            'borderRadius': '6px', 'cursor': 'pointer'}),
                     ], style={'flex': '0', 'alignSelf': 'flex-end'}),
-                ], style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
-                          'padding': '12px 18px', 'backgroundColor': '#faf8f4',
-                          'borderRadius': '8px', 'marginBottom': '12px'}),
+                ], className='kosma-panel',
+                style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
+                       'padding': '12px 18px'}),
                 html.Div(id='fit-available-lines',
                          style={'padding': '0 18px 8px', 'fontSize': '12px', 'color': '#666'}),
                 html.Div(id='fit-status', style={'padding': '0 18px 12px'}),
@@ -5041,7 +5241,7 @@ def _ui_slider_config(axis_tokens):
         tokens = axis_tokens[p['key']]
         n = len(tokens)
         varies = n > 1
-        marks = build_marks(p)
+        marks = build_marks(p, axis_tokens)
         value = n // 2
         slider_cfg += [max(n - 1, 0), marks, value, (shown if varies else hidden)]
 
@@ -5051,7 +5251,7 @@ def _ui_slider_config(axis_tokens):
             sdef = _param_def(plane['slice'])
             tokens = axis_tokens[plane['slice']]
             n = len(tokens)
-            slice_cfg += [max(n - 1, 0), build_marks(sdef), n // 2]
+            slice_cfg += [max(n - 1, 0), build_marks(sdef, axis_tokens), n // 2]
         else:
             slice_cfg += [1, {}, 0]
     return slider_cfg, slice_cfg, hidden
@@ -5069,6 +5269,19 @@ def _empty_slice_slider_ui():
     for _ in SLICE_PLANES:
         empty += [1, {}, 0]
     return empty
+
+
+def _interleave_slice_tab_cfgs(slice_cfg):
+    """Match ``_grid_sync_outputs``: per plane, slice then int then ie (same cfg thrice).
+
+    ``handle_load`` uses grouped outputs (all slice, then all int, then all ie), so it
+    can pass ``slice_cfg`` three times.  SIMLINE bootstrap uses interleaved outputs.
+    """
+    out = []
+    for i in range(len(SLICE_PLANES)):
+        plane = slice_cfg[i * 3:(i + 1) * 3]
+        out += plane + plane + plane
+    return out
 
 
 def _species_dropdown_cfg(species, species_idx):
@@ -5116,7 +5329,8 @@ def _empty_grid_sync(loaded=False):
     empty = _empty_param_slider_ui(hidden)
     empty_slice = _empty_slice_slider_ui()
     empty_dropdowns = [[], [], [], None, [], None]
-    return [loaded] + empty + empty_slice + empty_slice + empty_slice + empty_dropdowns
+    return ([loaded] + empty + _interleave_slice_tab_cfgs(empty_slice)
+            + empty_dropdowns)
 
 
 def _grid_sync_from_axis_tokens(axis_tokens):
@@ -5125,7 +5339,7 @@ def _grid_sync_from_axis_tokens(axis_tokens):
     species_idx = _grid.get('species_idx', {})
     sp_opts, defaults, cq_opts, cq_val, ie_cq_opts, ie_cq_val = _species_dropdown_cfg(
         species, species_idx)
-    return ([True] + slider_cfg + slice_cfg + slice_cfg + slice_cfg
+    return ([True] + slider_cfg + _interleave_slice_tab_cfgs(slice_cfg)
             + [sp_opts, defaults, cq_opts, cq_val, ie_cq_opts, ie_cq_val])
 
 
@@ -5200,30 +5414,55 @@ def show_controls(tab, loaded):
 
 @app.callback(
     Output('app-root', 'style'),
+    Output('app-root', 'className'),
+    Output('app-header', 'style'),
     Output('controls-sliders-wrap', 'style'),
     Output('controls-axis-wrap', 'style'),
     Output('model-info', 'style'),
+    Output('main-tabs', 'colors'),
     Input('plot-theme', 'value'),
     Input('grid-loaded', 'data'),
     Input('simline-state', 'data'),
 )
 def apply_plot_theme(theme, loaded, _simline_state):
     t = _theme_colors(theme)
-    root = {'fontFamily': 'Arial, sans-serif', 'maxWidth': '1460px',
-            'margin': '0 auto', 'padding': '14px 22px', 'backgroundColor': t['page_bg']}
-    sliders = {'display': 'flex', 'flexWrap': 'wrap', 'alignItems': 'flex-start',
-                 'padding': '14px 18px', 'marginTop': '4px',
-                 'backgroundColor': t['controls_bg'], 'borderRadius': '8px'}
+    name = _parse_plot_theme(theme)
+    root = {
+        'fontFamily': 'Arial, sans-serif', 'maxWidth': '1460px',
+        'margin': '0 auto', 'padding': '14px 22px',
+        'backgroundColor': t['page_bg'], 'color': t['font'],
+        'minHeight': '100vh',
+    }
+    header = {
+        'display': 'flex', 'alignItems': 'flex-start',
+        'justifyContent': 'space-between', 'gap': '16px',
+        'borderBottom': f'2px solid {t["accent"]}',
+        'paddingBottom': '14px', 'marginBottom': '14px',
+    }
+    sliders = {
+        'display': 'flex', 'flexWrap': 'wrap', 'alignItems': 'flex-start',
+        'padding': '14px 18px', 'marginTop': '4px',
+        'color': t['font'],
+    }
     if loaded and _grid and _grid.get('simline_only'):
         axis = {'display': 'none'}
     else:
-        axis = {'display': 'flex', 'alignItems': 'flex-start',
-                'padding': '10px 18px', 'marginTop': '8px',
-                'backgroundColor': t['controls_bg'], 'borderRadius': '8px'}
-    info = {'display': 'flex', 'flexWrap': 'wrap', 'gap': '8px', 'alignItems': 'center',
-            'backgroundColor': t['controls_bg'], 'padding': '7px 16px', 'borderRadius': '6px',
-            'marginTop': '8px', 'marginBottom': '4px', 'fontSize': '13px', 'color': t['font']}
-    return root, sliders, axis, info
+        axis = {
+            'display': 'flex', 'alignItems': 'flex-start',
+            'padding': '10px 18px', 'marginTop': '8px',
+            'color': t['font'],
+        }
+    info = {
+        'display': 'flex', 'flexWrap': 'wrap', 'gap': '8px', 'alignItems': 'center',
+        'padding': '7px 16px',
+        'marginTop': '8px', 'marginBottom': '4px', 'fontSize': '13px', 'color': t['font'],
+    }
+    tab_colors = {
+        'border': t['tab_border'],
+        'primary': t['accent'],
+        'background': t['tab_bg'],
+    }
+    return root, f'theme-{name}', header, sliders, axis, info, tab_colors
 
 
 # Per-slider value labels + model info bar.
@@ -5812,12 +6051,14 @@ def _ie_slice_token(plane, idx):
 
 
 def _ie_quantity_unit(quantity):
-    if quantity == 'tgas':
+    if quantity in ('tgas', 'tgas_col'):
         return 'K'
     if quantity == 'tdust':
         return 'K'
     if quantity == 'nh':
         return 'cm^-3'
+    if quantity == 'xe':
+        return 'n(e-)/nH'
     if quantity.startswith('species:'):
         return 'rel. abund.'
     return ''

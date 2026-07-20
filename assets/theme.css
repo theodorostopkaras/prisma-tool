@@ -1,0 +1,471 @@
+/* Site-wide light/dark theme — toggled via #app-root.theme-dark / .theme-light */
+
+html, body {
+  margin: 0;
+  min-height: 100%;
+}
+
+body:has(#app-root.theme-dark) {
+  background-color: #0f1419;
+  color: #e0e0e0;
+}
+
+body:has(#app-root.theme-light) {
+  background-color: #ffffff;
+  color: #333333;
+}
+
+#app-root.theme-light {
+  color: #333333;
+}
+
+#app-root.theme-dark {
+  color: #e0e0e0;
+}
+
+/* ---- Shared panels (no pastel inline backgrounds) ---- */
+.kosma-panel {
+  background-color: #f0f4ff;
+  border: 1px solid #c5d0e8;
+  border-radius: 8px;
+  color: inherit;
+}
+
+#app-root.theme-dark .kosma-panel {
+  background-color: #1e293b !important;
+  border-color: #334155 !important;
+  color: #e0e0e0 !important;
+}
+
+.kosma-panel-dashed {
+  border-style: dashed;
+}
+
+.kosma-muted {
+  color: #666666;
+}
+
+#app-root.theme-dark .kosma-muted {
+  color: #9aa3b2 !important;
+}
+
+/* ---- Header brand block ---- */
+.app-brand {
+  flex: 1;
+  min-width: 0;
+  padding-right: 12px;
+}
+
+.app-brand-kicker {
+  display: inline-block;
+  margin: 0 0 8px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #1f77b4;
+  background: rgba(31, 119, 180, 0.10);
+  border: 1px solid rgba(31, 119, 180, 0.22);
+}
+
+#app-root.theme-dark .app-brand-kicker {
+  color: #93c5fd !important;
+  background: rgba(59, 130, 246, 0.14);
+  border-color: rgba(59, 130, 246, 0.28);
+}
+
+.app-brand-title {
+  margin: 0 0 8px !important;
+  font-size: 30px !important;
+  font-weight: 750 !important;
+  line-height: 1.15 !important;
+  letter-spacing: -0.02em;
+  color: #152033 !important;
+}
+
+#app-root.theme-dark .app-brand-title {
+  color: #f1f5f9 !important;
+}
+
+.app-brand-name {
+  font-weight: 750;
+}
+
+.app-brand-tau {
+  font-weight: 750;
+  color: #1f77b4;
+  margin: 0 1px;
+}
+
+#app-root.theme-dark .app-brand-tau {
+  color: #60a5fa !important;
+}
+
+.app-brand-lead {
+  margin: 0 0 6px !important;
+  max-width: 52rem;
+  font-size: 14px !important;
+  line-height: 1.45 !important;
+  color: #4a5568 !important;
+}
+
+#app-root.theme-dark .app-brand-lead {
+  color: #c8d0dc !important;
+}
+
+.app-brand-blurb {
+  margin: 0 !important;
+  max-width: 48rem;
+  font-size: 12.5px !important;
+  line-height: 1.45 !important;
+  color: #6b778a !important;
+}
+
+#app-root.theme-dark .app-brand-blurb {
+  color: #9aa3b2 !important;
+}
+
+/* ---- Header theme sticker / segmented control ---- */
+#theme-toggle-wrap.theme-sticker {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 14px;
+  background: linear-gradient(160deg, #f4f7fb 0%, #e8eef6 100%);
+  border: 1px solid #c5d0e0;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06), inset 0 1px 0 rgba(255, 255, 255, 0.7);
+}
+
+#app-root.theme-dark #theme-toggle-wrap.theme-sticker {
+  background: linear-gradient(160deg, #1e293b 0%, #151f2e 100%);
+  border-color: #3d4f66;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  color: #e0e0e0;
+}
+
+.theme-sticker-caption {
+  display: block;
+  width: 100%;
+  text-align: center;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #6b7a90;
+  line-height: 1;
+}
+
+#app-root.theme-dark .theme-sticker-caption {
+  color: #8b9bb0 !important;
+}
+.theme-seg {
+  display: inline-flex !important;
+  flex-direction: row !important;
+  align-items: center;
+  gap: 2px;
+  margin: 0;
+  padding: 3px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.75);
+  border: 1px solid #d0d7e2;
+}
+
+#app-root.theme-dark .theme-seg {
+  background: rgba(15, 23, 42, 0.65);
+  border-color: #445468;
+}
+
+.theme-seg-input {
+  position: absolute !important;
+  opacity: 0 !important;
+  width: 0 !important;
+  height: 0 !important;
+  margin: 0 !important;
+  pointer-events: none;
+}
+
+.theme-seg-btn {
+  display: inline-flex !important;
+  align-items: center;
+  margin: 0 !important;
+  padding: 0 !important;
+  cursor: pointer;
+  border-radius: 999px;
+  color: #5a6a80 !important;
+  font-weight: 600 !important;
+  font-size: 12px !important;
+  transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+}
+
+#app-root.theme-dark .theme-seg-btn {
+  color: #9aa8bc !important;
+}
+
+.theme-opt {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 11px;
+  border-radius: 999px;
+  line-height: 1;
+  user-select: none;
+}
+
+.theme-seg-btn:has(.theme-seg-input:checked),
+.theme-seg-btn:has(input:checked) {
+  background: #ffffff;
+  color: #1a2332 !important;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.12);
+}
+
+#app-root.theme-dark .theme-seg-btn:has(.theme-seg-input:checked),
+#app-root.theme-dark .theme-seg-btn:has(input:checked) {
+  background: #334155;
+  color: #f1f5f9 !important;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+}
+
+.theme-opt-text {
+  letter-spacing: 0.01em;
+}
+
+/* CSS sun / moon icons (no emoji) */
+.theme-ico {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  position: relative;
+  flex-shrink: 0;
+}
+
+.theme-ico-sun {
+  border-radius: 50%;
+  background: #e2a008;
+  box-shadow:
+    0 -7px 0 -4px #e2a008,
+    0 7px 0 -4px #e2a008,
+    7px 0 0 -4px #e2a008,
+    -7px 0 0 -4px #e2a008,
+    5px 5px 0 -4px #e2a008,
+    -5px 5px 0 -4px #e2a008,
+    5px -5px 0 -4px #e2a008,
+    -5px -5px 0 -4px #e2a008;
+}
+
+.theme-ico-moon {
+  border-radius: 50%;
+  background: transparent;
+  box-shadow: inset -3px -1px 0 1px #7c8db0;
+}
+
+#app-root.theme-dark .theme-ico-moon {
+  box-shadow: inset -3px -1px 0 1px #c7d2e5;
+}
+
+#app-root.theme-dark .theme-ico-sun {
+  background: #f0c14a;
+  box-shadow:
+    0 -7px 0 -4px #f0c14a,
+    0 7px 0 -4px #f0c14a,
+    7px 0 0 -4px #f0c14a,
+    -7px 0 0 -4px #f0c14a,
+    5px 5px 0 -4px #f0c14a,
+    -5px 5px 0 -4px #f0c14a,
+    5px -5px 0 -4px #f0c14a,
+    -5px -5px 0 -4px #f0c14a;
+}
+
+/* Don't force generic label color onto the sticker */
+#app-root.theme-dark #theme-toggle-wrap.theme-sticker label {
+  color: inherit !important;
+}
+
+/* ---- Typography ---- */
+#app-root.theme-dark h1,
+#app-root.theme-dark h2,
+#app-root.theme-dark h3,
+#app-root.theme-dark h4,
+#app-root.theme-dark label {
+  color: #e8eaf0 !important;
+}
+
+#app-root.theme-dark p {
+  color: #c8ced8;
+}
+
+/* Keep status / value accents (inline colors) */
+#app-root.theme-dark [id^="slabel-"],
+#app-root.theme-dark [id^="slice-label-"],
+#app-root.theme-dark [id^="int-slice-label-"],
+#app-root.theme-dark [id^="ie-slice-label-"] {
+  /* leave callback inline colors */
+}
+
+/* ---- Tabs ---- */
+#app-root.theme-dark .tab {
+  color: #c8ced8 !important;
+  background-color: #121528 !important;
+  border-color: #334155 !important;
+}
+
+#app-root.theme-dark .tab--selected,
+#app-root.theme-dark .tab.tab--selected {
+  color: #e8eaf0 !important;
+  background-color: #1e293b !important;
+  border-top: 3px solid #3b82f6 !important;
+}
+
+/* ---- Inputs ---- */
+#app-root.theme-dark input[type="text"],
+#app-root.theme-dark input[type="number"],
+#app-root.theme-dark textarea,
+#app-root.theme-dark .kosma-input {
+  background-color: #0f172a !important;
+  color: #e0e0e0 !important;
+  border: 1px solid #475569 !important;
+  border-radius: 6px;
+  caret-color: #e0e0e0;
+}
+
+#app-root.theme-dark input::placeholder,
+#app-root.theme-dark textarea::placeholder {
+  color: #7a8494 !important;
+  opacity: 1;
+}
+
+/* ---- Dropdowns (Dash / react-select, several class generations) ---- */
+#app-root.theme-dark .Select-control,
+#app-root.theme-dark .Select-menu-outer,
+#app-root.theme-dark .Select-option,
+#app-root.theme-dark .dash-dropdown .Select-control,
+#app-root.theme-dark .VirtualizedSelectOption,
+#app-root.theme-dark div[class*="-control"],
+#app-root.theme-dark div[class*="-menu"],
+#app-root.theme-dark div[class*="-MenuList"],
+#app-root.theme-dark div[class*="-option"],
+#app-root.theme-dark div[class*="-singleValue"],
+#app-root.theme-dark div[class*="-placeholder"],
+#app-root.theme-dark div[class*="-Input"] input,
+#app-root.theme-dark div[class*="-indicatorContainer"],
+#app-root.theme-dark div[class*="-ValueContainer"] {
+  background-color: #0f172a !important;
+  color: #e0e0e0 !important;
+  border-color: #475569 !important;
+}
+
+#app-root.theme-dark .Select-placeholder,
+#app-root.theme-dark .Select-value-label,
+#app-root.theme-dark div[class*="-singleValue"],
+#app-root.theme-dark div[class*="-placeholder"] {
+  color: #e0e0e0 !important;
+}
+
+#app-root.theme-dark .VirtualizedSelectFocusedOption,
+#app-root.theme-dark .Select-option.is-focused,
+#app-root.theme-dark div[class*="-option"]:hover {
+  background-color: #334155 !important;
+}
+
+/* Dropdown portal menus rendered under body */
+body:has(#app-root.theme-dark) div[class*="-menu"],
+body:has(#app-root.theme-dark) .Select-menu-outer {
+  background-color: #1e293b !important;
+  color: #e0e0e0 !important;
+  border-color: #475569 !important;
+}
+
+/* ---- Radios / checklists ---- */
+#app-root.theme-dark .radio,
+#app-root.theme-dark label.radio,
+#app-root.theme-dark .form-check-label,
+#app-root.theme-dark input[type="radio"] + label,
+#app-root.theme-dark .dash-radioitems label,
+#app-root.theme-dark .dash-checklist label {
+  color: #e0e0e0 !important;
+}
+
+/* ---- Code / tables ---- */
+#app-root.theme-dark code {
+  background-color: #1e293b;
+  color: #93c5fd;
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+#app-root.theme-dark table,
+#app-root.theme-dark th,
+#app-root.theme-dark td {
+  color: #e0e0e0;
+  border-color: #334155 !important;
+}
+
+/* ---- Sliders: mark labels must stay readable ---- */
+#app-root.theme-dark .rc-slider-mark-text,
+#app-root.theme-dark .dash-slider-mark {
+  color: #c8d0dc !important;
+  opacity: 1 !important;
+  font-size: 11px !important;
+  font-weight: 500;
+}
+
+#app-root.theme-dark .rc-slider-rail {
+  background-color: #334155 !important;
+}
+
+#app-root.theme-dark .rc-slider-track {
+  background-color: #6366f1 !important;
+}
+
+#app-root.theme-dark .rc-slider-dot {
+  border-color: #64748b !important;
+  background-color: #1e293b !important;
+}
+
+#app-root.theme-dark .rc-slider-handle {
+  border-color: #a5b4fc !important;
+  background-color: #e0e7ff !important;
+}
+
+#app-root.theme-dark .dash-slider-root input {
+  background-color: #0f172a !important;
+  color: #e0e0e0 !important;
+  border-color: #475569 !important;
+}
+
+/* ---- Buttons (secondary / clear) ---- */
+#app-root.theme-dark button {
+  color: inherit;
+}
+
+#app-root.theme-dark button[style*="background-color: rgb(238, 238, 238)"],
+#app-root.theme-dark button[style*="background: rgb(238, 238, 238)"] {
+  background-color: #334155 !important;
+  color: #e0e0e0 !important;
+  border-color: #475569 !important;
+}
+
+/* Fallback: light pastel panels still using inline rgb backgrounds */
+#app-root.theme-dark [style*="background-color: rgb(240, 244, 255)"],
+#app-root.theme-dark [style*="background-color: rgb(245, 247, 255)"],
+#app-root.theme-dark [style*="background-color: rgb(232, 244, 248)"],
+#app-root.theme-dark [style*="background-color: rgb(250, 246, 244)"],
+#app-root.theme-dark [style*="background-color: rgb(250, 248, 244)"],
+#app-root.theme-dark [style*="background-color: rgb(244, 248, 244)"],
+#app-root.theme-dark [style*="background-color: rgb(250, 244, 248)"],
+#app-root.theme-dark [style*="background-color: rgb(243, 249, 241)"],
+#app-root.theme-dark [style*="background-color: rgb(247, 243, 250)"],
+#app-root.theme-dark [style*="background-color: rgb(243, 246, 250)"],
+#app-root.theme-dark [style*="background-color: rgb(250, 246, 240)"],
+#app-root.theme-dark [style*="background-color: rgb(247, 245, 250)"],
+#app-root.theme-dark [style*="background-color: rgb(244, 246, 250)"],
+#app-root.theme-dark [style*="background-color: rgb(238, 242, 247)"],
+#app-root.theme-dark [style*="background-color: rgb(240, 248, 240)"] {
+  background-color: #1e293b !important;
+  border-color: #334155 !important;
+  color: #e0e0e0 !important;
+}

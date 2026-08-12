@@ -56,6 +56,8 @@ import simline_spectra as ss
 import obs_spectrum_fits as osf
 import cr_attenuation as cra
 import grid_naming as gn
+import rgb_phase
+import chem_network
 
 
 # --- CLI ----------------------------------------------------------------------
@@ -85,6 +87,8 @@ args, _ = parser.parse_known_args()
 
 MIN_AB = 1e-30                      # floor for log abundance plots
 MIN_RATE = 1e-40                    # floor for log heating/cooling rate plots
+AV_FLOOR = 1e-5                     # optional A_V display floor (mag); off by default
+DEFAULT_AV_RANGE = 'full'           # 'full' = all HDF5 A_V; 'floor' = clip below AV_FLOOR
 METADATA_PATH   = 'Metadata/Metadata'
 SPECIES_PATH    = 'Additional output/species involved'
 RELDENS_PATH    = 'Local quantities/Densities/Relative densities'
@@ -126,6 +130,23 @@ SIMLINE_PV_QUANTITY_OPTIONS = [
 ]
 SIMLINE_DEFAULT_PV_QUANTITY = 'intensity'
 
+# RGB phase-diagram defaults (KoSens ``plot_species_phase_diagram``).
+RGB_DEFAULT_GRID_SPECIES = ('C+', 'C', 'CO')
+RGB_CHANNEL_COLORS = (
+    {'label': 'Channel 1 (blue)', 'color': '#00008B'},
+    {'label': 'Channel 2 (green)', 'color': '#008000'},
+    {'label': 'Channel 3 (red)', 'color': '#D62728'},
+)
+RGB_GRID_TRANSITION_OPTIONS = [
+    {'label': ' H \u2194 H\u2082 (dashed)', 'value': 'hh2'},
+    {'label': ' C \u2194 CO (solid)', 'value': 'cco'},
+    {'label': ' CO \u2194 JCO (dash-dotted)', 'value': 'cojco'},
+]
+RGB_INT_TRANSITION_OPTIONS = [
+    {'label': ' H \u2194 H\u2082 from HDF5 abundances (dashed)', 'value': 'hh2'},
+    {'label': ' C \u2194 CO from line intensities (solid)', 'value': 'cco'},
+]
+
 # Attenuation x-shift matching (KoSens grid_attenuation_compare / plot_triple_grid_ratio)
 X_SHIFT_MATCH_RTOL = 0.02
 X_SHIFT_SCAN_DIRECTION = 'rightward_then_leftward'
@@ -140,14 +161,28 @@ DEFAULT_INTERP_NY = 60
 DEFAULT_INTERP_NX = 60
 DEFAULT_INTERP_METHOD = 'linear'
 DEFAULT_INTERP_CLIP = False
-COMPACT_CONTOUR_PANEL_W = 380
 DEFAULT_CONTOUR_PANEL_W = 520
-COMPACT_FIG_WIDTH = COMPACT_CONTOUR_PANEL_W + 90
-COMPACT_FIG_HEIGHT = COMPACT_CONTOUR_PANEL_W + 106
-# Identical axes box + colorbar slot for every side-by-side slice figure.
-_COMPACT_FIG_MARGIN = dict(l=58, r=72, t=44, b=50)
-_COMPACT_XDOMAIN = [0.0, 0.80]
-_COMPACT_YDOMAIN = [0.0, 0.94]
+# Square axes box (px) for every side-by-side Grid / Intensities / RGB panel.
+# Domains leave a right strip for the colorbar; figure size is derived so the
+# plotted box is exactly COMPACT_PLOT_BOX × COMPACT_PLOT_BOX pixels.
+COMPACT_PLOT_BOX = 400
+_COMPACT_FIG_MARGIN = dict(l=64, r=90, t=52, b=58)
+_COMPACT_XDOMAIN = [0.0, 0.84]   # ~16% reserved for colorbar
+_COMPACT_YDOMAIN = [0.0, 1.0]    # full paper height → square with x-domain span
+_COMPACT_XSPAN = _COMPACT_XDOMAIN[1] - _COMPACT_XDOMAIN[0]
+_COMPACT_YSPAN = _COMPACT_YDOMAIN[1] - _COMPACT_YDOMAIN[0]
+COMPACT_FIG_WIDTH = int(round(
+    _COMPACT_FIG_MARGIN['l'] + COMPACT_PLOT_BOX / _COMPACT_XSPAN
+    + _COMPACT_FIG_MARGIN['r']
+))
+COMPACT_FIG_HEIGHT = int(round(
+    _COMPACT_FIG_MARGIN['t'] + COMPACT_PLOT_BOX / _COMPACT_YSPAN
+    + _COMPACT_FIG_MARGIN['b']
+))
+# Page shell: wide enough for three compact panels side by side.
+APP_MAX_WIDTH = 'min(1920px, 98vw)'
+# Legacy alias used by a few non-compact figure paths.
+COMPACT_CONTOUR_PANEL_W = COMPACT_PLOT_BOX
 INTERP_METHOD_OPTIONS = [
     {'label': ' Linear', 'value': 'linear'},
     {'label': ' Cubic', 'value': 'cubic'},
@@ -795,6 +830,23 @@ def scan_simline_overlay(directory, recursive=False):
     return _simline_overlay
 
 
+def _prefer_smli_path(existing, candidate):
+    """Prefer ``.smli`` over ``.smlc`` for the same model / species / idef key.
+
+    ``jtemp`` / ``jerg`` / ``tau`` select intensity units via the filename prefix;
+    when both extensions exist for one model, always keep the ``.smli`` table.
+    """
+    if not existing:
+        return candidate
+    cand_smli = candidate.lower().endswith('.smli')
+    exist_smli = existing.lower().endswith('.smli')
+    if cand_smli and not exist_smli:
+        return candidate
+    if exist_smli and not cand_smli:
+        return existing
+    return candidate
+
+
 def _scan_simline_directory(directory, recursive, build_by_non_atten=False):
     directory = os.path.expanduser((directory or '').strip())
     if not directory or not os.path.isdir(directory):
@@ -814,6 +866,7 @@ def _scan_simline_directory(directory, recursive, build_by_non_atten=False):
     skipped = 0
     species_set = set()
     transitions = {}
+    transition_paths = {}
     filename_token_count = None
     for path in paths:
         parsed = parse_smli_filename(path)
@@ -824,13 +877,18 @@ def _scan_simline_directory(directory, recursive, build_by_non_atten=False):
         if filename_token_count is None:
             filename_token_count = len(file_key)
         key = (file_key, species, idef)
-        files[key] = path
+        chosen = _prefer_smli_path(files.get(key), path)
+        files[key] = chosen
         if build_by_non_atten:
-            by_non_atten.setdefault((file_key[:N_PARAMS - 1], species, idef), path)
+            bn_key = (file_key[:N_PARAMS - 1], species, idef)
+            by_non_atten[bn_key] = _prefer_smli_path(by_non_atten.get(bn_key), path)
         species_set.add(species)
         tkey = (species, idef)
-        if tkey not in transitions:
-            rows = read_smli_file(path)
+        prev_tpath = transition_paths.get(tkey)
+        chosen_tpath = _prefer_smli_path(prev_tpath, path)
+        if chosen_tpath != prev_tpath:
+            transition_paths[tkey] = chosen_tpath
+            rows = read_smli_file(chosen_tpath)
             transitions[tkey] = [
                 dict(
                     idx=i,
@@ -1653,13 +1711,17 @@ def _axis_style(theme='light'):
     )
 
 
-def _apply_layout(fig, title, xlabel, xtype, xrange, ylabel, ytype, theme='light'):
+def _apply_layout(fig, title, xlabel, xtype, xrange, ylabel, ytype, theme='light',
+                  uirevision_extra=''):
     t = _theme_colors(theme)
+    uirev = f'{xtype}|{ytype}|{_parse_plot_theme(theme)}'
+    if uirevision_extra:
+        uirev = f'{uirev}|{uirevision_extra}'
     fig.update_layout(
         **_base_layout(theme),
         title=dict(text=title, font=dict(size=13, color=t['title']), x=0.02, xanchor='left'),
-        # Reset zoom/colorbar when log↔linear changes (uirevision must change).
-        uirevision=f'{xtype}|{ytype}|{_parse_plot_theme(theme)}',
+        # Reset zoom/colorbar when log↔linear / A_V range changes (uirevision must change).
+        uirevision=uirev,
         xaxis=dict(**_axis_style(theme),
                    title=dict(text=xlabel, font=dict(size=12, color=t['font'])),
                    type=xtype, range=xrange, autorange=False),
@@ -1669,11 +1731,23 @@ def _apply_layout(fig, title, xlabel, xtype, xrange, ylabel, ytype, theme='light
     )
 
 
-def _xvals(model, xvar, xscale):
+def _parse_av_range(value):
+    return value if value in ('full', 'floor') else DEFAULT_AV_RANGE
+
+
+def _av_display_floor(av_range):
+    """Return A_V clip threshold, or None when the full HDF5 axis is requested."""
+    return AV_FLOOR if _parse_av_range(av_range) == 'floor' else None
+
+
+def _xvals(model, xvar, xscale, av_range=DEFAULT_AV_RANGE):
     """Return (x_array, x_label, x_type, x_range) with an explicit axis range.
 
     For ``type='log'`` Plotly expects ``range`` in log10 units.  For linear axes
     the range is in physical data units.
+
+    ``av_range='floor'`` hides A_V below ``AV_FLOOR``; ``'full'`` keeps every
+    HDF5 sample (log axes still omit non-positive values, which cannot be drawn).
     """
     if xvar == 'nH':
         xv = np.asarray(model['nH'], dtype=float)
@@ -1682,26 +1756,27 @@ def _xvals(model, xvar, xscale):
         xv = np.asarray(model['av'], dtype=float)
         xl = 'A<sub>V</sub> (mag)'
 
-    # For Av, never show values below this floor (mag).
-    av_floor = 1e-5
+    floor = _av_display_floor(av_range) if xvar == 'Av' else None
+    if floor is not None:
+        xv = np.where(xv >= floor, xv, np.nan)
 
-    pos = xv[xv > 0]
+    pos = xv[np.isfinite(xv) & (xv > 0)]
     if xscale == 'log' and pos.size:
-        lo_exp = np.floor(np.log10(pos.min()))
-        if xvar == 'Av':
-            lo_exp = max(lo_exp, np.log10(av_floor))
-            xv = np.where(xv >= av_floor, xv, np.nan)
-        else:
-            xv = np.where(xv > 0, xv, np.nan)
-        xrange = [float(lo_exp), float(np.ceil(np.log10(pos.max())))]
+        xv = np.where(np.isfinite(xv) & (xv > 0), xv, np.nan)
+        lo_exp = float(np.floor(np.log10(pos.min())))
+        if floor is not None:
+            lo_exp = max(lo_exp, np.log10(floor))
+        xrange = [lo_exp, float(np.ceil(np.log10(pos.max())))]
         xtype = 'log'
     else:
-        if xvar == 'Av':
-            lo = av_floor
-            xv = np.where(xv >= av_floor, xv, np.nan)
+        finite = xv[np.isfinite(xv)]
+        if finite.size:
+            lo = float(np.nanmin(finite))
+            hi = float(np.nanmax(finite))
         else:
-            lo = float(np.nanmin(xv))
-        hi = float(np.nanmax(xv))
+            lo, hi = (floor if floor is not None else 0.0), 1.0
+        if floor is not None:
+            lo = max(lo, floor)
         if not np.isfinite(hi) or hi <= lo:
             hi = lo * 1.02 if lo else 1.0
         xrange = [lo, hi * 1.02]
@@ -1709,14 +1784,14 @@ def _xvals(model, xvar, xscale):
     return xv, xl, xtype, xrange
 
 
-def _x_array(model, xvar, xscale):
+def _x_array(model, xvar, xscale, av_range=DEFAULT_AV_RANGE):
     """x-array for a model, masked consistently with ``_xvals`` (for overlays)."""
-    av_floor = 1e-5
     xv = np.asarray(model['nH'] if xvar == 'nH' else model['av'], dtype=float)
-    if xvar == 'Av':
-        xv = np.where(xv >= av_floor, xv, np.nan)
-    elif xscale == 'log':
-        xv = np.where(xv > 0, xv, np.nan)
+    floor = _av_display_floor(av_range) if xvar == 'Av' else None
+    if floor is not None:
+        xv = np.where(xv >= floor, xv, np.nan)
+    if xscale == 'log':
+        xv = np.where(np.isfinite(xv) & (xv > 0), xv, np.nan)
     return xv
 
 
@@ -1787,22 +1862,25 @@ def _temperature(model, key, yscale):
     return arr
 
 
-def fig_tgas(model, overlay, xvar, xscale, yscale, theme='light'):
-    xv, xl, xt, xr = _xvals(model, xvar, xscale)
-    xvo = _x_array(overlay, xvar, xscale) if overlay else None
+def fig_tgas(model, overlay, xvar, xscale, yscale, theme='light',
+             av_range=DEFAULT_AV_RANGE):
+    xv, xl, xt, xr = _xvals(model, xvar, xscale, av_range=av_range)
+    xvo = _x_array(overlay, xvar, xscale, av_range=av_range) if overlay else None
     fig = go.Figure()
     _line(fig, xv, _temperature(model, 'tgas', yscale), COLORS[0], 'T<sub>gas</sub>')
     _line(fig, xv, _temperature(model, 'tdust', yscale), COLORS[1], 'T<sub>dust</sub>', dash='dot')
     if overlay:
         _line(fig, xvo, _temperature(overlay, 'tgas', yscale), COLORS[0], 'T<sub>gas</sub>', overlay=True)
         _line(fig, xvo, _temperature(overlay, 'tdust', yscale), COLORS[1], 'T<sub>dust</sub>', overlay=True)
-    _apply_layout(fig, 'Gas / Dust Temperature', xl, xt, xr, 'T (K)', yscale, theme=theme)
+    _apply_layout(fig, 'Gas / Dust Temperature', xl, xt, xr, 'T (K)', yscale, theme=theme,
+                  uirevision_extra=_parse_av_range(av_range))
     return fig
 
 
-def _fig_species(model, overlay, xvar, xscale, yscale, specs, title, theme='light'):
-    xv, xl, xt, xr = _xvals(model, xvar, xscale)
-    xvo = _x_array(overlay, xvar, xscale) if overlay else None
+def _fig_species(model, overlay, xvar, xscale, yscale, specs, title, theme='light',
+                 av_range=DEFAULT_AV_RANGE):
+    xv, xl, xt, xr = _xvals(model, xvar, xscale, av_range=av_range)
+    xvo = _x_array(overlay, xvar, xscale, av_range=av_range) if overlay else None
     fig = go.Figure()
     for name, color in specs:
         _line(fig, xv, species_abundance(model, name, yscale), color, format_species_html(name))
@@ -1810,26 +1888,30 @@ def _fig_species(model, overlay, xvar, xscale, yscale, specs, title, theme='ligh
         for name, color in specs:
             _line(fig, xvo, species_abundance(overlay, name, yscale), color,
                   format_species_html(name), overlay=True)
-    _apply_layout(fig, title, xl, xt, xr, 'x(species)', yscale, theme=theme)
+    _apply_layout(fig, title, xl, xt, xr, 'x(species)', yscale, theme=theme,
+                  uirevision_extra=_parse_av_range(av_range))
     return fig
 
 
-def fig_h_h2(model, overlay, xvar, xscale, yscale, theme='light'):
+def fig_h_h2(model, overlay, xvar, xscale, yscale, theme='light',
+             av_range=DEFAULT_AV_RANGE):
     return _fig_species(model, overlay, xvar, xscale, yscale,
                         [('H', COLORS[0]), ('H2', COLORS[1])], 'H / H<sub>2</sub>',
-                        theme=theme)
+                        theme=theme, av_range=av_range)
 
 
-def fig_cplus_c_co(model, overlay, xvar, xscale, yscale, theme='light'):
+def fig_cplus_c_co(model, overlay, xvar, xscale, yscale, theme='light',
+                   av_range=DEFAULT_AV_RANGE):
     return _fig_species(model, overlay, xvar, xscale, yscale,
                         [('C+', COLORS[3]), ('C', COLORS[2]), ('CO', COLORS[0])],
-                        'C<sup>+</sup> / C / CO', theme=theme)
+                        'C<sup>+</sup> / C / CO', theme=theme, av_range=av_range)
 
 
-def fig_custom(model, overlay, xvar, xscale, yscale, sel_species, theme='light'):
+def fig_custom(model, overlay, xvar, xscale, yscale, sel_species, theme='light',
+               av_range=DEFAULT_AV_RANGE):
     specs = [(sp, COLORS[k % len(COLORS)]) for k, sp in enumerate(sel_species or [])]
     return _fig_species(model, overlay, xvar, xscale, yscale, specs, 'Custom Species',
-                        theme=theme)
+                        theme=theme, av_range=av_range)
 
 
 _RATE_YLABEL = '\u0393, \u039B (erg cm<sup>-3</sup> s<sup>-1</sup>)'
@@ -1838,10 +1920,11 @@ _RATE_YLABEL_heating = '\u0393 (erg cm<sup>-3</sup> s<sup>-1</sup>)'
 _RATE_YLABEL_cooling = '\u039B (erg cm<sup>-3</sup> s<sup>-1</sup>)'
 
 
-def fig_thermal(model, overlay, xvar, xscale, yscale, theme='light'):
+def fig_thermal(model, overlay, xvar, xscale, yscale, theme='light',
+                av_range=DEFAULT_AV_RANGE):
     """Total heating vs total cooling, with the cosmic-ray heating highlighted."""
-    xv, xl, xt, xr = _xvals(model, xvar, xscale)
-    xvo = _x_array(overlay, xvar, xscale) if overlay else None
+    xv, xl, xt, xr = _xvals(model, xvar, xscale, av_range=av_range)
+    xvo = _x_array(overlay, xvar, xscale, av_range=av_range) if overlay else None
     fig = go.Figure()
     _line(fig, xv, _rate_total(model['heat'], yscale), '#d62728', '\u0393 total (heating)')
     _line(fig, xv, _rate_total(model['cool'], yscale), '#1f77b4', '\u039B total (cooling)')
@@ -1853,7 +1936,8 @@ def fig_thermal(model, overlay, xvar, xscale, yscale, theme='light'):
         _line(fig, xvo, _rate_column(overlay['heat'], _cr_heat_idx, yscale),
               '#ff7f0e', '\u0393 cosmic rays', overlay=True)
     _apply_layout(fig, 'Heating / Cooling balance  (CR highlighted)',
-                  xl, xt, xr, _RATE_YLABEL, yscale, theme=theme)
+                  xl, xt, xr, _RATE_YLABEL, yscale, theme=theme,
+                  uirevision_extra=_parse_av_range(av_range))
     return fig
 
 
@@ -1861,14 +1945,15 @@ _DASH_CYCLE = ['solid', 'dot', 'dash', 'dashdot']
 
 
 def _fig_rate_breakdown(model, overlay, xvar, xscale, yscale,
-                        key, components, title, emphasize_idx=None, theme='light'):
+                        key, components, title, emphasize_idx=None, theme='light',
+                        av_range=DEFAULT_AV_RANGE):
     """Plot every component of a rate matrix (heating or cooling) individually.
 
     With more components than colours, the dash pattern is cycled too so all
     lines stay distinguishable.
     """
-    xv, xl, xt, xr = _xvals(model, xvar, xscale)
-    xvo = _x_array(overlay, xvar, xscale) if overlay else None
+    xv, xl, xt, xr = _xvals(model, xvar, xscale, av_range=av_range)
+    xvo = _x_array(overlay, xvar, xscale, av_range=av_range) if overlay else None
     fig = go.Figure()
     for k, (label, idx) in enumerate(components):
         emph = (emphasize_idx is not None and idx == emphasize_idx)
@@ -1881,23 +1966,27 @@ def _fig_rate_breakdown(model, overlay, xvar, xscale, yscale,
                   color, label, overlay=True)
     _apply_layout(fig, title, xl, xt, xr,
                   _RATE_YLABEL_heating if key == 'heat' else _RATE_YLABEL_cooling,
-                  yscale, theme=theme)
+                  yscale, theme=theme,
+                  uirevision_extra=_parse_av_range(av_range))
     return fig
 
 
-def fig_heat_breakdown(model, overlay, xvar, xscale, yscale, theme='light'):
+def fig_heat_breakdown(model, overlay, xvar, xscale, yscale, theme='light',
+                       av_range=DEFAULT_AV_RANGE):
     """All heating-rate components; cosmic-ray heating drawn thicker."""
     return _fig_rate_breakdown(model, overlay, xvar, xscale, yscale,
                                'heat', _heat_components,
                                'Heating-rate components (all)', _cr_heat_idx,
-                               theme=theme)
+                               theme=theme, av_range=av_range)
 
 
-def fig_cool_breakdown(model, overlay, xvar, xscale, yscale, theme='light'):
+def fig_cool_breakdown(model, overlay, xvar, xscale, yscale, theme='light',
+                       av_range=DEFAULT_AV_RANGE):
     """All cooling-rate components."""
     return _fig_rate_breakdown(model, overlay, xvar, xscale, yscale,
                                'cool', _cool_components,
-                               'Cooling-rate components (all)', theme=theme)
+                               'Cooling-rate components (all)', theme=theme,
+                               av_range=av_range)
 
 
 _REACT_YLABEL = 'rate (cm<sup>-3</sup> s<sup>-1</sup>)'
@@ -1909,6 +1998,42 @@ _REACT_TABLE_CELL = {
     'padding': '4px 8px', 'borderBottom': '1px solid #e0e0e0',
     'verticalAlign': 'top',
 }
+
+
+def _reaction_y_range(ys_list, yscale, decade_pad=1.0):
+    """Y-axis range from the currently displayed (top-N) reaction rates.
+
+    Uses the raw min/max of those series (no filtering of small values), then
+    pads by ``decade_pad`` orders of magnitude on both ends.  For log axes the
+    returned range is in log10 units (Plotly convention).
+    """
+    chunks = []
+    for y in ys_list:
+        if y is None:
+            continue
+        vals = np.asarray(y, dtype=float)
+        vals = vals[np.isfinite(vals)]
+        if yscale == 'log':
+            vals = vals[vals > 0]
+        if vals.size:
+            chunks.append(vals)
+    if not chunks:
+        return None
+    allv = np.concatenate(chunks)
+    lo, hi = float(np.min(allv)), float(np.max(allv))
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        return None
+    if yscale == 'log':
+        if lo <= 0 or hi <= 0:
+            return None
+        return [float(np.log10(lo)) - decade_pad,
+                float(np.log10(hi)) + decade_pad]
+    # Linear: one decade of headroom around the data span.
+    if hi <= 0 and lo <= 0:
+        return [hi * 10.0 ** decade_pad, lo / 10.0 ** decade_pad]
+    if lo <= 0:
+        return [lo - abs(hi) * (10.0 ** decade_pad - 1), hi * 10.0 ** decade_pad]
+    return [lo / 10.0 ** decade_pad, hi * 10.0 ** decade_pad]
 
 
 def _reaction_contribution_table(order, labels, stats, mode, ranking_metric):
@@ -1969,9 +2094,11 @@ def _reaction_contribution_table(order, labels, stats, mode, ranking_metric):
 
 
 def fig_reactions(filepath, species, mode, xscale, yscale, top_n, model=None,
-                  ranking_metric=DEFAULT_REACT_RANKING, theme='light'):
+                  ranking_metric=DEFAULT_REACT_RANKING, theme='light',
+                  av_range=DEFAULT_AV_RANGE):
     """Top-N formation or destruction reactions for a species (vs A_V)."""
     ranking_metric = _parse_react_ranking(ranking_metric)
+    av_range = _parse_av_range(av_range)
     title = f'{species}: {"formation" if mode == "formation" else "destruction"} reactions'
     if filepath is None:
         return placeholder_fig('Load a chemistry grid to see reactions', theme=theme), {}, []
@@ -1992,24 +2119,21 @@ def fig_reactions(filepath, species, mode, xscale, yscale, top_n, model=None,
     stats = compute_reaction_contributions(matrix, model, species)
     order = sort_reactions_by_ranking(order, stats, ranking_metric)
 
-    # x handling (Av only; chem grid carries the A_V axis).
-    av_floor = 1e-5
-    xv = np.where(av >= av_floor, av, np.nan) if xscale == 'log' else av.copy()
-    pos = av[av > 0]
-    if xscale == 'log' and pos.size:
-        xr = [max(np.floor(np.log10(pos.min())), np.log10(av_floor)),
-              np.ceil(np.log10(pos.max()))]
-        xt = 'log'
-    else:
-        xr = [av_floor if xscale == 'log' else float(np.nanmin(av)),
-              float(np.nanmax(av)) * 1.02]
-        xt = 'linear'
+    # Reuse the shared A_V axis helper (full HDF5 axis vs optional AV_FLOOR).
+    xv, _xl, xt, xr = _xvals(dict(av=av), 'Av', xscale, av_range=av_range)
+    x_ok = np.isfinite(xv)
 
     fig = go.Figure()
+    # Y-range follows the currently plotted top-N reactions (±1 decade pad),
+    # using only depth points that are actually drawn on the x-axis.
+    displayed_ys = []
     for k, j in enumerate(order):
-        y = matrix[:, j].astype(float)
+        # Rates may be signed (esp. destruction); plots show magnitudes.
+        y = np.abs(matrix[:, j].astype(float))
         if yscale == 'log':
-            y = np.where(y > 0, y, np.nan)   # rates can be negative-signed; show positive part on log
+            y = np.where(y > 0, y, np.nan)
+        y_plot = np.where(x_ok, y, np.nan)
+        displayed_ys.append(y_plot)
         lab = labels[j] if j < len(labels) else f'reaction {j}'
         st = stats.get(j, {})
         pct = st.get('fraction_pct', np.nan)
@@ -2022,41 +2146,106 @@ def fig_reactions(filepath, species, mode, xscale, yscale, top_n, model=None,
             + '<extra></extra>'
         )
         fig.add_trace(go.Scatter(
-            x=xv, y=y, mode='lines',
+            x=xv, y=y_plot, mode='lines',
             line=dict(color=COLORS[k % len(COLORS)], width=1.9,
                       dash=_DASH_CYCLE[(k // len(COLORS)) % len(_DASH_CYCLE)]),
             name=legend,
+            legendrank=k + 1,
             hovertemplate=hover,
         ))
-    _apply_layout(fig, title, 'A<sub>V</sub> (mag)', xt, xr, _REACT_YLABEL, yscale, theme=theme)
-    fig.update_layout(legend=dict(font=dict(size=10)))
+    # Sum of every |reaction| column — always shown, independent of top-N.
+    y_total = np.sum(np.abs(matrix), axis=1).astype(float)
+    if yscale == 'log':
+        y_total = np.where(y_total > 0, y_total, np.nan)
+    y_total = np.where(x_ok, y_total, np.nan)
+    total_name = f'Total {mode}'
+    fig.add_trace(go.Scatter(
+        x=xv, y=y_total, mode='lines',
+        line=dict(color='black', width=2.5),
+        name=total_name,
+        legendrank=0,
+        hovertemplate=(
+            f'{total_name}<br>A_V=%{{x:.3g}}<br>rate=%{{y:.3g}}<extra></extra>'
+        ),
+    ))
+    yr = _reaction_y_range(displayed_ys, yscale)
+    _apply_layout(fig, title, 'A<sub>V</sub> (mag)', xt, xr, _REACT_YLABEL, yscale, theme=theme,
+                  uirevision_extra=av_range)
+    yr_tag = f'{yr[0]:.4g}:{yr[1]:.4g}' if yr is not None else 'auto'
+    fig.update_layout(
+        legend=dict(font=dict(size=10)),
+        uirevision=(
+            f'react|{xt}|{yscale}|{av_range}|{top_n}|{species}|{mode}|'
+            f'{ranking_metric}|{yr_tag}|{_parse_plot_theme(theme)}'
+        ),
+    )
+    if yr is not None:
+        fig.update_yaxes(type=yscale, range=yr, autorange=False)
+    else:
+        fig.update_yaxes(type=yscale, autorange=True)
     return fig, stats, order
 
 
 def make_reaction_plots(values, species, xscale, yscale, top_n,
-                        ranking_metric=DEFAULT_REACT_RANKING, theme='light'):
-    """Return formation/destruction figures and contribution summary tables."""
+                        ranking_metric=DEFAULT_REACT_RANKING, theme='light',
+                        av_range=DEFAULT_AV_RANGE,
+                        chain_upstream=None, chain_downstream=None,
+                        chain_include_isotopes=False, chain_include_ice=False,
+                        network_highlight=None):
+    """Return formation/destruction figures, tables, and pathway network."""
     ranking_metric = _parse_react_ranking(ranking_metric)
+    av_range = _parse_av_range(av_range)
     empty = html.Div()
+    theme = _parse_plot_theme(theme)
+    tc = _theme_colors(theme)
+    net_placeholder = placeholder_fig(
+        'Load a chemistry grid and pick a species', theme=theme)
+    net_status = chem_network.status_message({})
+    try:
+        up = int(chain_upstream) if chain_upstream is not None else chem_network.DEFAULT_CHAIN_UPSTREAM
+    except (TypeError, ValueError):
+        up = chem_network.DEFAULT_CHAIN_UPSTREAM
+    try:
+        down = int(chain_downstream) if chain_downstream is not None else chem_network.DEFAULT_CHAIN_DOWNSTREAM
+    except (TypeError, ValueError):
+        down = chem_network.DEFAULT_CHAIN_DOWNSTREAM
+    include_isotopes = bool(chain_include_isotopes)
+    include_ice = bool(chain_include_ice)
     if not _chem or not species:
         p = placeholder_fig('Load a chemistry grid and pick a species', theme=theme)
-        return p, empty, p, empty
+        return (p, empty, p, empty, net_placeholder, net_status)
     chem_path = chem_file(values)
     struct_path = current_file(values)
     model = get_model(struct_path) if struct_path else None
-    fig_f, stats_f, order_f = fig_reactions(
-        chem_path, species, 'formation', xscale, yscale, top_n, model=model,
-        ranking_metric=ranking_metric, theme=theme)
-    fig_d, stats_d, order_d = fig_reactions(
-        chem_path, species, 'destruction', xscale, yscale, top_n, model=model,
-        ranking_metric=ranking_metric, theme=theme)
-    labels_f = (get_reaction_data(chem_path, species, 'formation') or {}).get('labels', [])
-    labels_d = (get_reaction_data(chem_path, species, 'destruction') or {}).get('labels', [])
-    tbl_f = _reaction_contribution_table(
-        order_f, labels_f, stats_f, 'formation', ranking_metric)
-    tbl_d = _reaction_contribution_table(
-        order_d, labels_d, stats_d, 'destruction', ranking_metric)
-    return fig_f, tbl_f, fig_d, tbl_d
+    if chem_path:
+        fig_f, stats_f, order_f = fig_reactions(
+            chem_path, species, 'formation', xscale, yscale, top_n, model=model,
+            ranking_metric=ranking_metric, theme=theme, av_range=av_range)
+        fig_d, stats_d, order_d = fig_reactions(
+            chem_path, species, 'destruction', xscale, yscale, top_n, model=model,
+            ranking_metric=ranking_metric, theme=theme, av_range=av_range)
+        labels_f = (get_reaction_data(chem_path, species, 'formation') or {}).get('labels', [])
+        labels_d = (get_reaction_data(chem_path, species, 'destruction') or {}).get('labels', [])
+        tbl_f = _reaction_contribution_table(
+            order_f, labels_f, stats_f, 'formation', ranking_metric)
+        tbl_d = _reaction_contribution_table(
+            order_d, labels_d, stats_d, 'destruction', ranking_metric)
+    else:
+        missing = placeholder_fig('No chemistry file for this model point', theme=theme)
+        fig_f = fig_d = missing
+        tbl_f = tbl_d = empty
+    sp_html = format_species_html(species)
+    fig_net, net_meta = chem_network.build_network_panels(
+        _chem.get('labels') or {}, species,
+        upstream_depth=up, downstream_depth=down,
+        include_isotopes=include_isotopes,
+        include_ice=include_ice,
+        highlight_species=network_highlight,
+        theme_colors=tc,
+        title=f'Reaction pathway network — {sp_html}',
+    )
+    return (fig_f, tbl_f, fig_d, tbl_d, fig_net,
+            chem_network.status_message(net_meta))
 
 
 # --- 2-D parameter-slice contour grids ----------------------------------------
@@ -2243,52 +2432,87 @@ def _apply_zscale(Z, zscale):
     return Zplot, zmin, zmax
 
 
+def _compact_slice_layout_kw(title, xlabel, ylabel, theme='light', uirevision='slice',
+                             x_range=None, y_range=None, showgrid=True):
+    """Identical figure box for every side-by-side slice panel.
+
+    Uses a fixed width/height and shared axis domains.  Deliberately does
+    *not* set ``scaleanchor``: equal log-decade scaling would shrink panels
+    differently when the three planes have unequal axis spans (e.g. 4 vs 5
+    decades), which makes the three plots look like different shapes.
+
+    Optional ``x_range`` / ``y_range`` lock the data window (needed for RGB
+    ``go.Image`` so Plotly does not re-derive a pixel-based aspect).
+    """
+    t = _theme_colors(theme)
+    axis_common = dict(
+        type='linear', showgrid=bool(showgrid), gridcolor=t['grid'],
+        linecolor=t['axis_line'], tickfont=dict(color=t['font']),
+        constrain='domain',
+        fixedrange=False,
+    )
+    xaxis = dict(
+        title=dict(text=xlabel, font=dict(size=11, color=t['font'])),
+        domain=list(_COMPACT_XDOMAIN),
+        **axis_common,
+    )
+    yaxis = dict(
+        title=dict(text=ylabel, font=dict(size=11, color=t['font'])),
+        domain=list(_COMPACT_YDOMAIN),
+        **axis_common,
+    )
+    if x_range is not None:
+        xaxis['range'] = [float(x_range[0]), float(x_range[1])]
+        xaxis['autorange'] = False
+    else:
+        xaxis['autorange'] = True
+    if y_range is not None:
+        yaxis['range'] = [float(y_range[0]), float(y_range[1])]
+        yaxis['autorange'] = False
+    else:
+        yaxis['autorange'] = True
+    return dict(
+        title=dict(text=title, font=dict(size=12, color=t['title']),
+                   x=0.02, xanchor='left'),
+        paper_bgcolor=t['paper_bg'],
+        plot_bgcolor=t['plot_bg'],
+        width=COMPACT_FIG_WIDTH,
+        height=COMPACT_FIG_HEIGHT,
+        autosize=False,
+        margin=dict(_COMPACT_FIG_MARGIN),
+        font=dict(family='Arial, sans-serif', size=12, color=t['font']),
+        uirevision=uirevision,
+        xaxis=xaxis,
+        yaxis=yaxis,
+    )
+
+
 def _apply_square_contour_layout(fig, x_plot, y_plot, xdef, ydef, title,
                                  panel_w=DEFAULT_CONTOUR_PANEL_W,
                                  fixed_size=False, theme='light',
                                  zscale='log'):
     """Layout for a single contour panel.
 
-    ``fixed_size=True`` — identical figsize for every panel in a side-by-side row
-    (same width/height, axes domain, and 1:1 log-decade scaling like KoSens triple plots).
+    ``fixed_size=True`` — identical figsize and axis box for every panel in a
+    side-by-side row (Grid / Intensities / RGB).
     """
     t = _theme_colors(theme)
-    title_kw = dict(text=title, font=dict(size=12 if fixed_size else 13, color=t['title']),
+    # Include zscale so colorbar range resets when switching log↔linear.
+    uirev = f'contour|{zscale}|{_parse_plot_theme(theme)}'
+    if fixed_size:
+        fig.update_layout(**_compact_slice_layout_kw(
+            title, _axis_label_contour(xdef), _axis_label_contour(ydef),
+            theme=theme, uirevision=uirev,
+        ))
+        return fig
+
+    title_kw = dict(text=title, font=dict(size=13, color=t['title']),
                     x=0.02, xanchor='left')
     axis_common = dict(
         type='linear', showgrid=True, gridcolor=t['grid'],
         linecolor=t['axis_line'], tickfont=dict(color=t['font']),
         autorange=True,
     )
-    # Include zscale so colorbar range resets when switching log↔linear.
-    uirev = f'contour|{zscale}|{_parse_plot_theme(theme)}'
-    if fixed_size:
-        fig.update_layout(
-            title=title_kw,
-            paper_bgcolor=t['paper_bg'],
-            plot_bgcolor=t['plot_bg'],
-            width=COMPACT_FIG_WIDTH,
-            height=COMPACT_FIG_HEIGHT,
-            autosize=False,
-            margin=_COMPACT_FIG_MARGIN,
-            font=dict(family='Arial, sans-serif', size=12, color=t['font']),
-            uirevision=uirev,
-            xaxis=dict(
-                title=dict(text=_axis_label_contour(xdef), font=dict(size=11, color=t['font'])),
-                domain=_COMPACT_XDOMAIN,
-                constrain='domain',
-                **axis_common,
-            ),
-            yaxis=dict(
-                title=dict(text=_axis_label_contour(ydef), font=dict(size=11, color=t['font'])),
-                domain=_COMPACT_YDOMAIN,
-                scaleanchor='x', scaleratio=1,
-                constrain='domain',
-                **axis_common,
-            ),
-        )
-        return fig
-
     aspect = _contour_data_aspect(x_plot, y_plot)
     fig_w = panel_w + 90
     fig_h = int(panel_w * aspect) + 106
@@ -3246,6 +3470,314 @@ def make_intensity_contour_plots(species, idef, transition_idx, zscale, slice_in
     )
 
 
+def _slice_token_from_index(plane, slice_idx):
+    """Resolve the fixed-axis token for a slice plane slider index."""
+    sk = plane['slice']
+    slice_tokens = _grid['axis_tokens'][sk]
+    if not slice_tokens:
+        return None
+    try:
+        return slice_tokens[int(slice_idx)]
+    except (IndexError, TypeError, ValueError):
+        return slice_tokens[0]
+
+
+def _rgb_slice_title(plane, slice_token, subtitle):
+    sdef = _param_def(plane['slice'])
+    if sdef['key'] == 'atten':
+        slice_disp = f'{slice_token:02d}'
+    else:
+        slice_disp = f'{sdef["decode"](slice_token):.4g}'
+    unit = f' {sdef["unit"]}' if sdef['unit'] else ''
+    return (f'{plane["title"]}<br>'
+            f'<sup style="font-size:11px">{sdef["name"]} = {slice_disp}{unit}'
+            f'  \u2014  {subtitle}</sup>')
+
+
+def _default_rgb_grid_species(species_list):
+    species_list = list(species_list or [])
+    chosen = [s for s in RGB_DEFAULT_GRID_SPECIES if s in species_list]
+    for s in species_list:
+        if s not in chosen:
+            chosen.append(s)
+        if len(chosen) >= 3:
+            break
+    while len(chosen) < 3:
+        chosen.append(None)
+    return chosen[:3]
+
+
+def _default_rgb_line_keys(idef):
+    keys = gf.list_simline_line_keys(_simline, idef or SIMLINE_DEFAULT_IDEF)
+    chosen = []
+    for base in RGB_DEFAULT_GRID_SPECIES:
+        match = rgb_phase.exact_base_key(base, keys)
+        if match:
+            chosen.append(match)
+    for k in keys:
+        if k not in chosen:
+            chosen.append(k)
+        if len(chosen) >= 3:
+            break
+    while len(chosen) < 3:
+        chosen.append(None)
+    return chosen[:3]
+
+
+def _resolve_simline_line(line_key, idef):
+    """Return ``(species, transition_idx)`` for a spectroscopic line key."""
+    if not line_key or not _simline:
+        return None
+    lookup = gf._line_lookup(_simline, idef or SIMLINE_DEFAULT_IDEF)
+    return lookup.get(line_key)
+
+
+def _find_simline_base_line(base_name, idef, preferred_keys=None):
+    """Find a SIMLINE line key whose bare species matches ``base_name``."""
+    keys = list(preferred_keys or [])
+    keys.extend(gf.list_simline_line_keys(_simline, idef or SIMLINE_DEFAULT_IDEF))
+    return rgb_phase.exact_base_key(base_name, keys)
+
+
+def _parse_rgb_conv_factors(*values):
+    """Three positive channel conversion factors (default 1)."""
+    out = []
+    for v in list(values)[:3]:
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            f = 1.0
+        if not np.isfinite(f) or f <= 0:
+            f = 1.0
+        out.append(f)
+    while len(out) < 3:
+        out.append(1.0)
+    return out[:3]
+
+
+def _channel_conv_factor(key, channel_keys, conv_factors):
+    """Conversion factor for ``key`` if it is one of the RGB channels."""
+    if not key or not channel_keys or not conv_factors:
+        return 1.0
+    try:
+        return float(conv_factors[list(channel_keys).index(key)])
+    except (ValueError, IndexError, TypeError):
+        return 1.0
+
+
+def _grid_rgb_transition_layers(plane, slice_token, flags, interp_config,
+                                species_trio=None, conv_factors=None):
+    """Optional H–H₂ / C–CO / CO–JCO ratio grids from HDF5 abundances."""
+    flags = set(flags or [])
+    species = list((_grid or {}).get('species') or [])
+    trio = list(species_trio or [])
+    cfs = _parse_rgb_conv_factors(*(conv_factors or []))
+    layers = []
+    if 'hh2' in flags and 'H' in species and 'H2' in species:
+        _, _, zh, _, _ = build_slice_grid(
+            plane, slice_token, 'species:H', interp_config=interp_config)
+        _, _, zh2, _, _ = build_slice_grid(
+            plane, slice_token, 'species:H2', interp_config=interp_config)
+        layers.append((rgb_phase.hh2_ratio(zh, zh2), '--', 'H-H2'))
+    if 'cco' in flags:
+        # Prefer RGB-channel C/CO (same data + conversion factors) like KoSens.
+        c_sp = rgb_phase.exact_base_key('C', trio) or rgb_phase.exact_base_key('C', species)
+        co_sp = rgb_phase.exact_base_key('CO', trio) or rgb_phase.exact_base_key('CO', species)
+        if c_sp and co_sp:
+            _, _, zc, _, _ = build_slice_grid(
+                plane, slice_token, f'species:{c_sp}', interp_config=interp_config)
+            _, _, zco, _, _ = build_slice_grid(
+                plane, slice_token, f'species:{co_sp}', interp_config=interp_config)
+            zc = zc * _channel_conv_factor(c_sp, trio, cfs)
+            zco = zco * _channel_conv_factor(co_sp, trio, cfs)
+            layers.append((rgb_phase.ratio_grid(zc, zco), '-', 'C-CO'))
+    if 'cojco' in flags:
+        co_sp = 'CO' if 'CO' in species else rgb_phase.exact_base_key('CO', species)
+        jco_sp = 'JCO' if 'JCO' in species else rgb_phase.exact_base_key('JCO', species)
+        if co_sp and jco_sp:
+            _, _, zco, _, _ = build_slice_grid(
+                plane, slice_token, f'species:{co_sp}', interp_config=interp_config)
+            _, _, zjco, _, _ = build_slice_grid(
+                plane, slice_token, f'species:{jco_sp}', interp_config=interp_config)
+            layers.append((rgb_phase.ratio_grid(zco, zjco), '-.', 'CO-JCO'))
+    return layers
+
+
+def _intensity_rgb_transition_layers(plane, slice_token, flags, idef,
+                                     channel_keys, interp_config, slider_values,
+                                     conv_factors=None):
+    """H–H₂ from HDF5; C–CO from SIMLINE intensities. No CO–JCO for lines."""
+    flags = set(flags or [])
+    channel_keys = list(channel_keys or [])
+    cfs = _parse_rgb_conv_factors(*(conv_factors or []))
+    layers = []
+    if 'hh2' in flags and _grid_has_hdf5():
+        species = list((_grid or {}).get('species') or [])
+        if 'H' in species and 'H2' in species:
+            _, _, zh, _, _ = build_slice_grid(
+                plane, slice_token, 'species:H', interp_config=interp_config)
+            _, _, zh2, _, _ = build_slice_grid(
+                plane, slice_token, 'species:H2', interp_config=interp_config)
+            layers.append((rgb_phase.hh2_ratio(zh, zh2), '--', 'H-H2'))
+    if 'cco' in flags and _simline:
+        c_key = _find_simline_base_line('C', idef, channel_keys)
+        co_key = _find_simline_base_line('CO', idef, channel_keys)
+        c_res = _resolve_simline_line(c_key, idef) if c_key else None
+        co_res = _resolve_simline_line(co_key, idef) if co_key else None
+        if c_res and co_res:
+            _, _, zc, _, _ = build_intensity_slice_grid(
+                plane, slice_token, c_res[0], idef, c_res[1],
+                interp_config=interp_config, slider_values=slider_values)
+            _, _, zco, _, _ = build_intensity_slice_grid(
+                plane, slice_token, co_res[0], idef, co_res[1],
+                interp_config=interp_config, slider_values=slider_values)
+            zc = zc * _channel_conv_factor(c_key, channel_keys, cfs)
+            zco = zco * _channel_conv_factor(co_key, channel_keys, cfs)
+            layers.append((rgb_phase.ratio_grid(zc, zco), '-', 'C-CO'))
+    return layers
+
+
+def fig_grid_rgb_plane(plane, slice_idx, species_trio, transition_flags,
+                       interp_config=None, theme='light', conv_factors=None):
+    """RGB abundance dominance map for one grid slice plane."""
+    if not plane.get('active'):
+        return placeholder_fig(theme=theme)
+    if not _grid or not _grid_has_hdf5():
+        return placeholder_fig('Load an HDF5 grid for abundance RGB maps', theme=theme)
+    species_trio = list(species_trio or [])
+    if len(species_trio) < 3 or any(not s for s in species_trio[:3]):
+        return placeholder_fig('Select three species for the RGB channels', theme=theme)
+    cfs = _parse_rgb_conv_factors(*(conv_factors or []))
+
+    slice_token = _slice_token_from_index(plane, slice_idx)
+    if slice_token is None:
+        return placeholder_fig('No slice axis', theme=theme)
+
+    grids = []
+    x_phys = y_phys = xdef = ydef = None
+    for sp in species_trio[:3]:
+        x_phys, y_phys, Z, xdef, ydef = build_slice_grid(
+            plane, slice_token, f'species:{sp}', interp_config=interp_config)
+        grids.append(Z)
+    if not any(np.any(np.isfinite(g)) for g in grids):
+        return placeholder_fig('No abundance data for this RGB slice', theme=theme)
+
+    labels = [format_species_html(sp) for sp in species_trio[:3]]
+    subtitle = ' / '.join(labels)
+    transitions = _grid_rgb_transition_layers(
+        plane, slice_token, transition_flags, interp_config,
+        species_trio=species_trio[:3], conv_factors=cfs)
+    x_plot = _axis_plot_coords(x_phys, xdef)
+    y_plot = _axis_plot_coords(y_phys, ydef)
+    title = _rgb_slice_title(plane, slice_token, subtitle)
+    fig = rgb_phase.build_rgb_figure(
+        grids, x_plot, y_plot,
+        xlabel=_axis_label_contour(xdef),
+        ylabel=_axis_label_contour(ydef),
+        title=title,
+        channel_labels=labels,
+        transitions=transitions,
+        theme_colors=_theme_colors(theme),
+        conv_factors=cfs,
+        width=COMPACT_FIG_WIDTH,
+        height=COMPACT_FIG_HEIGHT,
+    )
+    xr = list(fig.layout.xaxis.range) if fig.layout.xaxis.range else None
+    yr = list(fig.layout.yaxis.range) if fig.layout.yaxis.range else None
+    fig.update_layout(**_compact_slice_layout_kw(
+        title, _axis_label_contour(xdef), _axis_label_contour(ydef),
+        theme=theme, uirevision=f'rgb|{_parse_plot_theme(theme)}',
+        x_range=xr, y_range=yr, showgrid=False,
+    ))
+    return fig
+
+
+def fig_intensity_rgb_plane(plane, slice_idx, line_keys, idef, transition_flags,
+                            interp_config=None, theme='light', slider_values=None,
+                            conv_factors=None):
+    """RGB line-intensity dominance map for one SIMLINE slice plane."""
+    if not plane.get('active'):
+        return placeholder_fig(theme=theme)
+    if not _grid or not _simline:
+        return placeholder_fig('Load a grid and SIMLINE directory', theme=theme)
+    line_keys = list(line_keys or [])
+    if len(line_keys) < 3 or any(not k for k in line_keys[:3]):
+        return placeholder_fig('Select three lines for the RGB channels', theme=theme)
+    idef = idef or SIMLINE_DEFAULT_IDEF
+    cfs = _parse_rgb_conv_factors(*(conv_factors or []))
+
+    slice_token = _slice_token_from_index(plane, slice_idx)
+    if slice_token is None:
+        return placeholder_fig('No slice axis', theme=theme)
+
+    grids = []
+    x_phys = y_phys = xdef = ydef = None
+    labels = []
+    for key in line_keys[:3]:
+        resolved = _resolve_simline_line(key, idef)
+        if not resolved:
+            return placeholder_fig(f'Unknown SIMLINE line: {key}', theme=theme)
+        sp, tidx = resolved
+        x_phys, y_phys, Z, xdef, ydef = build_intensity_slice_grid(
+            plane, slice_token, sp, idef, tidx,
+            interp_config=interp_config, slider_values=slider_values)
+        grids.append(Z)
+        labels.append(key)
+    if not any(np.any(np.isfinite(g)) for g in grids):
+        return placeholder_fig('No SIMLINE data for this RGB slice', theme=theme)
+
+    transitions = _intensity_rgb_transition_layers(
+        plane, slice_token, transition_flags, idef, line_keys[:3],
+        interp_config, slider_values, conv_factors=cfs)
+    x_plot = _axis_plot_coords(x_phys, xdef)
+    y_plot = _axis_plot_coords(y_phys, ydef)
+    title = _rgb_slice_title(plane, slice_token, ' / '.join(labels))
+    fig = rgb_phase.build_rgb_figure(
+        grids, x_plot, y_plot,
+        xlabel=_axis_label_contour(xdef),
+        ylabel=_axis_label_contour(ydef),
+        title=title,
+        channel_labels=labels,
+        transitions=transitions,
+        theme_colors=_theme_colors(theme),
+        conv_factors=cfs,
+        width=COMPACT_FIG_WIDTH,
+        height=COMPACT_FIG_HEIGHT,
+    )
+    xr = list(fig.layout.xaxis.range) if fig.layout.xaxis.range else None
+    yr = list(fig.layout.yaxis.range) if fig.layout.yaxis.range else None
+    fig.update_layout(**_compact_slice_layout_kw(
+        title, _axis_label_contour(xdef), _axis_label_contour(ydef),
+        theme=theme, uirevision=f'rgb-int|{_parse_plot_theme(theme)}',
+        x_range=xr, y_range=yr, showgrid=False,
+    ))
+    return fig
+
+
+def make_grid_rgb_plots(species_trio, transition_flags, slice_indices,
+                        interp_config=None, theme='light', conv_factors=None):
+    return tuple(
+        fig_grid_rgb_plane(
+            plane, slice_indices[i], species_trio, transition_flags,
+            interp_config=interp_config, theme=theme, conv_factors=conv_factors)
+        if plane.get('active') else placeholder_fig(theme=theme)
+        for i, plane in enumerate(active_slice_planes())
+    )
+
+
+def make_intensity_rgb_plots(line_keys, idef, transition_flags, slice_indices,
+                             interp_config=None, theme='light', slider_values=None,
+                             conv_factors=None):
+    return tuple(
+        fig_intensity_rgb_plane(
+            plane, slice_indices[i], line_keys, idef, transition_flags,
+            interp_config=interp_config, theme=theme, slider_values=slider_values,
+            conv_factors=conv_factors)
+        if plane.get('active') else placeholder_fig(theme=theme)
+        for i, plane in enumerate(active_slice_planes())
+    )
+
+
 def fig_intensity_spectrum(values, species, idef, theme='light', int_slice_indices=None):
     """All SIMLINE line intensities for the selected model point."""
     if not _grid:
@@ -3929,7 +4461,9 @@ def _load_model_pair(values):
     return model, overlay
 
 
-def make_profile_plots(values, xvar, xscale, yscale, custom_species, theme='light'):
+def make_profile_plots(values, xvar, xscale, yscale, custom_species, theme='light',
+                       av_range=DEFAULT_AV_RANGE):
+    av_range = _parse_av_range(av_range)
     model, overlay = _load_model_pair(values)
     if model is None:
         if _grid and _grid.get('simline_only'):
@@ -3941,17 +4475,20 @@ def make_profile_plots(values, xvar, xscale, yscale, custom_species, theme='ligh
         return (bad,) * 4
     x_cross = find_h_h2_transition(model, xvar)
     figs = [
-        fig_tgas(model, overlay, xvar, xscale, yscale, theme=theme),
-        fig_h_h2(model, overlay, xvar, xscale, yscale, theme=theme),
-        fig_cplus_c_co(model, overlay, xvar, xscale, yscale, theme=theme),
-        fig_custom(model, overlay, xvar, xscale, yscale, custom_species, theme=theme),
+        fig_tgas(model, overlay, xvar, xscale, yscale, theme=theme, av_range=av_range),
+        fig_h_h2(model, overlay, xvar, xscale, yscale, theme=theme, av_range=av_range),
+        fig_cplus_c_co(model, overlay, xvar, xscale, yscale, theme=theme, av_range=av_range),
+        fig_custom(model, overlay, xvar, xscale, yscale, custom_species, theme=theme,
+                   av_range=av_range),
     ]
     for f in figs:
         add_h_h2_vline(f, x_cross, theme=theme)
     return tuple(figs)
 
 
-def make_thermal_plots(values, xvar, xscale, yscale, theme='light'):
+def make_thermal_plots(values, xvar, xscale, yscale, theme='light',
+                       av_range=DEFAULT_AV_RANGE):
+    av_range = _parse_av_range(av_range)
     model, overlay = _load_model_pair(values)
     if model is None:
         if _grid and _grid.get('simline_only'):
@@ -3962,9 +4499,9 @@ def make_thermal_plots(values, xvar, xscale, yscale, theme='light'):
             bad = placeholder_fig('No model file for this parameter combination', theme=theme)
         return (bad,) * 3
     return (
-        fig_thermal(model, overlay, xvar, xscale, yscale, theme=theme),
-        fig_heat_breakdown(model, overlay, xvar, xscale, yscale, theme=theme),
-        fig_cool_breakdown(model, overlay, xvar, xscale, yscale, theme=theme),
+        fig_thermal(model, overlay, xvar, xscale, yscale, theme=theme, av_range=av_range),
+        fig_heat_breakdown(model, overlay, xvar, xscale, yscale, theme=theme, av_range=av_range),
+        fig_cool_breakdown(model, overlay, xvar, xscale, yscale, theme=theme, av_range=av_range),
     )
 
 
@@ -3981,6 +4518,11 @@ _RADIO = dict(labelStyle={'display': 'block', 'marginBottom': '3px', 'fontSize':
 
 _SCALE_OPTIONS = [{'label': ' log', 'value': 'log'},
                   {'label': ' linear', 'value': 'linear'}]
+
+_AV_RANGE_OPTIONS = [
+    {'label': ' full HDF5', 'value': 'full'},
+    {'label': f' floor \u2265 {AV_FLOOR:g}', 'value': 'floor'},
+]
 
 _XVAR_OPTIONS = [{'label': ' A\u1D65 (mag)', 'value': 'Av'},
                  {'label': ' n_H (cm\u207B\u00B3)', 'value': 'nH'}]
@@ -4083,6 +4625,112 @@ def _int_contour_overlay_row():
                 style={**_INPUT_STYLE, 'width': '100%'}),
         ], style={'flex': '1', 'minWidth': '140px'}),
     ], className='kosma-panel kosma-panel-dashed', style=_PANEL_ROW)
+
+
+def _rgb_channel_dropdowns(prefix, placeholder):
+    """Three channel selectors + conversion factors for an RGB phase diagram."""
+    boxes = []
+    for i, meta in enumerate(RGB_CHANNEL_COLORS):
+        boxes.append(html.Div([
+            html.Label(meta['label'], style={**_CTRL_LABEL, 'color': meta['color']}),
+            dcc.Dropdown(
+                id=f'{prefix}rgb-sp{i}',
+                options=[], value=None, clearable=False,
+                placeholder=placeholder,
+                style={'fontSize': '13px'}),
+            html.Label('Conversion factor',
+                       style={**_CTRL_LABEL, 'fontSize': '11px', 'marginTop': '6px'}),
+            dcc.Input(
+                id=f'{prefix}rgb-cf{i}',
+                type='number', value=1, min=0, step='any',
+                debounce=True,
+                style={**_INPUT_STYLE, 'width': '100%'}),
+        ], style={'flex': '1', 'minWidth': '150px',
+                  'marginRight': '12px' if i < 2 else '0'}))
+    return boxes
+
+
+def _rgb_slice_panel(slot_id, *, prefix, plot_id):
+    """One RGB panel with its own third-axis slider (same pattern as contour slices)."""
+    return html.Div([
+        html.Div([
+            html.Label(id=f'{prefix}slice-fixed-label-{slot_id}',
+                       style={**_CTRL_LABEL, 'fontSize': '12px'}),
+            dcc.Slider(id=f'{prefix}slice-slider-{slot_id}', min=0, max=1, step=1,
+                       value=0, marks={},
+                       tooltip={'placement': 'top', 'always_visible': False}),
+            html.Div(id=f'{prefix}slice-label-{slot_id}',
+                     style={'textAlign': 'center', 'fontSize': '11px',
+                            'marginTop': '2px', 'fontWeight': '600'}),
+        ], style={'padding': '0 4px 8px'}),
+        dcc.Graph(id=plot_id, figure=placeholder_fig(),
+                  config=_SLICE_GRAPH_CFG, style=_SLICE_GRAPH_STYLE),
+    ], id=f'{prefix}panel-{slot_id}', style=_SLICE_PANEL_ROW)
+
+
+def _rgb_grid_controls():
+    """Abundance RGB phase-diagram controls (Grid slices tab)."""
+    return html.Div([
+        html.H4('RGB phase diagram',
+                style={'fontSize': '14px', 'margin': '18px 0 6px', 'fontWeight': '600'}),
+        html.P('Fractional abundance dominance of three species (KoSens-style RGB map). '
+               'Per-channel conversion factors scale each species before the mix '
+               '(e.g. mass-density weights). Optional white contours mark chemistry transitions.',
+               style={**_PAGE_INTRO, 'marginBottom': '8px'}),
+        html.Div(
+            _rgb_channel_dropdowns('grid-', 'Load a grid\u2026')
+            + [html.Div([
+                html.Label('Transition contours', style=_CTRL_LABEL),
+                dcc.Checklist(
+                    id='grid-rgb-transitions',
+                    options=RGB_GRID_TRANSITION_OPTIONS,
+                    value=[],
+                    style={'fontSize': '13px'}),
+            ], style={'flex': '1.4', 'minWidth': '220px'})],
+            className='kosma-panel',
+            style={'display': 'flex', 'alignItems': 'flex-start',
+                   'padding': '12px 18px', 'marginBottom': '12px', 'flexWrap': 'wrap'}),
+        html.Div(
+            [_rgb_slice_panel(p['id'], prefix='rgb-', plot_id=f'plot-rgb-{p["id"]}')
+             for p in SLICE_PLANES],
+            id='rgb-panels-wrap',
+            style=_SLICE_PANELS_ROW_STYLE,
+        ),
+    ])
+
+
+def _rgb_intensity_controls():
+    """Line-intensity RGB phase-diagram controls (Intensities tab)."""
+    return html.Div([
+        html.H4('RGB phase diagram',
+                style={'fontSize': '14px', 'margin': '18px 0 6px', 'fontWeight': '600'}),
+        html.P('Fractional intensity dominance of three SIMLINE lines. '
+               'Per-channel conversion factors scale each line before the mix '
+               '(and the C\u2194CO intensity contour). '
+               'H\u2194H\u2082 uses HDF5 abundances when a PDR grid is loaded; '
+               'CO\u2194JCO is unavailable for intensities (no ice line).',
+               style={**_PAGE_INTRO, 'marginBottom': '8px'}),
+        html.Div(
+            _rgb_channel_dropdowns('int-', 'Load SIMLINE\u2026')
+            + [html.Div([
+                html.Label('Transition contours', style=_CTRL_LABEL),
+                dcc.Checklist(
+                    id='int-rgb-transitions',
+                    options=RGB_INT_TRANSITION_OPTIONS,
+                    value=[],
+                    style={'fontSize': '13px'}),
+            ], style={'flex': '1.6', 'minWidth': '260px'})],
+            className='kosma-panel',
+            style={'display': 'flex', 'alignItems': 'flex-start',
+                   'padding': '12px 18px', 'marginBottom': '12px', 'flexWrap': 'wrap'}),
+        html.Div(
+            [_rgb_slice_panel(p['id'], prefix='int-rgb-',
+                              plot_id=f'plot-int-rgb-{p["id"]}')
+             for p in SLICE_PLANES],
+            id='int-rgb-panels-wrap',
+            style=_SLICE_PANELS_ROW_STYLE,
+        ),
+    ])
 
 
 def _interp_control_row(prefix=''):
@@ -4286,8 +4934,8 @@ def _ie_plane_section(slot_id):
 app.layout = html.Div(
     id='app-root',
     className='theme-light',
-    style={'fontFamily': 'Arial, sans-serif', 'maxWidth': '1460px',
-           'margin': '0 auto', 'padding': '14px 22px', 'backgroundColor': '#fff',
+    style={'fontFamily': 'Arial, sans-serif', 'maxWidth': APP_MAX_WIDTH,
+           'margin': '0 auto', 'padding': '14px 28px', 'backgroundColor': '#fff',
            'color': '#333', 'minHeight': '100vh'},
     children=[
 
@@ -4359,6 +5007,11 @@ app.layout = html.Div(
             html.Div([
                 html.Label('Y scale', style=_CTRL_LABEL),
                 dcc.RadioItems(id='yscale', options=_SCALE_OPTIONS, value='log', **_RADIO),
+            ], style=_CTRL_BOX),
+            html.Div([
+                html.Label('A\u1D65 range', style=_CTRL_LABEL),
+                dcc.RadioItems(id='av-range', options=_AV_RANGE_OPTIONS,
+                               value=DEFAULT_AV_RANGE, **_RADIO),
             ], style={**_CTRL_BOX, 'marginRight': '0'}),
         ], id='controls-axis-wrap',
            className='kosma-panel',
@@ -4635,6 +5288,7 @@ app.layout = html.Div(
                 html.Div([_slice_panel(p['id']) for p in SLICE_PLANES],
                          id='slice-panels-wrap',
                          style=_SLICE_PANELS_ROW_STYLE),
+                _rgb_grid_controls(),
             ]),
         ]),
 
@@ -4645,7 +5299,9 @@ app.layout = html.Div(
                 html.P('Top formation and destruction reactions for a selected species '
                        '(requires a chemistry grid on the Load tab). Choose how reactions '
                        'are ranked: fractional contribution to the total rate, or '
-                       'mass-weighted rate (KoSens ``top_reactions_plot`` metrics).',
+                       'mass-weighted rate (KoSens ``top_reactions_plot`` metrics). '
+                       'Below, separate formation and destruction networks show all '
+                       'partners in those same top-N reactions (reactants left, products right).',
                        style=_PAGE_INTRO),
                 html.Div([
                     html.Div([
@@ -4682,6 +5338,61 @@ app.layout = html.Div(
                     ], style={'flex': '1', 'minWidth': '0'}),
                 ], style={'display': 'flex', 'gap': '12px', 'marginTop': '12px',
                           'alignItems': 'flex-start'}),
+                html.H4('Reaction pathway network',
+                        style={'fontSize': '14px', 'margin': '22px 0 6px', 'fontWeight': '600'}),
+                html.Div(id='react-network-status', style={**_PAGE_INTRO, 'marginBottom': '8px'}),
+                dcc.Store(id='react-net-highlight', data=None),
+                html.Div([
+                    html.Div([
+                        html.Label('Upstream depth', style=_CTRL_LABEL),
+                        dcc.Input(id='react-chain-upstream', type='number',
+                                  min=0, max=6, step=1,
+                                  value=chem_network.DEFAULT_CHAIN_UPSTREAM,
+                                  style={'width': '90px', 'padding': '7px 9px', 'fontSize': '13px',
+                                         'border': '1px solid #bbc', 'borderRadius': '6px'}),
+                    ], style={'marginRight': '18px'}),
+                    html.Div([
+                        html.Label('Downstream depth', style=_CTRL_LABEL),
+                        dcc.Input(id='react-chain-downstream', type='number',
+                                  min=0, max=6, step=1,
+                                  value=chem_network.DEFAULT_CHAIN_DOWNSTREAM,
+                                  style={'width': '90px', 'padding': '7px 9px', 'fontSize': '13px',
+                                         'border': '1px solid #bbc', 'borderRadius': '6px'}),
+                    ], style={'marginRight': '22px'}),
+                    html.Div([
+                        html.Label('Include', style=_CTRL_LABEL),
+                        dcc.Checklist(
+                            id='react-chain-isotopes',
+                            options=[{'label': ' isotopes', 'value': 'iso'}],
+                            value=[],
+                            style={'fontSize': '13px', 'whiteSpace': 'nowrap'}),
+                    ], style={'marginRight': '16px', 'alignSelf': 'flex-end'}),
+                    html.Div([
+                        html.Label('\u00a0', style=_CTRL_LABEL),
+                        dcc.Checklist(
+                            id='react-chain-ice',
+                            options=[{'label': ' ice / grain', 'value': 'ice'}],
+                            value=[],
+                            style={'fontSize': '13px', 'whiteSpace': 'nowrap'}),
+                    ], style={'marginRight': '18px', 'alignSelf': 'flex-end'}),
+                    html.Div([
+                        html.Label('\u00a0', style=_CTRL_LABEL),
+                        html.Button('Clear highlight', id='btn-react-net-clear', n_clicks=0,
+                                    style={'padding': '7px 12px', 'fontSize': '13px',
+                                           'border': '1px solid #bbc', 'borderRadius': '6px',
+                                           'backgroundColor': '#f7f7f7', 'cursor': 'pointer'}),
+                    ], style={'alignSelf': 'flex-end'}),
+                ], style={'display': 'flex', 'alignItems': 'flex-end',
+                          'flexWrap': 'wrap', 'marginBottom': '10px'}),
+                dcc.Graph(
+                    id='plot-react-network',
+                    figure=placeholder_fig(),
+                    config={**_GRAPH_CFG, 'responsive': True},
+                    style={'width': '100%', 'maxWidth': '100%',
+                           'height': 'min(900px, 78vh)', 'maxHeight': '900px',
+                           'minHeight': '640px', 'marginBottom': '16px',
+                           'overflow': 'hidden'},
+                ),
             ]),
         ]),
 
@@ -4729,6 +5440,7 @@ app.layout = html.Div(
                 html.Div([_int_slice_panel(p['id']) for p in SLICE_PLANES],
                          id='int-slice-panels-wrap',
                          style=_SLICE_PANELS_ROW_STYLE),
+                _rgb_intensity_controls(),
             ]),
         ]),
 
@@ -5182,6 +5894,20 @@ _slice_slider_inputs = [Input(f'slice-slider-{p["id"]}', 'value') for p in SLICE
 _slice_label_outputs = [Output(f'slice-label-{p["id"]}', 'children') for p in SLICE_PLANES]
 _contour_outputs = [Output(f'plot-contour-{p["id"]}', 'figure') for p in SLICE_PLANES]
 
+_rgb_slice_slider_outputs = []
+for plane in SLICE_PLANES:
+    pid = plane['id']
+    _rgb_slice_slider_outputs += [
+        Output(f'rgb-slice-slider-{pid}', 'max'),
+        Output(f'rgb-slice-slider-{pid}', 'marks'),
+        Output(f'rgb-slice-slider-{pid}', 'value'),
+    ]
+_rgb_slice_slider_inputs = [Input(f'rgb-slice-slider-{p["id"]}', 'value') for p in SLICE_PLANES]
+_rgb_slice_label_outputs = [Output(f'rgb-slice-label-{p["id"]}', 'children') for p in SLICE_PLANES]
+_rgb_outputs = [Output(f'plot-rgb-{p["id"]}', 'figure') for p in SLICE_PLANES]
+_rgb_panel_style_outputs = [Output(f'rgb-panel-{p["id"]}', 'style') for p in SLICE_PLANES]
+_rgb_graph_style_outputs = [Output(f'plot-rgb-{p["id"]}', 'style') for p in SLICE_PLANES]
+
 _int_slice_slider_outputs = []
 for plane in SLICE_PLANES:
     pid = plane['id']
@@ -5194,6 +5920,24 @@ for plane in SLICE_PLANES:
 _int_slice_slider_inputs = [Input(f'int-slice-slider-{p["id"]}', 'value') for p in SLICE_PLANES]
 _int_slice_label_outputs = [Output(f'int-slice-label-{p["id"]}', 'children') for p in SLICE_PLANES]
 _int_contour_outputs = [Output(f'plot-int-contour-{p["id"]}', 'figure') for p in SLICE_PLANES]
+
+_int_rgb_slice_slider_outputs = []
+for plane in SLICE_PLANES:
+    pid = plane['id']
+    _int_rgb_slice_slider_outputs += [
+        Output(f'int-rgb-slice-slider-{pid}', 'max'),
+        Output(f'int-rgb-slice-slider-{pid}', 'marks'),
+        Output(f'int-rgb-slice-slider-{pid}', 'value'),
+    ]
+_int_rgb_slice_slider_inputs = [
+    Input(f'int-rgb-slice-slider-{p["id"]}', 'value') for p in SLICE_PLANES
+]
+_int_rgb_slice_label_outputs = [
+    Output(f'int-rgb-slice-label-{p["id"]}', 'children') for p in SLICE_PLANES
+]
+_int_rgb_outputs = [Output(f'plot-int-rgb-{p["id"]}', 'figure') for p in SLICE_PLANES]
+_int_rgb_panel_style_outputs = [Output(f'int-rgb-panel-{p["id"]}', 'style') for p in SLICE_PLANES]
+_int_rgb_graph_style_outputs = [Output(f'plot-int-rgb-{p["id"]}', 'style') for p in SLICE_PLANES]
 
 _ie_slice_slider_outputs = []
 for plane in SLICE_PLANES:
@@ -5271,16 +6015,17 @@ def _empty_slice_slider_ui():
     return empty
 
 
-def _interleave_slice_tab_cfgs(slice_cfg):
-    """Match ``_grid_sync_outputs``: per plane, slice then int then ie (same cfg thrice).
+def _interleave_slice_tab_cfgs(slice_cfg, n_tabs=5):
+    """Match ``_grid_sync_outputs``: per plane, one (max, marks, value) block per tab.
 
-    ``handle_load`` uses grouped outputs (all slice, then all int, then all ie), so it
-    can pass ``slice_cfg`` three times.  SIMLINE bootstrap uses interleaved outputs.
+    Tabs: contour slice, intensity slice, IE slice, grid RGB, intensity RGB.
+    ``handle_load`` uses grouped outputs (all of tab A, then B, …), so it can
+    pass ``slice_cfg`` five times.  SIMLINE bootstrap uses interleaved outputs.
     """
     out = []
     for i in range(len(SLICE_PLANES)):
         plane = slice_cfg[i * 3:(i + 1) * 3]
-        out += plane + plane + plane
+        out += plane * n_tabs
     return out
 
 
@@ -5312,6 +6057,12 @@ for plane in SLICE_PLANES:
         Output(f'ie-slice-slider-{pid}', 'max', allow_duplicate=True),
         Output(f'ie-slice-slider-{pid}', 'marks', allow_duplicate=True),
         Output(f'ie-slice-slider-{pid}', 'value', allow_duplicate=True),
+        Output(f'rgb-slice-slider-{pid}', 'max', allow_duplicate=True),
+        Output(f'rgb-slice-slider-{pid}', 'marks', allow_duplicate=True),
+        Output(f'rgb-slice-slider-{pid}', 'value', allow_duplicate=True),
+        Output(f'int-rgb-slice-slider-{pid}', 'max', allow_duplicate=True),
+        Output(f'int-rgb-slice-slider-{pid}', 'marks', allow_duplicate=True),
+        Output(f'int-rgb-slice-slider-{pid}', 'value', allow_duplicate=True),
     ]
 _grid_sync_outputs += [
     Output('species-selector', 'options', allow_duplicate=True),
@@ -5350,6 +6101,8 @@ def _grid_sync_from_axis_tokens(axis_tokens):
     + _slice_slider_outputs
     + _int_slice_slider_outputs
     + _ie_slice_slider_outputs
+    + _rgb_slice_slider_outputs
+    + _int_rgb_slice_slider_outputs
     + [Output('species-selector', 'options'),
        Output('species-selector', 'value'),
        Output('contour-quantity', 'options'),
@@ -5364,15 +6117,13 @@ def _grid_sync_from_axis_tokens(axis_tokens):
 def handle_load(n_clicks, directory, recursive):
     hidden, shown = _slider_wrap_styles()
     empty_slice = _empty_slice_slider_ui()
-    empty_int_slice = list(empty_slice)
-    empty_ie_slice = list(empty_slice)
 
     try:
         grid = scan_directory(directory or '', recursive=bool(recursive))
     except Exception as exc:
         err = html.Span(f'\u2717  {exc}', style={'color': '#d62728', 'fontWeight': '600'})
         empty = _empty_param_slider_ui(hidden)
-        return ([err, False] + empty + empty_slice + empty_int_slice + empty_ie_slice
+        return ([err, False] + empty + empty_slice * 5
                 + [[], [], [], None, [], None])
 
     slider_cfg, slice_cfg, _ = _ui_slider_config(grid['axis_tokens'])
@@ -5397,7 +6148,7 @@ def handle_load(n_clicks, directory, recursive):
                   style={'color': '#555', 'marginLeft': '10px'}),
     ])
 
-    return ([status, True] + slider_cfg + slice_cfg + slice_cfg + slice_cfg
+    return ([status, True] + slider_cfg + slice_cfg * 5
             + [sp_opts, defaults, cq_opts, cq_val, ie_cq_opts, ie_cq_val])
 
 
@@ -5428,8 +6179,8 @@ def apply_plot_theme(theme, loaded, _simline_state):
     t = _theme_colors(theme)
     name = _parse_plot_theme(theme)
     root = {
-        'fontFamily': 'Arial, sans-serif', 'maxWidth': '1460px',
-        'margin': '0 auto', 'padding': '14px 22px',
+        'fontFamily': 'Arial, sans-serif', 'maxWidth': APP_MAX_WIDTH,
+        'margin': '0 auto', 'padding': '14px 28px',
         'backgroundColor': t['page_bg'], 'color': t['font'],
         'minHeight': '100vh',
     }
@@ -5565,16 +6316,23 @@ _ie_slice_fixed_label_outputs = [Output(f'ie-slice-fixed-label-{p["id"]}', 'chil
                                  for p in SLICE_PLANES]
 _ie_plane_title_outputs = [Output(f'ie-plane-title-{p["id"]}', 'children')
                            for p in SLICE_PLANES]
+_rgb_slice_fixed_label_outputs = [
+    Output(f'rgb-slice-fixed-label-{p["id"]}', 'children') for p in SLICE_PLANES
+]
+_rgb_slice_value_style_outputs = [
+    Output(f'rgb-slice-label-{p["id"]}', 'style') for p in SLICE_PLANES
+]
+_int_rgb_slice_fixed_label_outputs = [
+    Output(f'int-rgb-slice-fixed-label-{p["id"]}', 'children') for p in SLICE_PLANES
+]
+_int_rgb_slice_value_style_outputs = [
+    Output(f'int-rgb-slice-label-{p["id"]}', 'style') for p in SLICE_PLANES
+]
 
 
-@app.callback(
-    _slice_label_outputs + _slice_fixed_label_outputs + _slice_value_style_outputs,
-    _slice_slider_inputs
-    + [Input('grid-loaded', 'data'), Input('simline-state', 'data')],
-)
-def update_slice_labels(*args_in):
+def _update_slice_label_bundle(slice_indices):
+    """Shared label/fixed-label/style bundle for one set of slice sliders."""
     n = len(SLICE_PLANES)
-    slice_indices = list(args_in[:n])
     if not _grid:
         empty = [''] * n
         hide = {'display': 'none'}
@@ -5586,6 +6344,25 @@ def update_slice_labels(*args_in):
         labels.append(val)
         styles.append(style if val else {'display': 'none'})
     return labels + fixed_labels + styles
+
+
+@app.callback(
+    _slice_label_outputs + _slice_fixed_label_outputs + _slice_value_style_outputs,
+    _slice_slider_inputs
+    + [Input('grid-loaded', 'data'), Input('simline-state', 'data')],
+)
+def update_slice_labels(*args_in):
+    return _update_slice_label_bundle(list(args_in[:len(SLICE_PLANES)]))
+
+
+@app.callback(
+    _rgb_slice_label_outputs + _rgb_slice_fixed_label_outputs
+    + _rgb_slice_value_style_outputs,
+    _rgb_slice_slider_inputs
+    + [Input('grid-loaded', 'data'), Input('simline-state', 'data')],
+)
+def update_rgb_slice_labels(*args_in):
+    return _update_slice_label_bundle(list(args_in[:len(SLICE_PLANES)]))
 
 
 _slice_panel_style_outputs = [Output(f'slice-panel-{p["id"]}', 'style') for p in SLICE_PLANES]
@@ -5656,6 +6433,73 @@ def update_int_slice_panels_layout(_simline_overlay_state, _loaded, _simline_sta
 
 
 @app.callback(
+    [Output('rgb-panels-wrap', 'style'),
+     *_rgb_panel_style_outputs,
+     *_rgb_graph_style_outputs],
+    Input('grid-loaded', 'data'),
+    Input('simline-state', 'data'),
+)
+def update_rgb_panels_layout(_loaded, _simline_state):
+    panel_styles = [
+        _slice_panel_row_style(p.get('active'), full_width=False)
+        for p in active_slice_planes()
+    ]
+    graph_styles = [
+        _SLICE_GRAPH_STYLE_COMPACT if p.get('active') else {'display': 'none'}
+        for p in active_slice_planes()
+    ]
+    return (_SLICE_PANELS_ROW_STYLE, *panel_styles, *graph_styles)
+
+
+@app.callback(
+    [Output('int-rgb-panels-wrap', 'style'),
+     *_int_rgb_panel_style_outputs,
+     *_int_rgb_graph_style_outputs],
+    Input('grid-loaded', 'data'),
+    Input('simline-state', 'data'),
+)
+def update_int_rgb_panels_layout(_loaded, _simline_state):
+    panel_styles = [
+        _slice_panel_row_style(p.get('active'), full_width=False)
+        for p in active_slice_planes()
+    ]
+    graph_styles = [
+        _SLICE_GRAPH_STYLE_COMPACT if p.get('active') else {'display': 'none'}
+        for p in active_slice_planes()
+    ]
+    return (_SLICE_PANELS_ROW_STYLE, *panel_styles, *graph_styles)
+
+
+@app.callback(
+    [Output(f'grid-rgb-sp{i}', 'options') for i in range(3)]
+    + [Output(f'grid-rgb-sp{i}', 'value') for i in range(3)],
+    Input('grid-loaded', 'data'),
+    Input('simline-state', 'data'),
+)
+def update_grid_rgb_species(_loaded, _simline_state):
+    if not _grid or not _grid_has_hdf5():
+        return ([],) * 3 + (None,) * 3
+    species = list(_grid.get('species') or [])
+    opts = [{'label': s, 'value': s} for s in species]
+    defaults = _default_rgb_grid_species(species)
+    return (*[opts] * 3, *defaults)
+
+
+@app.callback(
+    [Output(f'int-rgb-sp{i}', 'options') for i in range(3)]
+    + [Output(f'int-rgb-sp{i}', 'value') for i in range(3)],
+    Input('simline-state', 'data'),
+    Input('int-idef', 'value'),
+)
+def update_int_rgb_lines(_simline_state, idef):
+    if not _simline:
+        return ([],) * 3 + (None,) * 3
+    opts = _simline_line_key_options(idef or SIMLINE_DEFAULT_IDEF)
+    defaults = _default_rgb_line_keys(idef or SIMLINE_DEFAULT_IDEF)
+    return (*[opts] * 3, *defaults)
+
+
+@app.callback(
     _contour_outputs,
     [Input('contour-quantity', 'value'),
      Input('contour-zscale', 'value'),
@@ -5689,6 +6533,42 @@ def update_contour_plots(quantity, zscale, _overlay_state, shift_dir, shift_rtol
         shift_scan_direction=_parse_shift_scan_direction(shift_dir),
         interp_config=icfg,
         colorscale=colorscale, theme=theme,
+    )
+
+
+@app.callback(
+    _rgb_outputs,
+    [Input('grid-rgb-sp0', 'value'),
+     Input('grid-rgb-sp1', 'value'),
+     Input('grid-rgb-sp2', 'value'),
+     Input('grid-rgb-cf0', 'value'),
+     Input('grid-rgb-cf1', 'value'),
+     Input('grid-rgb-cf2', 'value'),
+     Input('grid-rgb-transitions', 'value'),
+     Input('interp-ny', 'value'),
+     Input('interp-nx', 'value'),
+     Input('interp-x-lim', 'value'),
+     Input('interp-y-lim', 'value'),
+     Input('interp-method', 'value'),
+     Input('interp-clip', 'value'),
+     Input('plot-theme', 'value'),
+     Input('grid-loaded', 'data')]
+    + _rgb_slice_slider_inputs,
+)
+def update_grid_rgb_plots(sp0, sp1, sp2, cf0, cf1, cf2, transitions,
+                          interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+                          interp_method, interp_clip, plot_theme, _loaded,
+                          *slice_indices):
+    theme = _parse_plot_theme(plot_theme)
+    if not _grid or not _grid_has_hdf5():
+        p = placeholder_fig('Load an HDF5 grid for abundance RGB maps', theme=theme)
+        return (p,) * len(SLICE_PLANES)
+    icfg = _interp_config(interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+                          interp_method, interp_clip)
+    return make_grid_rgb_plots(
+        [sp0, sp1, sp2], transitions or [], list(slice_indices),
+        interp_config=icfg, theme=theme,
+        conv_factors=_parse_rgb_conv_factors(cf0, cf1, cf2),
     )
 
 
@@ -6027,19 +6907,17 @@ def update_sp_pv(*args_in):
     + [Input('grid-loaded', 'data'), Input('simline-state', 'data')],
 )
 def update_int_slice_labels(*args_in):
-    n = len(SLICE_PLANES)
-    slice_indices = list(args_in[:n])
-    if not _grid:
-        empty = [''] * n
-        hide = {'display': 'none'}
-        return empty + empty + [hide] * n
-    labels, fixed_labels, styles = [], [], []
-    for plane, idx in zip(active_slice_planes(), slice_indices):
-        fixed, val, style = _slice_axis_ui(plane, idx)
-        fixed_labels.append(fixed)
-        labels.append(val)
-        styles.append(style if val else {'display': 'none'})
-    return labels + fixed_labels + styles
+    return _update_slice_label_bundle(list(args_in[:len(SLICE_PLANES)]))
+
+
+@app.callback(
+    _int_rgb_slice_label_outputs + _int_rgb_slice_fixed_label_outputs
+    + _int_rgb_slice_value_style_outputs,
+    _int_rgb_slice_slider_inputs
+    + [Input('grid-loaded', 'data'), Input('simline-state', 'data')],
+)
+def update_int_rgb_slice_labels(*args_in):
+    return _update_slice_label_bundle(list(args_in[:len(SLICE_PLANES)]))
 
 
 def _ie_slice_token(plane, idx):
@@ -6278,6 +7156,50 @@ def update_intensity_contours(*args_in):
 
 
 @app.callback(
+    _int_rgb_outputs,
+    [Input('int-rgb-sp0', 'value'),
+     Input('int-rgb-sp1', 'value'),
+     Input('int-rgb-sp2', 'value'),
+     Input('int-rgb-cf0', 'value'),
+     Input('int-rgb-cf1', 'value'),
+     Input('int-rgb-cf2', 'value'),
+     Input('int-idef', 'value'),
+     Input('int-rgb-transitions', 'value'),
+     Input('simline-state', 'data'),
+     Input('grid-loaded', 'data'),
+     Input('int-interp-ny', 'value'),
+     Input('int-interp-nx', 'value'),
+     Input('int-interp-x-lim', 'value'),
+     Input('int-interp-y-lim', 'value'),
+     Input('int-interp-method', 'value'),
+     Input('int-interp-clip', 'value'),
+     Input('plot-theme', 'value')]
+    + _slider_value_inputs
+    + _int_rgb_slice_slider_inputs,
+)
+def update_intensity_rgb_plots(*args_in):
+    n_sl = N_PARAMS
+    n_int = len(_int_rgb_slice_slider_inputs)
+    n_fixed = len(args_in) - n_sl - n_int
+    slider_values = list(args_in[n_fixed:n_fixed + n_sl])
+    slice_indices = list(args_in[n_fixed + n_sl:])
+    (line0, line1, line2, cf0, cf1, cf2, idef, transitions, _state, _loaded,
+     interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+     interp_method, interp_clip, plot_theme) = args_in[:n_fixed]
+    theme = _parse_plot_theme(plot_theme)
+    if not _grid or not _simline:
+        p = placeholder_fig('Load grids and a SIMLINE directory', theme=theme)
+        return (p,) * len(SLICE_PLANES)
+    icfg = _interp_config(interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+                          interp_method, interp_clip)
+    return make_intensity_rgb_plots(
+        [line0, line1, line2], idef, transitions or [], slice_indices,
+        interp_config=icfg, theme=theme, slider_values=slider_values,
+        conv_factors=_parse_rgb_conv_factors(cf0, cf1, cf2),
+    )
+
+
+@app.callback(
     Output('plot-int-spectrum', 'figure'),
     _slider_value_inputs
     + _int_slice_slider_inputs
@@ -6308,15 +7230,18 @@ def update_intensity_spectrum(*args_in):
     + [Input('xvar-choice', 'value'),
        Input('xscale', 'value'),
        Input('yscale', 'value'),
+       Input('av-range', 'value'),
        Input('species-selector', 'value'),
        Input('overlay-state', 'data'),
        Input('plot-theme', 'value')],
 )
 def update_profile_plots(*args_in):
     values = list(args_in[:N_PARAMS])
-    xvar, xscale, yscale, custom_species, _overlay_state, plot_theme = args_in[N_PARAMS:]
+    xvar, xscale, yscale, av_range, custom_species, _overlay_state, plot_theme = (
+        args_in[N_PARAMS:])
     return make_profile_plots(values, xvar, xscale, yscale, custom_species or [],
-                              theme=_parse_plot_theme(plot_theme))
+                              theme=_parse_plot_theme(plot_theme),
+                              av_range=av_range)
 
 
 @app.callback(
@@ -6327,14 +7252,16 @@ def update_profile_plots(*args_in):
     + [Input('xvar-choice', 'value'),
        Input('xscale', 'value'),
        Input('yscale', 'value'),
+       Input('av-range', 'value'),
        Input('overlay-state', 'data'),
        Input('plot-theme', 'value')],
 )
 def update_thermal_plots(*args_in):
     values = list(args_in[:N_PARAMS])
-    xvar, xscale, yscale, _overlay_state, plot_theme = args_in[N_PARAMS:]
+    xvar, xscale, yscale, av_range, _overlay_state, plot_theme = args_in[N_PARAMS:]
     return make_thermal_plots(values, xvar, xscale, yscale,
-                              theme=_parse_plot_theme(plot_theme))
+                              theme=_parse_plot_theme(plot_theme),
+                              av_range=av_range)
 
 
 @app.callback(
@@ -6342,22 +7269,69 @@ def update_thermal_plots(*args_in):
     Output('react-contrib-formation', 'children'),
     Output('plot-react-destruction', 'figure'),
     Output('react-contrib-destruction', 'children'),
+    Output('plot-react-network', 'figure'),
+    Output('react-network-status', 'children'),
     _slider_value_inputs
     + [Input('react-species', 'value'),
        Input('react-n', 'value'),
        Input('react-ranking', 'value'),
        Input('xscale', 'value'),
        Input('yscale', 'value'),
+       Input('av-range', 'value'),
        Input('chem-state', 'data'),
-       Input('plot-theme', 'value')],
+       Input('plot-theme', 'value'),
+       Input('react-chain-upstream', 'value'),
+       Input('react-chain-downstream', 'value'),
+       Input('react-chain-isotopes', 'value'),
+       Input('react-chain-ice', 'value'),
+       Input('react-net-highlight', 'data')],
 )
 def update_reaction_plots(*args_in):
     values = list(args_in[:N_PARAMS])
-    species, top_n, ranking, xscale, yscale, _chem_state, plot_theme = args_in[N_PARAMS:]
+    (species, top_n, ranking, xscale, yscale, av_range, _chem_state,
+     plot_theme, chain_up, chain_down, chain_iso, chain_ice,
+     net_highlight) = args_in[N_PARAMS:]
     top_n = top_n or CHEM_DEFAULT_NREAC
     return make_reaction_plots(values, species, xscale, yscale, top_n,
                                ranking_metric=ranking,
-                               theme=_parse_plot_theme(plot_theme))
+                               theme=_parse_plot_theme(plot_theme),
+                               av_range=av_range,
+                               chain_upstream=chain_up,
+                               chain_downstream=chain_down,
+                               chain_include_isotopes=bool(chain_iso and 'iso' in chain_iso),
+                               chain_include_ice=bool(chain_ice and 'ice' in chain_ice),
+                               network_highlight=net_highlight)
+
+
+@app.callback(
+    Output('react-net-highlight', 'data'),
+    Input('plot-react-network', 'clickData'),
+    Input('btn-react-net-clear', 'n_clicks'),
+    Input('react-species', 'value'),
+    State('react-net-highlight', 'data'),
+    prevent_initial_call=True,
+)
+def update_react_net_highlight(click_data, clear_clicks, species, current):
+    """Click a species box to isolate its links; Clear / species change resets."""
+    from dash import ctx
+    trig = getattr(ctx, 'triggered_id', None)
+    if trig in ('btn-react-net-clear', 'react-species'):
+        return None
+    if not click_data:
+        return current
+    pts = click_data.get('points') or []
+    if not pts:
+        return current
+    pt = pts[0]
+    # Node traces carry plain species names in customdata.
+    cd = pt.get('customdata')
+    if isinstance(cd, (list, tuple)):
+        cd = cd[0] if cd else None
+    if cd:
+        name = str(cd)
+        # Toggle off if the same box is clicked again.
+        return None if current == name else name
+    return current
 
 
 @app.callback(

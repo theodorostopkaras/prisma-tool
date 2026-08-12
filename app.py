@@ -116,6 +116,16 @@ INT_OBS_BOUNDARY_JTEMP = 0.1
 INT_OBS_BOUNDARY_COLOR = 'red'
 INT_OBS_BOUNDARY_WIDTH = 2.5
 INT_EXTRA_CONTOUR_WIDTH = 1.5
+# Discrete palette for multi-level / spaghetti contours (Plotly tab20-like).
+INT_CONTOUR_COLORS = [
+    '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+    '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
+    '#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5',
+    '#c49c94', '#f7b6d2', '#c7c7c7', '#dbdb8d', '#9edae5',
+]
+INT_SPAGHETTI_DEFAULT_ERROR_FRAC = 0.20
+INT_SPAGHETTI_LINE_WIDTH = 2.5
+INT_SPAGHETTI_BAND_OPACITY = 0.35
 SIMLINE_IDEF_OPTIONS = [
     {'label': ' I [K km/s]  (jtemp)', 'value': 'jtemp'},
     {'label': ' I [erg s\u207B\u00B9 cm\u207B\u00B2 Hz\u207B\u00B9]  (jerg)', 'value': 'jerg'},
@@ -1002,26 +1012,6 @@ def clear_main_grid():
     _cr_heat_idx = None
     _model_config_summary = None
     _SLICE_PLANES_ACTIVE = None
-
-
-def _directory_has_hdf5(directory, recursive=False):
-    """True if ``directory`` contains at least one ``.hdf5`` grid file."""
-    directory = os.path.expanduser((directory or '').strip())
-    if not directory or not os.path.isdir(directory):
-        return False
-    pattern = os.path.join(directory, '**', '*.hdf5') if recursive \
-        else os.path.join(directory, '*.hdf5')
-    return bool(glob.glob(pattern, recursive=recursive))
-
-
-def _prepare_simline_grid_bootstrap(directory, recursive=False):
-    """Drop an unrelated HDF5 grid when loading SIMLINE from a directory with no HDF5."""
-    if _directory_has_hdf5(directory, recursive):
-        return False
-    if _grid_has_hdf5():
-        clear_main_grid()
-        return True
-    return False
 
 
 def _simline_sample_path(tok_tuple):
@@ -2572,6 +2562,32 @@ def _parse_int_extra_contour_levels(text):
     return levels
 
 
+def _parse_int_extra_contour_colors(text, n_levels):
+    """Parse CSS colors for extra contours; cycle palette when under-specified.
+
+    Empty / blank → one colour per level from ``INT_CONTOUR_COLORS``.
+    One colour → reuse for every level (legacy single-colour behaviour).
+    Several colours → assign in order, cycling if fewer than ``n_levels``.
+    """
+    n = max(int(n_levels), 0)
+    if n == 0:
+        return []
+    raw = (text or '').strip()
+    if not raw:
+        # Legacy single-contour default is black; multi-level uses a palette.
+        if n == 1:
+            return ['black']
+        return [INT_CONTOUR_COLORS[i % len(INT_CONTOUR_COLORS)] for i in range(n)]
+    colors = [c.strip() for c in re.split(r'[,;]+', raw) if c.strip()]
+    if not colors:
+        if n == 1:
+            return ['black']
+        return [INT_CONTOUR_COLORS[i % len(INT_CONTOUR_COLORS)] for i in range(n)]
+    if len(colors) == 1:
+        return [colors[0]] * n
+    return [colors[i % len(colors)] for i in range(n)]
+
+
 def _physical_to_plot_intensity(level, zscale):
     """Map a physical intensity level to the Z array used in contour plots."""
     if level is None or not np.isfinite(level):
@@ -2596,9 +2612,10 @@ def _build_intensity_line_contours(idef, zscale, show_obs_boundary,
                 width=INT_OBS_BOUNDARY_WIDTH,
                 label=f'obs. limit ({INT_OBS_BOUNDARY_JTEMP:g} K km/s)',
             ))
-    color = (extra_color or 'black').strip() or 'black'
+    phys_levels = _parse_int_extra_contour_levels(extra_levels_text)
+    colors = _parse_int_extra_contour_colors(extra_color, len(phys_levels))
     unit = _intensity_unit_label(idef)
-    for phys in _parse_int_extra_contour_levels(extra_levels_text):
+    for phys, color in zip(phys_levels, colors):
         lvl = _physical_to_plot_intensity(phys, zscale)
         if lvl is not None:
             lines.append(dict(
@@ -2630,6 +2647,413 @@ def _add_contour_level_lines(fig, x_plot, y_plot, z_plot, line_contours, row=Non
             fig.add_trace(trace, row=row, col=col)
         else:
             fig.add_trace(trace)
+
+
+def _hex_to_rgba(color, alpha=0.35):
+    """Best-effort CSS colour → rgba() string for translucent contour bands."""
+    raw = (color or '').strip()
+    if not raw:
+        return f'rgba(31,119,180,{alpha})'
+    if raw.startswith('rgba(') or raw.startswith('rgb('):
+        return raw
+    if raw.startswith('#') and len(raw) in (4, 7):
+        h = raw[1:]
+        if len(h) == 3:
+            h = ''.join(c * 2 for c in h)
+        try:
+            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+            return f'rgba({r},{g},{b},{alpha})'
+        except ValueError:
+            pass
+    named = {
+        'black': (0, 0, 0), 'white': (255, 255, 255), 'red': (214, 39, 40),
+        'blue': (31, 119, 180), 'green': (44, 160, 44), 'orange': (255, 127, 14),
+        'purple': (148, 103, 189), 'cyan': (23, 190, 207), 'gray': (127, 127, 127),
+        'grey': (127, 127, 127),
+    }
+    rgb = named.get(raw.lower())
+    if rgb is not None:
+        return f'rgba({rgb[0]},{rgb[1]},{rgb[2]},{alpha})'
+    return f'rgba(31,119,180,{alpha})'
+
+
+def _parse_spaghetti_contour_spec(text, available_keys=None):
+    """Parse named observed intensities for spaghetti / χ² intersection.
+
+    Accepts JSON ``{"CO(1-0)": 1.2, ...}`` or line-oriented text::
+
+        CO(1-0) = 1.2
+        CO(2-1): 3.5 ± 0.7
+        C+(158um): 5.0, 1.0
+
+    Optional second number / ± term is the intensity error; otherwise
+    ``INT_SPAGHETTI_DEFAULT_ERROR_FRAC`` of the level is used.
+
+    Returns
+    -------
+    list of dict
+        ``{name, level, error}`` for each successfully parsed entry.
+    """
+    if text is None:
+        return []
+    raw = str(text).strip()
+    if not raw:
+        return []
+
+    available = set(available_keys or [])
+    entries = []
+
+    def _append(name, level, error=None):
+        name = str(name).strip()
+        if not name:
+            return
+        try:
+            level = float(level)
+        except (TypeError, ValueError):
+            return
+        if not np.isfinite(level):
+            return
+        if error is None:
+            error = abs(level) * INT_SPAGHETTI_DEFAULT_ERROR_FRAC
+        else:
+            try:
+                error = float(error)
+            except (TypeError, ValueError):
+                error = abs(level) * INT_SPAGHETTI_DEFAULT_ERROR_FRAC
+        if not np.isfinite(error) or error <= 0:
+            error = abs(level) * INT_SPAGHETTI_DEFAULT_ERROR_FRAC or 1e-30
+        if available and name not in available:
+            # Soft match: case-insensitive / unique prefix among available keys.
+            lower = name.lower()
+            matches = [k for k in available if k.lower() == lower]
+            if not matches:
+                matches = [k for k in available if k.lower().startswith(lower)]
+            if len(matches) == 1:
+                name = matches[0]
+            else:
+                return
+        entries.append(dict(name=name, level=level, error=error))
+
+    if raw.startswith('{'):
+        try:
+            data = gf.parse_json_dict(raw)
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            for k, v in data.items():
+                if isinstance(v, (list, tuple)) and len(v) >= 1:
+                    _append(k, v[0], v[1] if len(v) > 1 else None)
+                elif isinstance(v, dict):
+                    _append(k, v.get('level', v.get('value')),
+                            v.get('error', v.get('err')))
+                else:
+                    _append(k, v)
+            return entries
+
+    line_re = re.compile(
+        r'^\s*(.+?)\s*[=:]\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)'
+        r'(?:\s*(?:±|\+/-|\+\/\-|,|;)\s*'
+        r'([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?))?\s*$'
+    )
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        m = line_re.match(line)
+        if not m:
+            continue
+        _append(m.group(1), m.group(2), m.group(3))
+    return entries
+
+
+def find_nearest_contour_point(x_plot, y_plot, grids, levels, errors):
+    """Minimise χ² = Σ ((Z − level)/error)² over plot-coordinate space.
+
+    Parameters
+    ----------
+    x_plot, y_plot : 1-D arrays
+        Plot-axis coordinates (log10 for logscale parameters).
+    grids : sequence of 2-D arrays
+        Intensity grids shaped ``(len(y_plot), len(x_plot))``.
+    levels, errors : sequence of float
+        Observed contour levels and uncertainties.
+
+    Returns
+    -------
+    dict or None
+        ``x``, ``y`` (plot coords), ``chi2``, ``relative_chi2`` on success.
+    """
+    from scipy.interpolate import RegularGridInterpolator
+    from scipy.optimize import minimize
+
+    if len(grids) < 2:
+        return None
+    x_arr = np.asarray(x_plot, dtype=float)
+    y_arr = np.asarray(y_plot, dtype=float)
+    if x_arr.size < 2 or y_arr.size < 2:
+        return None
+    x_min, x_max = float(np.nanmin(x_arr)), float(np.nanmax(x_arr))
+    y_min, y_max = float(np.nanmin(y_arr)), float(np.nanmax(y_arr))
+    if not np.isfinite([x_min, x_max, y_min, y_max]).all():
+        return None
+
+    interpolators = []
+    for grid in grids:
+        z = np.asarray(grid, dtype=float)
+        if z.shape != (y_arr.size, x_arr.size):
+            return None
+        interpolators.append(RegularGridInterpolator(
+            (y_arr, x_arr), z, method='linear',
+            bounds_error=False, fill_value=np.nan,
+        ))
+
+    def chi2_func(pt):
+        chi2 = 0.0
+        for interp, level, err in zip(interpolators, levels, errors):
+            val = float(interp([[pt[1], pt[0]]])[0])
+            if np.isfinite(val) and err > 0:
+                chi2 += ((val - level) / err) ** 2
+        return chi2
+
+    result = minimize(
+        chi2_func,
+        np.array([(x_min + x_max) / 2.0, (y_min + y_max) / 2.0]),
+        method='L-BFGS-B',
+        bounds=[(x_min, x_max), (y_min, y_max)],
+    )
+    if not result.success:
+        return None
+    chi2_min = float(result.fun)
+    n = len(levels)
+    return dict(
+        x=float(result.x[0]),
+        y=float(result.x[1]),
+        chi2=chi2_min,
+        relative_chi2=chi2_min / n if n else chi2_min,
+    )
+
+
+def _add_spaghetti_contour(fig, x_plot, y_plot, z, level, error, color, name,
+                           show_band=True):
+    """Draw one observed-level contour (+ optional ±error band) on ``fig``."""
+    z_arr = np.asarray(z, dtype=float)
+    if not np.any(np.isfinite(z_arr)):
+        return False
+    drawn = False
+    if show_band and error is not None and error > 0:
+        lo, hi = float(level - error), float(level + error)
+        if hi > lo:
+            fill = _hex_to_rgba(color, INT_SPAGHETTI_BAND_OPACITY)
+            fig.add_trace(go.Contour(
+                x=x_plot, y=y_plot, z=z_arr,
+                contours=dict(
+                    coloring='fill', showlines=False,
+                    start=lo, end=hi, size=max(hi - lo, 1e-30),
+                ),
+                colorscale=[[0, fill], [1, fill]],
+                showscale=False,
+                hoverinfo='skip',
+                name=f'{name} ±err',
+                showlegend=False,
+                opacity=1.0,
+            ))
+            drawn = True
+
+    paths = gf._extract_contour_paths(x_plot, y_plot, z_arr, level)
+    for i, path in enumerate(paths):
+        fig.add_trace(go.Scatter(
+            x=path[:, 0], y=path[:, 1],
+            mode='lines',
+            line=dict(color=color, width=INT_SPAGHETTI_LINE_WIDTH),
+            legendgroup=name,
+            name=name if i == 0 else None,
+            showlegend=(i == 0),
+            hoverinfo='skip',
+        ))
+        drawn = True
+    if not paths:
+        # Fallback: Plotly Contour line when matplotlib finds no path.
+        fig.add_trace(go.Contour(
+            x=x_plot, y=y_plot, z=z_arr,
+            contours=dict(
+                coloring='none', showlabels=False,
+                start=level, end=level, size=1,
+            ),
+            line=dict(color=color, width=INT_SPAGHETTI_LINE_WIDTH),
+            showscale=False,
+            hoverinfo='skip',
+            legendgroup=name,
+            name=name,
+            showlegend=True,
+        ))
+        fin = z_arr[np.isfinite(z_arr)]
+        drawn = fin.size > 0 and float(np.nanmin(fin)) <= level <= float(np.nanmax(fin))
+    return drawn
+
+
+def fig_spaghetti_plane(plane, slice_idx, contour_entries, idef,
+                        interp_config=None, theme='light', slider_values=None,
+                        show_error_bands=True, mark_closest=True):
+    """KoSens-style spaghetti plot: multi-line observed contours on one slice."""
+    if not plane.get('active'):
+        return placeholder_fig(theme=theme), None
+    if not _grid or not _simline:
+        return placeholder_fig('Load grids and a SIMLINE directory', theme=theme), None
+    if not contour_entries:
+        return placeholder_fig(
+            'Provide observed intensities (line = value) above', theme=theme), None
+
+    sk = plane['slice']
+    slice_tokens = _grid['axis_tokens'][sk]
+    if not slice_tokens:
+        return placeholder_fig('No slice axis', theme=theme), None
+    try:
+        slice_token = slice_tokens[int(slice_idx)]
+    except (IndexError, TypeError, ValueError):
+        slice_token = slice_tokens[0]
+
+    lookup = gf._line_lookup(_simline, idef or SIMLINE_DEFAULT_IDEF)
+    names, grids, levels, errors, colors = [], [], [], [], []
+    x_plot = y_plot = None
+    xdef = ydef = None
+    for i, entry in enumerate(contour_entries):
+        resolved = lookup.get(entry['name'])
+        if resolved is None:
+            continue
+        species, tidx = resolved
+        x_phys, y_phys, Z, xd, yd = build_intensity_slice_grid(
+            plane, slice_token, species, idef, tidx,
+            interp_config=interp_config, slider_values=slider_values,
+        )
+        if not np.any(np.isfinite(Z)):
+            continue
+        if x_plot is None:
+            x_plot = _axis_plot_coords(x_phys, xd)
+            y_plot = _axis_plot_coords(y_phys, yd)
+            xdef, ydef = xd, yd
+        names.append(entry['name'])
+        grids.append(Z)
+        levels.append(float(entry['level']))
+        errors.append(float(entry['error']))
+        colors.append(INT_CONTOUR_COLORS[i % len(INT_CONTOUR_COLORS)])
+
+    if not names or x_plot is None:
+        return placeholder_fig('No matching SIMLINE lines for the given names',
+                               theme=theme), None
+
+    t = _theme_colors(theme)
+    sdef = _param_def(sk)
+    if sdef['key'] == 'atten':
+        slice_disp = f'{slice_token:02d}'
+    else:
+        slice_disp = f'{sdef["decode"](slice_token):.4g}'
+    slice_unit = f' {sdef["unit"]}' if sdef['unit'] else ''
+    unit = _intensity_unit_label(idef)
+    title = (f'{plane["title"]}<br>'
+             f'<sup style="font-size:11px">{sdef["name"]} = {slice_disp}{slice_unit}'
+             f'  \u2014  spaghetti contours [{unit}]</sup>')
+
+    fig = go.Figure()
+    n_drawn = 0
+    for name, Z, level, err, color in zip(names, grids, levels, errors, colors):
+        label = f'{name}  ({level:g} \u00b1 {err:g})'
+        if _add_spaghetti_contour(
+            fig, x_plot, y_plot, Z, level, err, color, label,
+            show_band=show_error_bands,
+        ):
+            n_drawn += 1
+
+    chi2_info = None
+    if mark_closest and len(grids) >= 2:
+        chi2_info = find_nearest_contour_point(
+            x_plot, y_plot, grids, levels, errors,
+        )
+        if chi2_info is not None:
+            fig.add_trace(go.Scatter(
+                x=[chi2_info['x']], y=[chi2_info['y']],
+                mode='markers',
+                marker=dict(
+                    symbol='star', size=14, color='red',
+                    line=dict(width=1.5, color='white'),
+                ),
+                name=f'\u03c7\u00b2 min ({chi2_info["chi2"]:.3g})',
+                showlegend=True,
+            ))
+
+    if n_drawn == 0:
+        return placeholder_fig('Contours outside grid range for this slice',
+                               theme=theme), chi2_info
+
+    fig = _apply_square_contour_layout(
+        fig, x_plot, y_plot, xdef, ydef, title,
+        fixed_size=True, theme=theme, zscale='linear',
+    )
+    fig.update_layout(
+        showlegend=True,
+        legend=dict(
+            orientation='v',
+            yanchor='top', y=1.0,
+            xanchor='left', x=1.02,
+            bgcolor=t['legend_bg'],
+            bordercolor=t['legend_border'],
+            borderwidth=1,
+            font=dict(size=10, color=t['font']),
+            tracegroupgap=2,
+        ),
+        margin=dict(l=64, r=160, t=52, b=58),
+    )
+    # Widen figure slightly for the legend strip.
+    if fig.layout.width:
+        fig.update_layout(width=int(fig.layout.width) + 70)
+    return fig, chi2_info
+
+
+def make_spaghetti_plots(contour_text, idef, slice_indices,
+                         interp_config=None, theme='light', slider_values=None,
+                         show_error_bands=True, mark_closest=True):
+    """Build spaghetti figures for every active slice plane."""
+    available = gf.list_simline_line_keys(_simline, idef or SIMLINE_DEFAULT_IDEF) if _simline else []
+    entries = _parse_spaghetti_contour_spec(contour_text, available_keys=available)
+    figs = []
+    chi2_first = None
+    for i, plane in enumerate(active_slice_planes()):
+        fig, chi2_info = fig_spaghetti_plane(
+            plane, slice_indices[i], entries, idef,
+            interp_config=interp_config, theme=theme,
+            slider_values=slider_values,
+            show_error_bands=show_error_bands,
+            mark_closest=mark_closest,
+        ) if plane.get('active') else (placeholder_fig(theme=theme), None)
+        figs.append(fig)
+        if chi2_first is None and chi2_info is not None:
+            chi2_first = dict(chi2_info)
+            chi2_first['plane'] = plane.get('title') or plane.get('id')
+            chi2_first['n_lines'] = len(entries)
+            chi2_first['names'] = [e['name'] for e in entries]
+    return tuple(figs), chi2_first
+
+
+def _spaghetti_status_children(chi2_info, theme='light'):
+    """Compact status line under the spaghetti controls."""
+    t = _theme_colors(theme)
+    if not chi2_info:
+        return html.Span(
+            'Enter at least two matched lines to mark the χ² closest point.',
+            style={'fontSize': '12px', 'color': t['muted']},
+        )
+    names = ', '.join(chi2_info.get('names') or [])
+    return html.Span([
+        html.Span('χ² intersection  ', style={'fontWeight': '700', 'color': t['heading']}),
+        html.Span(
+            f'plane={chi2_info.get("plane", "?")}  '
+            f'χ²={chi2_info["chi2"]:.4g}  '
+            f'χ²/N={chi2_info["relative_chi2"]:.4g}  '
+            f'(x,y)_plot=({chi2_info["x"]:.4g}, {chi2_info["y"]:.4g})',
+            style={'fontSize': '12px', 'color': t['font']},
+        ),
+        html.Span(f'   [{names}]',
+                  style={'fontSize': '11px', 'color': t['muted'], 'marginLeft': '6px'}),
+    ])
 
 
 def _multi_panel_layout_kw(theme='light', height=420):
@@ -4617,13 +5041,17 @@ def _int_contour_overlay_row():
                              'display': 'block'}),
         ], style={'flex': '2', 'minWidth': '260px', 'marginRight': '18px'}),
         html.Div([
-            html.Label('Extra contour color', style=_CTRL_LABEL),
+            html.Label('Extra contour color(s)', style=_CTRL_LABEL),
             dcc.Input(
-                id='int-extra-contour-color', type='text', value='black',
-                placeholder='CSS color, e.g. black, #00ff00, cyan',
+                id='int-extra-contour-color', type='text', value='',
+                placeholder='empty = auto palette; or black, #00ff00, cyan',
                 className='kosma-input',
                 style={**_INPUT_STYLE, 'width': '100%'}),
-        ], style={'flex': '1', 'minWidth': '140px'}),
+            html.Span('  one colour for all levels, or comma-separated per level',
+                      className='kosma-muted',
+                      style={'fontSize': '11px', 'marginTop': '4px',
+                             'display': 'block'}),
+        ], style={'flex': '1.2', 'minWidth': '180px'}),
     ], className='kosma-panel kosma-panel-dashed', style=_PANEL_ROW)
 
 
@@ -4728,6 +5156,74 @@ def _rgb_intensity_controls():
                               plot_id=f'plot-int-rgb-{p["id"]}')
              for p in SLICE_PLANES],
             id='int-rgb-panels-wrap',
+            style=_SLICE_PANELS_ROW_STYLE,
+        ),
+    ])
+
+
+def _spaghetti_controls():
+    """KoSens-style multi-line spaghetti / χ² intersection (Intensities tab)."""
+    example = (
+        'CO(1-0) = 1.2\n'
+        'CO(2-1) = 3.5 \u00b1 0.7\n'
+        'C+(158um) = 5.0, 1.0'
+    )
+    return html.Div([
+        html.H4('Spaghetti contours (observed intensities)',
+                style={'fontSize': '14px', 'margin': '18px 0 6px', 'fontWeight': '600'}),
+        html.P(
+            'Overlay model = observed intensity contours for several SIMLINE lines '
+            'on each parameter slice (KoSens spaghetti_plot_grid). Optional error '
+            'bands default to 20% of the level; with two or more lines the χ² '
+            'closest point in parameter space is marked (find_nearest_contour_points).',
+            style={**_PAGE_INTRO, 'marginBottom': '8px'},
+        ),
+        html.Div([
+            html.Div([
+                html.Label('Lines (optional multi-select helper)', style=_CTRL_LABEL),
+                dcc.Dropdown(
+                    id='int-spaghetti-lines',
+                    options=[], value=[], multi=True,
+                    placeholder='Load SIMLINE\u2026 then pick lines to seed the text box',
+                    style={'fontSize': '13px'}),
+            ], style={'flex': '1.4', 'minWidth': '240px', 'marginRight': '18px'}),
+            html.Div([
+                html.Label('Observed intensities', style=_CTRL_LABEL),
+                dcc.Textarea(
+                    id='int-spaghetti-contours',
+                    value='',
+                    placeholder=example,
+                    className='kosma-input',
+                    style={**_INPUT_STYLE, 'width': '100%', 'height': '96px',
+                           'fontFamily': 'monospace', 'resize': 'vertical'},
+                ),
+                html.Span(
+                    '  JSON or lines: Name = value [± err]. Names must match SIMLINE keys.',
+                    className='kosma-muted',
+                    style={'fontSize': '11px', 'marginTop': '4px', 'display': 'block'},
+                ),
+            ], style={'flex': '2', 'minWidth': '280px', 'marginRight': '18px'}),
+            html.Div([
+                html.Label('Options', style=_CTRL_LABEL),
+                dcc.Checklist(
+                    id='int-spaghetti-options',
+                    options=[
+                        {'label': '  error bands (±σ)', 'value': 'bands'},
+                        {'label': '  mark χ² closest point', 'value': 'chi2'},
+                    ],
+                    value=['bands', 'chi2'],
+                    style={'fontSize': '13px'},
+                ),
+            ], style={'flex': '1', 'minWidth': '180px'}),
+        ], className='kosma-panel',
+           style={'display': 'flex', 'alignItems': 'flex-start', 'flexWrap': 'wrap',
+                  'padding': '12px 18px', 'marginBottom': '8px'}),
+        html.Div(id='int-spaghetti-status', style={'padding': '0 18px 8px'}),
+        html.Div(
+            [_rgb_slice_panel(p['id'], prefix='int-spag-',
+                              plot_id=f'plot-int-spag-{p["id"]}')
+             for p in SLICE_PLANES],
+            id='int-spag-panels-wrap',
             style=_SLICE_PANELS_ROW_STYLE,
         ),
     ])
@@ -5440,6 +5936,7 @@ app.layout = html.Div(
                 html.Div([_int_slice_panel(p['id']) for p in SLICE_PLANES],
                          id='int-slice-panels-wrap',
                          style=_SLICE_PANELS_ROW_STYLE),
+                _spaghetti_controls(),
                 _rgb_intensity_controls(),
             ]),
         ]),
@@ -5939,6 +6436,24 @@ _int_rgb_outputs = [Output(f'plot-int-rgb-{p["id"]}', 'figure') for p in SLICE_P
 _int_rgb_panel_style_outputs = [Output(f'int-rgb-panel-{p["id"]}', 'style') for p in SLICE_PLANES]
 _int_rgb_graph_style_outputs = [Output(f'plot-int-rgb-{p["id"]}', 'style') for p in SLICE_PLANES]
 
+_int_spag_slice_slider_outputs = []
+for plane in SLICE_PLANES:
+    pid = plane['id']
+    _int_spag_slice_slider_outputs += [
+        Output(f'int-spag-slice-slider-{pid}', 'max'),
+        Output(f'int-spag-slice-slider-{pid}', 'marks'),
+        Output(f'int-spag-slice-slider-{pid}', 'value'),
+    ]
+_int_spag_slice_slider_inputs = [
+    Input(f'int-spag-slice-slider-{p["id"]}', 'value') for p in SLICE_PLANES
+]
+_int_spag_slice_label_outputs = [
+    Output(f'int-spag-slice-label-{p["id"]}', 'children') for p in SLICE_PLANES
+]
+_int_spag_outputs = [Output(f'plot-int-spag-{p["id"]}', 'figure') for p in SLICE_PLANES]
+_int_spag_panel_style_outputs = [Output(f'int-spag-panel-{p["id"]}', 'style') for p in SLICE_PLANES]
+_int_spag_graph_style_outputs = [Output(f'plot-int-spag-{p["id"]}', 'style') for p in SLICE_PLANES]
+
 _ie_slice_slider_outputs = []
 for plane in SLICE_PLANES:
     pid = plane['id']
@@ -6015,12 +6530,13 @@ def _empty_slice_slider_ui():
     return empty
 
 
-def _interleave_slice_tab_cfgs(slice_cfg, n_tabs=5):
+def _interleave_slice_tab_cfgs(slice_cfg, n_tabs=6):
     """Match ``_grid_sync_outputs``: per plane, one (max, marks, value) block per tab.
 
-    Tabs: contour slice, intensity slice, IE slice, grid RGB, intensity RGB.
+    Tabs: contour slice, intensity slice, IE slice, grid RGB, intensity RGB,
+    intensity spaghetti.
     ``handle_load`` uses grouped outputs (all of tab A, then B, …), so it can
-    pass ``slice_cfg`` five times.  SIMLINE bootstrap uses interleaved outputs.
+    pass ``slice_cfg`` six times.  SIMLINE bootstrap uses interleaved outputs.
     """
     out = []
     for i in range(len(SLICE_PLANES)):
@@ -6063,6 +6579,9 @@ for plane in SLICE_PLANES:
         Output(f'int-rgb-slice-slider-{pid}', 'max', allow_duplicate=True),
         Output(f'int-rgb-slice-slider-{pid}', 'marks', allow_duplicate=True),
         Output(f'int-rgb-slice-slider-{pid}', 'value', allow_duplicate=True),
+        Output(f'int-spag-slice-slider-{pid}', 'max', allow_duplicate=True),
+        Output(f'int-spag-slice-slider-{pid}', 'marks', allow_duplicate=True),
+        Output(f'int-spag-slice-slider-{pid}', 'value', allow_duplicate=True),
     ]
 _grid_sync_outputs += [
     Output('species-selector', 'options', allow_duplicate=True),
@@ -6103,6 +6622,7 @@ def _grid_sync_from_axis_tokens(axis_tokens):
     + _ie_slice_slider_outputs
     + _rgb_slice_slider_outputs
     + _int_rgb_slice_slider_outputs
+    + _int_spag_slice_slider_outputs
     + [Output('species-selector', 'options'),
        Output('species-selector', 'value'),
        Output('contour-quantity', 'options'),
@@ -6123,7 +6643,7 @@ def handle_load(n_clicks, directory, recursive):
     except Exception as exc:
         err = html.Span(f'\u2717  {exc}', style={'color': '#d62728', 'fontWeight': '600'})
         empty = _empty_param_slider_ui(hidden)
-        return ([err, False] + empty + empty_slice * 5
+        return ([err, False] + empty + empty_slice * 6
                 + [[], [], [], None, [], None])
 
     slider_cfg, slice_cfg, _ = _ui_slider_config(grid['axis_tokens'])
@@ -6148,7 +6668,7 @@ def handle_load(n_clicks, directory, recursive):
                   style={'color': '#555', 'marginLeft': '10px'}),
     ])
 
-    return ([status, True] + slider_cfg + slice_cfg * 5
+    return ([status, True] + slider_cfg + slice_cfg * 6
             + [sp_opts, defaults, cq_opts, cq_val, ie_cq_opts, ie_cq_val])
 
 
@@ -6328,6 +6848,12 @@ _int_rgb_slice_fixed_label_outputs = [
 _int_rgb_slice_value_style_outputs = [
     Output(f'int-rgb-slice-label-{p["id"]}', 'style') for p in SLICE_PLANES
 ]
+_int_spag_slice_fixed_label_outputs = [
+    Output(f'int-spag-slice-fixed-label-{p["id"]}', 'children') for p in SLICE_PLANES
+]
+_int_spag_slice_value_style_outputs = [
+    Output(f'int-spag-slice-label-{p["id"]}', 'style') for p in SLICE_PLANES
+]
 
 
 def _update_slice_label_bundle(slice_indices):
@@ -6471,6 +6997,25 @@ def update_int_rgb_panels_layout(_loaded, _simline_state):
 
 
 @app.callback(
+    [Output('int-spag-panels-wrap', 'style'),
+     *_int_spag_panel_style_outputs,
+     *_int_spag_graph_style_outputs],
+    Input('grid-loaded', 'data'),
+    Input('simline-state', 'data'),
+)
+def update_int_spag_panels_layout(_loaded, _simline_state):
+    panel_styles = [
+        _slice_panel_row_style(p.get('active'), full_width=False)
+        for p in active_slice_planes()
+    ]
+    graph_styles = [
+        _SLICE_GRAPH_STYLE_COMPACT if p.get('active') else {'display': 'none'}
+        for p in active_slice_planes()
+    ]
+    return (_SLICE_PANELS_ROW_STYLE, *panel_styles, *graph_styles)
+
+
+@app.callback(
     [Output(f'grid-rgb-sp{i}', 'options') for i in range(3)]
     + [Output(f'grid-rgb-sp{i}', 'value') for i in range(3)],
     Input('grid-loaded', 'data'),
@@ -6497,6 +7042,52 @@ def update_int_rgb_lines(_simline_state, idef):
     opts = _simline_line_key_options(idef or SIMLINE_DEFAULT_IDEF)
     defaults = _default_rgb_line_keys(idef or SIMLINE_DEFAULT_IDEF)
     return (*[opts] * 3, *defaults)
+
+
+@app.callback(
+    Output('int-spaghetti-lines', 'options'),
+    Input('simline-state', 'data'),
+    Input('int-idef', 'value'),
+)
+def update_spaghetti_line_options(_simline_state, idef):
+    if not _simline:
+        return []
+    return _simline_line_key_options(idef or SIMLINE_DEFAULT_IDEF)
+
+
+@app.callback(
+    Output('int-spaghetti-contours', 'value'),
+    Input('int-spaghetti-lines', 'value'),
+    State('int-spaghetti-contours', 'value'),
+    prevent_initial_call=True,
+)
+def seed_spaghetti_contours_from_lines(selected, current_text):
+    """Append newly selected line keys into the intensity text box."""
+    selected = list(selected or [])
+    if not selected:
+        raise PreventUpdate
+    current = current_text or ''
+    available = gf.list_simline_line_keys(
+        _simline, SIMLINE_DEFAULT_IDEF) if _simline else []
+    # Re-parse with whatever keys we can; idef-specific keys come from dropdown.
+    existing = {
+        e['name'] for e in _parse_spaghetti_contour_spec(current, available_keys=None)
+    }
+    # Also treat bare "Name =" lines without a value as present.
+    for line in current.splitlines():
+        m = re.match(r'^\s*(.+?)\s*[=:]\s*', line)
+        if m:
+            existing.add(m.group(1).strip())
+    additions = []
+    for name in selected:
+        if name not in existing:
+            additions.append(f'{name} = ')
+            existing.add(name)
+    if not additions:
+        raise PreventUpdate
+    prefix = current.rstrip()
+    sep = '\n' if prefix else ''
+    return prefix + sep + '\n'.join(additions)
 
 
 @app.callback(
@@ -6738,7 +7329,6 @@ def handle_simline(n_load, n_clear, directory, recursive, state,
                 state + 1, [], None, [], None, [], None]
                 + no_grid_sync)
 
-    replaced_grid = _prepare_simline_grid_bootstrap(sl['directory'], recursive=bool(recursive))
     bootstrapped = bootstrap_grid_from_simline()
 
     preferred = [s for s in ('CO', '13CO', 'C18O', 'HCO+', 'N2H+', 'CS', 'HCN', 'C+', 'CI')
@@ -6762,8 +7352,8 @@ def handle_simline(n_load, n_clear, directory, recursive, state,
             for p in PARAM_DEFS if len(_grid['axis_tokens'][p['key']]) > 1
         ) or 'single model'
         mode_note = f'   \u2014   grid from filenames: {cube}  (SIMLINE-only mode)'
-    if replaced_grid:
-        mode_note += '   \u2014   replaced previous HDF5 grid (no .hdf5 in SIMLINE directory)'
+    elif _grid_has_hdf5():
+        mode_note = '   \u2014   using loaded HDF5 grid axes'
     grid_sync = (_grid_sync_from_axis_tokens(_grid['axis_tokens']) if bootstrapped
                  else no_grid_sync)
     status = html.Span([
@@ -6917,6 +7507,16 @@ def update_int_slice_labels(*args_in):
     + [Input('grid-loaded', 'data'), Input('simline-state', 'data')],
 )
 def update_int_rgb_slice_labels(*args_in):
+    return _update_slice_label_bundle(list(args_in[:len(SLICE_PLANES)]))
+
+
+@app.callback(
+    _int_spag_slice_label_outputs + _int_spag_slice_fixed_label_outputs
+    + _int_spag_slice_value_style_outputs,
+    _int_spag_slice_slider_inputs
+    + [Input('grid-loaded', 'data'), Input('simline-state', 'data')],
+)
+def update_int_spag_slice_labels(*args_in):
     return _update_slice_label_bundle(list(args_in[:len(SLICE_PLANES)]))
 
 
@@ -7153,6 +7753,50 @@ def update_intensity_contours(*args_in):
         extra_contour_levels=extra_contours,
         extra_contour_color=extra_contour_color,
     )
+
+
+@app.callback(
+    list(_int_spag_outputs) + [Output('int-spaghetti-status', 'children')],
+    [Input('int-spaghetti-contours', 'value'),
+     Input('int-spaghetti-options', 'value'),
+     Input('int-idef', 'value'),
+     Input('simline-state', 'data'),
+     Input('grid-loaded', 'data'),
+     Input('int-interp-ny', 'value'),
+     Input('int-interp-nx', 'value'),
+     Input('int-interp-x-lim', 'value'),
+     Input('int-interp-y-lim', 'value'),
+     Input('int-interp-method', 'value'),
+     Input('int-interp-clip', 'value'),
+     Input('plot-theme', 'value')]
+    + _slider_value_inputs
+    + _int_spag_slice_slider_inputs,
+)
+def update_spaghetti_plots(*args_in):
+    n_sl = N_PARAMS
+    n_sp = len(_int_spag_slice_slider_inputs)
+    n_fixed = len(args_in) - n_sl - n_sp
+    slider_values = list(args_in[n_fixed:n_fixed + n_sl])
+    slice_indices = list(args_in[n_fixed + n_sl:])
+    (contour_text, options, idef, _state, _loaded,
+     interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+     interp_method, interp_clip, plot_theme) = args_in[:n_fixed]
+    theme = _parse_plot_theme(plot_theme)
+    options = options or []
+    if not _grid or not _simline:
+        p = placeholder_fig('Load grids and a SIMLINE directory', theme=theme)
+        return (p,) * len(SLICE_PLANES) + (
+            _spaghetti_status_children(None, theme=theme),
+        )
+    icfg = _interp_config(interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+                          interp_method, interp_clip)
+    figs, chi2_info = make_spaghetti_plots(
+        contour_text, idef or SIMLINE_DEFAULT_IDEF, slice_indices,
+        interp_config=icfg, theme=theme, slider_values=slider_values,
+        show_error_bands=('bands' in options),
+        mark_closest=('chi2' in options),
+    )
+    return tuple(figs) + (_spaghetti_status_children(chi2_info, theme=theme),)
 
 
 @app.callback(

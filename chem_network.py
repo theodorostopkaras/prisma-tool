@@ -39,8 +39,10 @@ DEFAULT_CHAIN_DOWNSTREAM = 2
 CHAIN_MAX_NODES = 36
 # Extra node budget when isotopes / ice toggles add partners on top of the base chain.
 # Page-safe Plotly canvas: never grow past this or the Dash tab scrolls off-screen.
-PAGE_FIG_HEIGHT = 900
-PAGE_FIG_HEIGHT_MIN = 680
+PAGE_FIG_HEIGHT = 1020
+PAGE_FIG_HEIGHT_MIN = 720
+# Approx. plot area used when converting marker px → data-unit box half.
+PAGE_FIG_WIDTH_EST = 1600
 CHAIN_EXTRA_NODES = 16
 # Max formation / destruction channels kept per species while walking the chain.
 CHAIN_BRANCH_LIMIT = 5
@@ -76,6 +78,22 @@ def normalize_token(raw: str) -> str:
     if upper in ('H2*', 'H2STAR'):
         return 'H2*'
     return tok
+
+
+def _species_match_key(name: str) -> str:
+    """Loose key so click labels (HCO⁺ / SiH+) match graph ids (HCO+ / SIH+)."""
+    s = str(name or '').strip()
+    if not s:
+        return ''
+    table = str.maketrans({
+        '\u207a': '+', '\u207b': '-',  # ⁺ ⁻
+        '\u208a': '+', '\u208b': '-',  # ₊ ₋
+        '\u2080': '0', '\u2081': '1', '\u2082': '2', '\u2083': '3',
+        '\u2084': '4', '\u2085': '5', '\u2086': '6', '\u2087': '7',
+        '\u2088': '8', '\u2089': '9',
+        '\u00b0': '0', '\u00b9': '1', '\u00b2': '2', '\u00b3': '3',
+    })
+    return s.translate(table).upper()
 
 
 def is_process_token(token: str) -> bool:
@@ -190,6 +208,22 @@ def _format_node_label(name: str) -> str:
             out.append(c)
         i += 1
     return ''.join(out)
+
+
+def _label_char_count(name: str) -> int:
+    """Visible character count used to size species boxes."""
+    return max(1, len(str(name or '').strip()))
+
+
+def _label_font_size(base: int, n_chars: int) -> int:
+    """Slightly smaller type for long formulas so they stay inside the box."""
+    if n_chars >= 8:
+        return max(9, base - 4)
+    if n_chars >= 6:
+        return max(10, base - 3)
+    if n_chars >= 5:
+        return max(10, base - 2)
+    return base
 
 
 def _format_mid_token(token: str) -> str:
@@ -381,14 +415,16 @@ def layout_pathway_positions(
     return pos
 
 
-def _pad_range(vals: Sequence[float], pad: float = 0.18) -> List[float]:
+def _pad_range(vals: Sequence[float], pad: float = 0.18,
+               abs_pad: float = 0.0) -> List[float]:
+    """Axis range with fractional and optional absolute padding."""
     if not vals:
         return [-1.0, 1.0]
     lo, hi = float(min(vals)), float(max(vals))
     if lo == hi:
-        return [lo - 1.0, hi + 1.0]
+        return [lo - 1.0 - abs_pad, hi + 1.0 + abs_pad]
     span = hi - lo
-    return [lo - pad * span, hi + pad * span]
+    return [lo - pad * span - abs_pad, hi + pad * span + abs_pad]
 
 
 def _orthogonal_polyline(
@@ -409,11 +445,69 @@ def _port_offsets(n: int, span: float = 0.28) -> List[float]:
 
 
 def _face_port_span(box_half: float, count: int) -> float:
-    """How far along a face to spread ports for ``count`` attachments."""
+    """How far along a face to spread ports for ``count`` attachments.
+
+    Uses most of the face so many exits/entries sit clearly side-by-side
+    (right next to each other) instead of stacking on the centre.
+    """
     if count <= 1:
         return 0.0
-    # Use nearly the full face; grow with degree so busy hubs fan out.
-    return min(float(box_half) * 0.92, 0.11 + 0.032 * (count - 1))
+    return max(0.0, float(box_half) * 0.84)
+
+
+def _exit_face(x0: float, y0: float, x1: float, y1: float) -> str:
+    """Which side of the source box an edge leaves on."""
+    dx, dy = x1 - x0, y1 - y0
+    if abs(dx) >= abs(dy):
+        return 'right' if dx >= 0 else 'left'
+    return 'top' if dy >= 0 else 'bottom'
+
+
+def _enter_face(x0: float, y0: float, x1: float, y1: float) -> str:
+    """Which side of the target box an edge arrives on."""
+    dx, dy = x1 - x0, y1 - y0
+    if abs(dx) >= abs(dy):
+        return 'left' if dx >= 0 else 'right'
+    return 'bottom' if dy >= 0 else 'top'
+
+
+def _assign_face_ports(
+    draw_edges: Sequence[dict],
+    pos: Dict[str, Tuple[float, float]],
+    node_half: Dict[str, float],
+) -> Dict[Tuple[str, str, str, str], float]:
+    """Map ``(source, target, partner, 'out'|'in')`` → port offset on that face.
+
+    Ports are grouped per node face so several links leaving the same side of a
+    box are spaced evenly along that side (easy to follow individually).
+    """
+    groups: Dict[Tuple[str, str, str], List[dict]] = defaultdict(list)
+    for e in draw_edges:
+        s, t = e.get('source', ''), e.get('target', '')
+        if s not in pos or t not in pos:
+            continue
+        x0, y0 = pos[s]
+        x1, y1 = pos[t]
+        groups[(s, _exit_face(x0, y0, x1, y1), 'out')].append(e)
+        groups[(t, _enter_face(x0, y0, x1, y1), 'in')].append(e)
+
+    port_of: Dict[Tuple[str, str, str, str], float] = {}
+    for (node, face, which), elist in groups.items():
+        def _sort_key(e: dict, _face: str = face, _which: str = which) -> tuple:
+            other = e['target'] if _which == 'out' else e['source']
+            ox, oy = pos[other]
+            # Order along the face: vertical faces by y, horizontal faces by x.
+            if _face in ('left', 'right'):
+                return (oy, str(e.get('partner', '')), other)
+            return (ox, str(e.get('partner', '')), other)
+
+        ordered = sorted(elist, key=_sort_key)
+        half = float(node_half.get(node, 0.18))
+        offs = _port_offsets(len(ordered), _face_port_span(half, len(ordered)))
+        for e, off in zip(ordered, offs):
+            key = (e['source'], e['target'], str(e.get('partner', '')), which)
+            port_of[key] = off
+    return port_of
 
 
 def _lane_offset(index: int, n_lanes: int, col_gap: float) -> float:
@@ -432,6 +526,107 @@ def _lane_offset(index: int, n_lanes: int, col_gap: float) -> float:
     if spread > max_spread:
         spread = max_spread
     return float(np.linspace(-spread, spread, n_lanes)[min(index, n_lanes - 1)])
+
+
+def _curve_bend(index: int, n: int, col_gap: float, *, strong: bool = False) -> float:
+    """Perpendicular arc offset (paper-style) for one of ``n`` parallel curves."""
+    if n <= 1:
+        return 0.28 if strong else 0.18
+    gap = 0.32 if strong else 0.24
+    spread = 0.5 * gap * (n - 1)
+    max_spread = max(0.70, 0.62 * float(col_gap))
+    if spread > max_spread:
+        spread = max_spread
+    return float(np.linspace(-spread, spread, n)[min(index, n - 1)])
+
+
+def _should_use_curve(
+    n_pair: int, n_lanes: int, n_edges: int, *, n_undirected: int = 1,
+) -> bool:
+    """Prefer orthogonal routes; switch to arcs when bundles would stack.
+
+    Same-direction multi-edges (several partners A→B) always get paper-style
+    arcs. Bidirectional and busy-corridor curves only kick in once the graph
+    is dense enough that Manhattan lanes would pile up.
+    """
+    if n_pair >= 2:
+        return True
+    if n_edges < 40:
+        return False
+    if n_undirected >= 2:
+        return True
+    if n_lanes >= 6:
+        return True
+    if n_edges >= 80 and n_lanes >= 4:
+        return True
+    return False
+
+
+def _facing_attach(
+    x0: float, y0: float, x1: float, y1: float,
+    *,
+    box_half_src: float,
+    box_half_dst: float,
+    port_src: float,
+    port_dst: float,
+) -> Tuple[float, float, float, float]:
+    """Exit/enter points on facing sides of source and target boxes."""
+    dx = x1 - x0
+    dy = y1 - y0
+    hs = max(0.08, float(box_half_src))
+    hd = max(0.08, float(box_half_dst))
+    if abs(dx) >= abs(dy):
+        if dx >= 0:
+            return x0 + hs, y0 + port_src, x1 - hd, y1 + port_dst
+        return x0 - hs, y0 + port_src, x1 + hd, y1 + port_dst
+    if dy >= 0:
+        return x0 + port_src, y0 + hs, x1 + port_dst, y1 - hd
+    return x0 + port_src, y0 - hs, x1 + port_dst, y1 + hd
+
+
+def _sample_quadratic(
+    sx: float, sy: float, cx: float, cy: float, tx: float, ty: float, n: int = 28,
+) -> List[Tuple[float, float]]:
+    """Sample a quadratic Bezier from ``(sx,sy)`` via control ``(cx,cy)`` to ``(tx,ty)``."""
+    ts = np.linspace(0.0, 1.0, max(8, int(n)))
+    pts: List[Tuple[float, float]] = []
+    for t in ts:
+        u = 1.0 - t
+        x = u * u * sx + 2.0 * u * t * cx + t * t * tx
+        y = u * u * sy + 2.0 * u * t * cy + t * t * ty
+        pts.append((float(x), float(y)))
+    return pts
+
+
+def _curve_route(
+    x0: float, y0: float, x1: float, y1: float,
+    *,
+    box_half_src: float,
+    box_half_dst: float,
+    bend: float,
+    port_src: float,
+    port_dst: float,
+    n_samples: int = 28,
+) -> List[Tuple[float, float]]:
+    """Smooth arc between facing box sides (A&A-style multi-edge curves).
+
+    Control point sits at the chord midpoint, offset perpendicular by ``bend``
+    so parallel reactions between the same pair fan apart instead of stacking.
+    """
+    sx, sy, tx, ty = _facing_attach(
+        x0, y0, x1, y1,
+        box_half_src=box_half_src, box_half_dst=box_half_dst,
+        port_src=port_src, port_dst=port_dst,
+    )
+    dx, dy = tx - sx, ty - sy
+    length = float(np.hypot(dx, dy))
+    if length < 1e-9:
+        return [(sx, sy), (tx, ty)]
+    # Unit perpendicular (left of travel direction).
+    px, py = -dy / length, dx / length
+    mx, my = 0.5 * (sx + tx), 0.5 * (sy + ty)
+    cx, cy = mx + px * float(bend), my + py * float(bend)
+    return _sample_quadratic(sx, sy, cx, cy, tx, ty, n=n_samples)
 
 
 def _dedupe_pathway_edges(edges: Sequence[dict]) -> List[dict]:
@@ -458,46 +653,38 @@ def _edge_route(
     lane: float,
     port_src: float,
     port_dst: float,
+    vertical_first: bool = False,
 ) -> List[Tuple[float, float]]:
     """Orthogonal route that starts/ends on the facing sides of both boxes.
 
     ``box_half_*`` are half-sizes of the source/target markers in data units so
     connectors meet each border.  ``port_*`` offsets slide the attachment
-    along that border.
+    along that border.  ``vertical_first`` flips the Manhattan bend order.
     """
+    sx, sy, tx, ty = _facing_attach(
+        x0, y0, x1, y1,
+        box_half_src=box_half_src, box_half_dst=box_half_dst,
+        port_src=port_src, port_dst=port_dst,
+    )
     dx = x1 - x0
     dy = y1 - y0
-    hs = max(0.08, float(box_half_src))
-    hd = max(0.08, float(box_half_dst))
+    prefer_h = abs(dx) >= abs(dy)
+    if vertical_first:
+        prefer_h = not prefer_h
 
-    if abs(dx) >= abs(dy):
-        # Mostly horizontal: leave left/right sides, port offset on y.
-        if dx >= 0:
-            sx, sy = x0 + hs, y0 + port_src
-            tx, ty = x1 - hd, y1 + port_dst
-        else:
-            sx, sy = x0 - hs, y0 + port_src
-            tx, ty = x1 + hd, y1 + port_dst
+    if prefer_h:
         if abs(sy - ty) < 1e-9 and abs(lane) < 1e-9:
             return [(sx, sy), (tx, ty)]
         xm = 0.5 * (sx + tx) + lane
         lo, hi = (sx, tx) if sx <= tx else (tx, sx)
         corridor = hi - lo
         if corridor > 0.25:
-            # Soft clamp: keep a small margin but prefer preserving lane gaps.
             margin = min(0.06, 0.12 * corridor)
             xm = min(max(xm, lo + margin), hi - margin)
         else:
             xm = 0.5 * (sx + tx) + 0.55 * lane
         return [(sx, sy), (xm, sy), (xm, ty), (tx, ty)]
 
-    # Mostly vertical: leave top/bottom sides, port offset on x.
-    if dy >= 0:
-        sx, sy = x0 + port_src, y0 + hs
-        tx, ty = x1 + port_dst, y1 - hd
-    else:
-        sx, sy = x0 + port_src, y0 - hs
-        tx, ty = x1 + port_dst, y1 + hd
     if abs(sx - tx) < 1e-9 and abs(lane) < 1e-9:
         return [(sx, sy), (tx, ty)]
     ym = 0.5 * (sy + ty) + lane
@@ -511,22 +698,194 @@ def _edge_route(
     return [(sx, sy), (sx, ym), (tx, ym), (tx, ty)]
 
 
+def _seg_hits_box(
+    x0: float, y0: float, x1: float, y1: float,
+    cx: float, cy: float, half: float, *, pad: float = 0.08,
+) -> bool:
+    """True if the segment passes through an expanded node box."""
+    r = max(0.10, float(half) + float(pad))
+    xmin, xmax = cx - r, cx + r
+    ymin, ymax = cy - r, cy + r
+    # Quick reject on bounding boxes.
+    if max(x0, x1) < xmin or min(x0, x1) > xmax:
+        return False
+    if max(y0, y1) < ymin or min(y0, y1) > ymax:
+        return False
+    length = float(np.hypot(x1 - x0, y1 - y0))
+    n = max(3, int(length / 0.06) + 1)
+    for t in np.linspace(0.0, 1.0, n):
+        # Skip the very ends — attachments sit on src/dst faces.
+        if t < 0.02 or t > 0.98:
+            continue
+        x = x0 + t * (x1 - x0)
+        y = y0 + t * (y1 - y0)
+        if xmin <= x <= xmax and ymin <= y <= ymax:
+            return True
+    return False
+
+
+def _polyline_hits_obstacles(
+    pts: Sequence[Tuple[float, float]],
+    obstacles: Dict[str, Tuple[float, float, float]],
+    skip: Set[str],
+    *,
+    pad: float = 0.08,
+) -> Optional[str]:
+    """Return the name of the first obstacle a polyline crosses, else None."""
+    if len(pts) < 2 or not obstacles:
+        return None
+    for i in range(len(pts) - 1):
+        x0, y0 = pts[i]
+        x1, y1 = pts[i + 1]
+        for name, (cx, cy, half) in obstacles.items():
+            if name in skip:
+                continue
+            if _seg_hits_box(x0, y0, x1, y1, cx, cy, half, pad=pad):
+                return name
+    return None
+
+
+def _detour_route(
+    x0: float, y0: float, x1: float, y1: float,
+    *,
+    box_half_src: float,
+    box_half_dst: float,
+    port_src: float,
+    port_dst: float,
+    obstacles: Dict[str, Tuple[float, float, float]],
+    skip: Set[str],
+    side: str = 'top',
+) -> List[Tuple[float, float]]:
+    """Manhattan detour above or below all obstacles between the endpoints."""
+    sx, sy, tx, ty = _facing_attach(
+        x0, y0, x1, y1,
+        box_half_src=box_half_src, box_half_dst=box_half_dst,
+        port_src=port_src, port_dst=port_dst,
+    )
+    x_lo, x_hi = (sx, tx) if sx <= tx else (tx, sx)
+    blocked: List[Tuple[float, float, float]] = []
+    for name, (cx, cy, half) in obstacles.items():
+        if name in skip:
+            continue
+        if x_lo - half <= cx <= x_hi + half:
+            blocked.append((cx, cy, half))
+    clear = 0.16
+    if blocked:
+        if side == 'top':
+            y_clear = max(cy + half for _, cy, half in blocked) + clear
+            y_clear = max(y_clear, sy + clear, ty + clear)
+        else:
+            y_clear = min(cy - half for _, cy, half in blocked) - clear
+            y_clear = min(y_clear, sy - clear, ty - clear)
+    else:
+        y_clear = 0.5 * (sy + ty) + (0.35 if side == 'top' else -0.35)
+    return [(sx, sy), (sx, y_clear), (tx, y_clear), (tx, ty)]
+
+
+def _route_avoiding_nodes(
+    x0: float, y0: float, x1: float, y1: float,
+    *,
+    box_half_src: float,
+    box_half_dst: float,
+    port_src: float,
+    port_dst: float,
+    lane: float,
+    bend: float,
+    prefer_curve: bool,
+    obstacles: Dict[str, Tuple[float, float, float]],
+    skip: Set[str],
+    col_gap: float,
+    n_samples: int = 24,
+) -> Tuple[List[Tuple[float, float]], str]:
+    """Pick a route that does not cross unrelated species boxes when possible.
+
+    Tries the preferred style first, then alternate orthogonal/curve options,
+    then an explicit above/below detour. Returns ``(points, style)``.
+    """
+    kw = dict(
+        box_half_src=box_half_src, box_half_dst=box_half_dst,
+        port_src=port_src, port_dst=port_dst,
+    )
+    candidates: List[Tuple[str, List[Tuple[float, float]]]] = []
+
+    if prefer_curve:
+        candidates.append(('curve', _curve_route(
+            x0, y0, x1, y1, bend=bend, n_samples=n_samples, **kw)))
+        for b in (bend, -bend, bend + 0.35, bend - 0.35, 0.55, -0.55, 0.85, -0.85):
+            if abs(b - bend) < 1e-9 and candidates:
+                continue
+            candidates.append(('curve', _curve_route(
+                x0, y0, x1, y1, bend=b, n_samples=n_samples, **kw)))
+        candidates.append(('ortho', _edge_route(
+            x0, y0, x1, y1, lane=lane, **kw)))
+        candidates.append(('ortho', _edge_route(
+            x0, y0, x1, y1, lane=lane, vertical_first=True, **kw)))
+    else:
+        candidates.append(('ortho', _edge_route(
+            x0, y0, x1, y1, lane=lane, **kw)))
+        candidates.append(('ortho', _edge_route(
+            x0, y0, x1, y1, lane=lane, vertical_first=True, **kw)))
+        for dlane in (0.25, -0.25, 0.45, -0.45, 0.65, -0.65):
+            candidates.append(('ortho', _edge_route(
+                x0, y0, x1, y1, lane=lane + dlane * max(0.5, col_gap * 0.2), **kw)))
+            candidates.append(('ortho', _edge_route(
+                x0, y0, x1, y1, lane=lane + dlane * max(0.5, col_gap * 0.2),
+                vertical_first=True, **kw)))
+        for b in (0.4, -0.4, 0.7, -0.7, 1.0, -1.0):
+            candidates.append(('curve', _curve_route(
+                x0, y0, x1, y1, bend=b, n_samples=n_samples, **kw)))
+
+    candidates.append(('detour', _detour_route(
+        x0, y0, x1, y1, side='top', obstacles=obstacles, skip=skip, **kw)))
+    candidates.append(('detour', _detour_route(
+        x0, y0, x1, y1, side='bottom', obstacles=obstacles, skip=skip, **kw)))
+
+    best_hit: Optional[Tuple[str, List[Tuple[float, float]]]] = None
+    for style, pts in candidates:
+        hit = _polyline_hits_obstacles(pts, obstacles, skip)
+        if hit is None:
+            return pts, style
+        if best_hit is None:
+            best_hit = (style, pts)
+    # Last resort: first candidate (still better than crashing).
+    if best_hit is not None:
+        return best_hit[1], best_hit[0]
+    return candidates[0][1], candidates[0][0]
+
+
 def _node_visual_style(
     degree: int,
     *,
     is_focal: bool = False,
     base_size: float = 40.0,
     base_half: float = 0.20,
+    label_chars: int = 1,
 ) -> Tuple[str, float, float]:
-    """Return ``(plotly_symbol, marker_size_px, box_half_data)`` from link degree."""
+    """Return ``(plotly_symbol, marker_size_px, box_half_data)``.
+
+    Size grows with link degree (hubs) and with formula length so long names
+    such as ``H213CO`` / ``SiOH+`` stay inside their box.
+    """
     if is_focal:
-        return 'square', base_size + 10.0, base_half * 1.15
-    if degree >= HUB_DEGREE_HEX:
-        # Wide hub: more perimeter for many attachments.
-        return 'hexagon', base_size + 16.0, base_half * 1.45
-    if degree >= HUB_DEGREE_CIRCLE:
-        return 'circle', base_size + 10.0, base_half * 1.25
-    return 'square', base_size, base_half
+        sym, sz, half = 'square', base_size + 10.0, base_half * 1.15
+    elif degree >= HUB_DEGREE_HEX:
+        sym, sz, half = 'hexagon', base_size + 16.0, base_half * 1.45
+    elif degree >= HUB_DEGREE_CIRCLE:
+        sym, sz, half = 'circle', base_size + 10.0, base_half * 1.25
+    else:
+        sym, sz, half = 'square', base_size, base_half
+
+    n = max(1, int(label_chars))
+    if n >= 4:
+        # Pixel width must cover the formula; ~7–8 px per character.
+        sz = max(sz, base_size * 0.55 + 7.5 * n)
+        half *= min(1.0 + 0.14 * (n - 3), 2.0)
+        # Long labels read better on a square name plate than a tight circle.
+        if n >= 6 and degree < HUB_DEGREE_HEX:
+            sym = 'square'
+    if is_focal and n >= 4:
+        sz = max(sz, base_size * 0.6 + 7.0 * n)
+    return sym, float(sz), float(half)
 
 
 def layout_rank_grid(
@@ -558,12 +917,12 @@ def layout_rank_grid(
     n_cols = len(ranks)
     max_col = max(len(by_rank[r]) for r in ranks)
     # Gaps grow with density; soft-caps keep the layout compressible onto one page.
-    col_gap = max(2.5, 2.15 + 0.20 * max_col + 0.09 * max(0, n_cols - 3))
-    row_gap = max(1.85, 1.45 + 0.20 * max_col)
-    max_span_x = 16.0
+    col_gap = max(2.6, 2.25 + 0.22 * max_col + 0.10 * max(0, n_cols - 3))
+    row_gap = max(1.95, 1.55 + 0.22 * max_col)
+    max_span_x = 18.5
     if n_cols > 1:
         col_gap = min(col_gap, max_span_x / (n_cols - 1))
-        col_gap = max(1.90, col_gap)
+        col_gap = max(2.05, col_gap)
 
     if 0 in by_rank:
         x_of = {r: float(ranks.index(r) - ranks.index(0)) * col_gap for r in ranks}
@@ -818,6 +1177,12 @@ def build_network_figure(
         include_ice=include_ice,
     )
     edges = _dedupe_pathway_edges(edges)
+    # Map highlight id onto a real node name (HCO⁺ → HCO+, etc.).
+    if hl:
+        by_key = {_species_match_key(n): n for n in nodes}
+        hl = by_key.get(_species_match_key(hl), hl)
+        if hl not in nodes:
+            hl = None
     if hl and hl not in nodes:
         hl = None
     status = dict(
@@ -854,9 +1219,9 @@ def build_network_figure(
     edge_width = 2.2 if n_edges < 40 else (1.7 if n_edges < 80 else 1.35)
     label_size = 15 if n_nodes < 28 else (13 if n_nodes < 50 else 11)
     mid_size = 12 if n_edges < 40 else 10
-    base_size = 38.0 if n_nodes < 28 else (30.0 if n_nodes < 50 else 24.0)
-    base_half = 0.18 if n_nodes < 28 else (0.15 if n_nodes < 50 else 0.13)
-    head_len = 0.12
+    base_size = 40.0 if n_nodes < 28 else (32.0 if n_nodes < 50 else 26.0)
+    base_half = 0.17 if n_nodes < 28 else (0.14 if n_nodes < 50 else 0.12)
+    head_len = 0.10
     col_gap = float(layout_meta.get('col_gap', 2.8))
     row_gap = float(layout_meta.get('row_gap', 1.6))
 
@@ -868,11 +1233,11 @@ def build_network_figure(
     data_h = (max(ys_fit) - min(ys_fit)) if ys_fit else 4.0
     max_col = int(layout_meta.get('max_col', 1) or 1)
     if n_nodes >= 30 or max_col >= 7:
-        target_span_x, target_span_y = 14.0, 8.6
+        target_span_x, target_span_y = 16.5, 10.2
     elif n_nodes >= 22 or max_col >= 5:
-        target_span_x, target_span_y = 15.0, 9.5
+        target_span_x, target_span_y = 17.5, 11.0
     else:
-        target_span_x, target_span_y = 16.0, 10.5
+        target_span_x, target_span_y = 18.5, 12.0
     sx = sy = 1.0
     if data_w > target_span_x and data_w > 1e-6:
         sx = target_span_x / data_w
@@ -895,48 +1260,121 @@ def build_network_figure(
     node_symbol: Dict[str, str] = {}
     node_size: Dict[str, float] = {}
     node_half: Dict[str, float] = {}
-    # Boxes must stay well under half the neighbour gap (labels + lanes need air).
-    max_half = 0.30 * min(max(col_gap, 1.0), max(row_gap, 1.0))
-    half_scale = max(0.70, min(1.0, min(sx, sy) * 1.05))
+    node_font: Dict[str, float] = {}
+    # Marker size is in pixels; routes use data units. Prefer a *slightly small*
+    # half so tips land on the visible border (oversized half → tips in empty space).
+    est_span_y = max(4.0, float(data_h)) + 2.8
+    est_span_x = max(4.0, float(data_w)) + 2.8
+    usable_h = float(PAGE_FIG_HEIGHT - 140)
+    usable_w = float(PAGE_FIG_WIDTH_EST - 80)
+    px_per = min(usable_h / est_span_y, usable_w / est_span_x)
+    px_per = max(px_per, 40.0)
+    half_cap = min(0.42 * max(col_gap, 1.0), 0.40 * max(row_gap, 1.0))
+    half_scale = max(0.72, min(1.0, min(sx, sy) * 1.02))
     for n in nodes:
-        sym, sz, half = _node_visual_style(
+        n_chars = _label_char_count(n)
+        sym, sz, half_style = _node_visual_style(
             degree.get(n, 0),
             is_focal=(n == focal_species),
             base_size=base_size,
             base_half=base_half,
+            label_chars=n_chars,
         )
         node_symbol[n] = sym
         node_size[n] = sz
-        node_half[n] = max(0.09, min(half * half_scale, max_half))
+        # ~0.40·size ≈ half-extent in px for square/circle markers (not full 0.5).
+        half_from_px = 0.40 * float(sz) / px_per
+        half_from_style = float(half_style) * half_scale
+        # Take the tighter of the two so arrows do not float past the drawn box.
+        node_half[n] = max(0.10, min(half_from_px, half_from_style, half_cap))
+        node_font[n] = _label_font_size(label_size, n_chars)
 
-    # Ports fan across each node's own face (wider on busy hubs).
-    out_ports = {
-        n: _port_offsets(c, _face_port_span(node_half.get(n, base_half), c))
-        for n, c in out_n.items()
-    }
-    in_ports = {
-        n: _port_offsets(c, _face_port_span(node_half.get(n, base_half), c))
-        for n, c in in_n.items()
-    }
-    out_i: Dict[str, int] = defaultdict(int)
-    in_i: Dict[str, int] = defaultdict(int)
     lane_i: Dict[Tuple[int, int], int] = defaultdict(int)
     lane_totals: Dict[Tuple[int, int], int] = defaultdict(int)
+    pair_i: Dict[Tuple[str, str], int] = defaultdict(int)
+    pair_totals: Dict[Tuple[str, str], int] = defaultdict(int)
     for ee in edges:
         a = int(rank.get(ee['source'], 0))
         b = int(rank.get(ee['target'], 0))
         lane_totals[(min(a, b), max(a, b))] += 1
+        pair_totals[(ee['source'], ee['target'])] += 1
 
     annotations = []
     legend_shown: Set[str] = set()
     route_xs: List[float] = []
     route_ys: List[float] = []
+    n_curve = 0
+    n_ortho = 0
+    n_detour = 0
+
+    # Node boxes used as routing obstacles (avoid crossing intermediate species).
+    obstacles: Dict[str, Tuple[float, float, float]] = {
+        n: (pos[n][0], pos[n][1], node_half[n]) for n in nodes if n in pos
+    }
+
+    # Clicked species + direct neighbours (fully solid when highlighting).
+    related: Set[str] = set()
+    if hl:
+        related.add(hl)
+        for e in edges:
+            if e['source'] == hl:
+                related.add(e['target'])
+            if e['target'] == hl:
+                related.add(e['source'])
+
+    others = sorted(n for n in nodes if n != focal_species and n in pos)
+    shape_note = {
+        'square': '',
+        'circle': '<br><i>hub (≥%d links)</i>' % HUB_DEGREE_CIRCLE,
+        'hexagon': '<br><i>busy hub (≥%d links)</i>' % HUB_DEGREE_HEX,
+    }
+
+    def _species_hover(n: str) -> str:
+        labs = sorted({e['raw'] for e in edges
+                       if e['source'] == n or e['target'] == n})
+        bits = [n, shape_note.get(node_symbol.get(n, 'square'), '')]
+        if hl and n in related:
+            bits.append(f'<br><b>On path with {hl}</b>')
+        bits.append('<br><i>Click to highlight links</i>')
+        if labs:
+            bits.append('<br>' + '<br>'.join(labs[:6]))
+        return ''.join(bits)
+
+    # Ghost unrelated species first (behind edges); related drawn fully opaque later.
+    if hl and others:
+        dim_nodes = [n for n in others if n not in related]
+        if dim_nodes:
+            fig.add_trace(go.Scatter(
+                x=[pos[n][0] for n in dim_nodes],
+                y=[pos[n][1] for n in dim_nodes],
+                mode='markers+text',
+                text=[_format_node_label(n) for n in dim_nodes],
+                textposition='middle center',
+                textfont=dict(
+                    size=[max(9, node_font.get(n, label_size) - 1) for n in dim_nodes],
+                    color='#c0c0c0',
+                ),
+                customdata=dim_nodes,
+                marker=dict(
+                    symbol=[node_symbol[n] for n in dim_nodes],
+                    size=[node_size[n] for n in dim_nodes],
+                    color='#f3f3f3',
+                    line=dict(color='#d0d0d0', width=1.0),
+                ),
+                opacity=0.22,
+                hovertext=[_species_hover(n) for n in dim_nodes],
+                hoverinfo='text',
+                showlegend=False, name='species-dim',
+                cliponaxis=True,
+            ))
 
     # When highlighting, omit unrelated links entirely (avoids orphan stubs).
     draw_edges = [
         e for e in edges
         if hl is None or e['source'] == hl or e['target'] == hl
     ]
+    # Per-face ports: many links on the same box side sit next to each other.
+    face_ports = _assign_face_ports(draw_edges, pos, node_half)
     ordered = sorted(
         draw_edges,
         key=lambda e: (e.get('partner', ''), e['source'], e['target']),
@@ -949,55 +1387,92 @@ def build_network_figure(
         leg, color, dash = PARTNER_STYLES.get(pclass, PARTNER_STYLES['other'])
         x0, y0 = pos[e['source']]
         x1, y1 = pos[e['target']]
-        oi = out_i[e['source']]
-        out_i[e['source']] = oi + 1
-        ii = in_i[e['target']]
-        in_i[e['target']] = ii + 1
-        port_src = out_ports[e['source']][min(oi, len(out_ports[e['source']]) - 1)]
-        port_dst = in_ports[e['target']][min(ii, len(in_ports[e['target']]) - 1)]
+        partner = str(e.get('partner', ''))
+        port_src = face_ports.get((e['source'], e['target'], partner, 'out'), 0.0)
+        port_dst = face_ports.get((e['source'], e['target'], partner, 'in'), 0.0)
         r0 = int(rank.get(e['source'], 0))
         r1 = int(rank.get(e['target'], 0))
         col_key = (min(r0, r1), max(r0, r1))
         li = lane_i[col_key]
         lane_i[col_key] = li + 1
         n_lanes = max(1, lane_totals.get(col_key, 1))
+        pair_key = (e['source'], e['target'])
+        pi = pair_i[pair_key]
+        pair_i[pair_key] = pi + 1
+        n_pair = max(1, pair_totals.get(pair_key, 1))
+        # Opposite-direction reactions between the same species pair.
+        rev_n = pair_totals.get((e['target'], e['source']), 0)
+        n_undirected = n_pair + rev_n
+        use_curve = _should_use_curve(
+            n_pair, n_lanes, n_edges, n_undirected=n_undirected,
+        )
+        if n_pair >= 2:
+            bend = _curve_bend(pi, n_pair, col_gap, strong=True)
+        elif rev_n > 0:
+            bend = _curve_bend(0, max(2, n_undirected), col_gap, strong=True)
+            bend = abs(bend) * (
+                1.0 if (e['source'], e['target']) < (e['target'], e['source']) else -1.0
+            )
+        else:
+            bend = _curve_bend(li, max(n_lanes, 2), col_gap, strong=False)
         lane = _lane_offset(li, n_lanes, col_gap)
-        pts = _edge_route(
+        pts, style = _route_avoiding_nodes(
             x0, y0, x1, y1,
             box_half_src=node_half[e['source']],
             box_half_dst=node_half[e['target']],
-            lane=lane,
             port_src=port_src, port_dst=port_dst,
+            lane=lane, bend=bend,
+            prefer_curve=use_curve,
+            obstacles=obstacles,
+            skip={e['source'], e['target']},
+            col_gap=col_gap,
+            n_samples=26 if n_edges < 90 else 20,
         )
+        if style == 'curve':
+            n_curve += 1
+        elif style == 'detour':
+            n_detour += 1
+            n_ortho += 1
+        else:
+            n_ortho += 1
         for px, py in pts:
             route_xs.append(px)
             route_ys.append(py)
-        width = edge_width + (0.6 if hl else 0.0)
+        width = edge_width + (1.4 if hl else 0.0)
         if len(pts) >= 2:
             ax0, ay0 = pts[-2]
-            tip_x, tip_y = pts[-1]
+            tip_x, tip_y = pts[-1]  # exactly on the target box face
             dx, dy = tip_x - ax0, tip_y - ay0
             length = float(np.hypot(dx, dy))
             if length > 1e-9:
                 ux, uy = dx / length, dy / length
-                tip_x = tip_x - ux * 0.02
-                tip_y = tip_y - uy * 0.02
-                pts = list(pts[:-1]) + [(tip_x, tip_y)]
+                # Keep the arrow tip on the box face; shorten only the stroked
+                # line so the head sits on the border (not floating in empty space).
+                line_gap = min(0.025, 0.18 * length)
+                pts = list(pts[:-1]) + [
+                    (tip_x - ux * line_gap, tip_y - uy * line_gap)
+                ]
                 annotations.append(dict(
                     x=tip_x, y=tip_y,
                     ax=tip_x - ux * head_len, ay=tip_y - uy * head_len,
                     xref='x', yref='y', axref='x', ayref='y',
-                    showarrow=True, arrowhead=3, arrowsize=1.15,
-                    arrowwidth=max(1.2, width * 0.85),
+                    showarrow=True, arrowhead=3, arrowsize=1.05,
+                    arrowwidth=max(1.15, width * 0.8),
                     arrowcolor=color, text='',
+                    opacity=1.0,
                 ))
+        # Also pin the route start exactly on the source box face (already from
+        # _facing_attach); record start for axis padding.
+        if pts:
+            route_xs.append(pts[0][0])
+            route_ys.append(pts[0][1])
         mid = e.get('mid_label') or ''
         # Hide mid-edge partner text on dense graphs — it collides with nodes/lanes.
         if mid and pclass == 'other' and n_edges < 55:
-            mid_i = max(0, len(pts) // 2 - 1)
+            mid_i = max(0, len(pts) // 2)
             mx, my = pts[mid_i]
             annotations.append(dict(
-                x=mx, y=my + 0.14, xref='x', yref='y',
+                x=mx, y=my + 0.12, xref='x', yref='y',
                 text=mid, showarrow=False,
                 font=dict(size=mid_size, color=color),
                 bgcolor=paper, borderpad=1,
@@ -1010,117 +1485,197 @@ def build_network_figure(
         fig.add_trace(go.Scatter(
             x=[p[0] for p in pts], y=[p[1] for p in pts], mode='lines',
             line=dict(color=color, width=width, dash=dash),
+            opacity=1.0,
             hoverinfo='text', hovertext=hover,
             name=leg, legendgroup=pclass,
             showlegend=show_leg,
         ))
 
-    # Species markers: shape follows degree (square / circle / hexagon).
-    others = sorted(n for n in nodes if n != focal_species and n in pos)
+    # Keep routing mix available for tests / status (not shown in UI).
+    status['n_curve'] = n_curve
+    status['n_ortho'] = n_ortho
+    status['n_detour'] = n_detour
+
+    # Related / normal species on top — always fully opaque (no reduced opacity).
     if others:
-        hover = []
-        opacities = []
-        shape_note = {
-            'square': '',
-            'circle': '<br><i>hub (≥%d links)</i>' % HUB_DEGREE_CIRCLE,
-            'hexagon': '<br><i>busy hub (≥%d links)</i>' % HUB_DEGREE_HEX,
-        }
-        for n in others:
-            labs = sorted({e['raw'] for e in edges
-                           if e['source'] == n or e['target'] == n})
-            hover.append(
-                n
-                + shape_note.get(node_symbol.get(n, 'square'), '')
-                + '<br><i>Click to highlight links</i>'
-                + ('<br>' + '<br>'.join(labs[:6]) if labs else '')
-            )
-            if hl is None or n == hl or any(
-                (e['source'] == hl and e['target'] == n)
-                or (e['target'] == hl and e['source'] == n)
-                for e in edges
-            ):
-                opacities.append(1.0)
-            else:
-                opacities.append(0.35)
-        fig.add_trace(go.Scatter(
-            x=[pos[n][0] for n in others],
-            y=[pos[n][1] for n in others],
-            mode='markers+text',
-            text=[_format_node_label(n) for n in others],
-            textposition='middle center',
-            textfont=dict(size=label_size, color=font),
-            customdata=others,
-            marker=dict(
-                symbol=[node_symbol[n] for n in others],
-                size=[node_size[n] for n in others],
-                color=plot_bg if plot_bg != 'rgba(0,0,0,0)' else 'white',
-                line=dict(color=font, width=1.5),
-                opacity=opacities,
-            ),
-            hovertext=hover, hoverinfo='text',
-            showlegend=False, name='species',
-        ))
+        if hl:
+            rel_nodes = [n for n in others if n in related]
+            if rel_nodes:
+                fig.add_trace(go.Scatter(
+                    x=[pos[n][0] for n in rel_nodes],
+                    y=[pos[n][1] for n in rel_nodes],
+                    mode='markers+text',
+                    text=[_format_node_label(n) for n in rel_nodes],
+                    textposition='middle center',
+                    textfont=dict(
+                        size=[max(label_size, node_font.get(n, label_size))
+                              for n in rel_nodes],
+                        color='#111111',
+                    ),
+                    customdata=rel_nodes,
+                    marker=dict(
+                        symbol=[node_symbol[n] for n in rel_nodes],
+                        size=[node_size[n] * (1.15 if n == hl else 1.06)
+                              for n in rel_nodes],
+                        # Solid fills — never translucent.
+                        color=['#ffd24d' if n == hl else '#ffffff' for n in rel_nodes],
+                        line=dict(
+                            color=['#8a6d00' if n == hl else '#111111'
+                                   for n in rel_nodes],
+                            width=3.0,
+                        ),
+                    ),
+                    opacity=1.0,
+                    hovertext=[_species_hover(n) for n in rel_nodes],
+                    hoverinfo='text',
+                    showlegend=False, name='species-related',
+                    cliponaxis=True,
+                ))
+        else:
+            fig.add_trace(go.Scatter(
+                x=[pos[n][0] for n in others],
+                y=[pos[n][1] for n in others],
+                mode='markers+text',
+                text=[_format_node_label(n) for n in others],
+                textposition='middle center',
+                textfont=dict(
+                    size=[node_font.get(n, label_size) for n in others],
+                    color=font,
+                ),
+                customdata=others,
+                marker=dict(
+                    symbol=[node_symbol[n] for n in others],
+                    size=[node_size[n] for n in others],
+                    color=plot_bg if plot_bg != 'rgba(0,0,0,0)' else 'white',
+                    line=dict(color=font, width=1.5),
+                ),
+                opacity=1.0,
+                hovertext=[_species_hover(n) for n in others],
+                hoverinfo='text',
+                showlegend=False, name='species',
+                cliponaxis=True,
+            ))
 
     if focal_species in pos:
         fx, fy = pos[focal_species]
-        fig.add_trace(go.Scatter(
-            x=[fx], y=[fy], mode='markers+text',
-            text=[_format_node_label(focal_species)],
-            textposition='middle center',
-            textfont=dict(size=label_size + 1, color=font),
-            customdata=[focal_species],
-            marker=dict(
-                symbol=node_symbol.get(focal_species, 'square'),
-                size=node_size.get(focal_species, base_size + 10),
-                color='#9ecae1',
-                line=dict(color='#2171b5', width=2.2),
-            ),
-            hovertext=(
-                f'{focal_species}<br><i>Click to highlight links</i>'
-                + (f'<br><b>Highlighting: {hl}</b>' if hl else '')
-            ),
-            hoverinfo='text',
-            showlegend=False, name='focus',
-        ))
+        focal_related = (hl is None) or (focal_species in related)
+        if focal_related:
+            # Same solid treatment as other related boxes (gold if clicked).
+            if hl and focal_species == hl:
+                fill, border = '#ffd24d', '#8a6d00'
+            elif hl:
+                fill, border = '#ffffff', '#111111'
+            else:
+                fill, border = '#7ec0ee', '#111111'
+            fig.add_trace(go.Scatter(
+                x=[fx], y=[fy], mode='markers+text',
+                text=[_format_node_label(focal_species)],
+                textposition='middle center',
+                textfont=dict(
+                    size=max(label_size + 1, node_font.get(focal_species, label_size + 1)),
+                    color='#111111',
+                ),
+                customdata=[focal_species],
+                marker=dict(
+                    symbol=node_symbol.get(focal_species, 'square'),
+                    size=node_size.get(focal_species, base_size + 10) * (1.12 if hl else 1.0),
+                    color=fill,
+                    line=dict(color=border, width=3.0),
+                ),
+                opacity=1.0,
+                hovertext=(
+                    f'{focal_species}'
+                    + (f'<br><b>On path with {hl}</b>' if hl else '')
+                    + '<br><i>Click to highlight links</i>'
+                    + (f'<br><b>Highlighting: {hl}</b>' if hl else '')
+                ),
+                hoverinfo='text',
+                showlegend=False, name='focus',
+                cliponaxis=True,
+            ))
+        else:
+            fig.add_trace(go.Scatter(
+                x=[fx], y=[fy], mode='markers+text',
+                text=[_format_node_label(focal_species)],
+                textposition='middle center',
+                textfont=dict(
+                    size=node_font.get(focal_species, label_size + 1),
+                    color='#c0c0c0',
+                ),
+                customdata=[focal_species],
+                marker=dict(
+                    symbol=node_symbol.get(focal_species, 'square'),
+                    size=node_size.get(focal_species, base_size + 10),
+                    color='#f3f3f3',
+                    line=dict(color='#d0d0d0', width=1.0),
+                ),
+                opacity=0.22,
+                hovertext=(
+                    f'{focal_species}<br><i>Click to highlight links</i>'
+                    + (f'<br><b>Highlighting: {hl}</b>' if hl else '')
+                ),
+                hoverinfo='text',
+                showlegend=False, name='focus',
+                cliponaxis=True,
+            ))
 
-    # Use the full Graph area; keep height page-safe (isotopes must not grow off-screen).
+    # Keep all content (nodes, curved bows, legend) inside the page-safe canvas.
+    # Marker sizes are in pixels — pad axes in data units so boxes are not clipped
+    # at the plot frame; keep the Partner legend inside the figure (not below it).
     xs_all = [p[0] for p in pos.values()] + route_xs
     ys_all = [p[1] for p in pos.values()] + route_ys
     half_pad = max(node_half.values()) if node_half else base_half
-    xs_all.extend([min(xs_all) - half_pad, max(xs_all) + half_pad] if xs_all else [])
-    ys_all.extend([min(ys_all) - half_pad, max(ys_all) + half_pad] if ys_all else [])
+    # Extra room for marker radius + curve bows near the frame.
+    marker_pad = max(0.45, half_pad * 2.2)
+    if xs_all:
+        xs_all.extend([min(xs_all) - marker_pad, max(xs_all) + marker_pad])
+    if ys_all:
+        ys_all.extend([min(ys_all) - marker_pad, max(ys_all) + marker_pad])
     fig_h = int(PAGE_FIG_HEIGHT)
 
     subtitle = ''
     if hl:
-        subtitle = f'  ·  highlighting links of {hl} (click empty / Clear to reset)'
+        n_rel = max(0, len(related) - 1)
+        subtitle = (
+            f'  ·  highlighting {hl} and {n_rel} linked species '
+            f'(click empty / Clear to reset)'
+        )
     fig.update_layout(
         title=dict(
             text=(title or f'Reaction pathway network — {focal_species}') + subtitle,
-            font=dict(size=15, color=title_c), x=0.02, xanchor='left'),
+            font=dict(size=15, color=title_c), x=0.02, xanchor='left',
+            y=0.995, yanchor='top', pad=dict(t=2, b=4)),
         paper_bgcolor=paper,
         plot_bgcolor=plot_bg,
         autosize=True,
         height=fig_h,
-        margin=dict(l=16, r=16, t=48, b=56),
+        # Legend sits in the top band (not y<0), so it cannot push past the page.
+        margin=dict(l=28, r=28, t=108, b=24),
         font=dict(family='Arial, sans-serif', size=14, color=font),
         showlegend=True,
         legend=dict(
-            title=dict(text='Partner', font=dict(size=13)),
-            bgcolor=t.get('legend_bg', 'rgba(255,255,255,0.9)'),
+            title=dict(text='Partner', font=dict(size=12)),
+            bgcolor=t.get('legend_bg', 'rgba(255,255,255,0.92)'),
             bordercolor=t.get('legend_border', '#ccc'),
             borderwidth=1,
-            orientation='h', y=-0.05, x=0, font=dict(size=13),
+            orientation='h',
+            x=0.0, xanchor='left',
+            y=1.0, yanchor='bottom',
+            font=dict(size=12),
+            tracegroupgap=4,
+            itemsizing='constant',
+            valign='middle',
         ),
         xaxis=dict(visible=False, showgrid=False, zeroline=False,
-                   range=_pad_range(xs_all, pad=0.05),
-                   automargin=False),
+                   range=_pad_range(xs_all, pad=0.04, abs_pad=0.12),
+                   automargin=False, fixedrange=False),
         yaxis=dict(visible=False, showgrid=False, zeroline=False,
-                   range=_pad_range(ys_all, pad=0.06),
-                   automargin=False),
+                   range=_pad_range(ys_all, pad=0.05, abs_pad=0.15),
+                   automargin=False, fixedrange=False),
         annotations=annotations,
         uirevision=(f'pathnet|{focal_species}|{up}|{down}|'
-                    f'iso={int(bool(include_isotopes))}|ice={int(bool(include_ice))}'),
+                    f'iso={int(bool(include_isotopes))}|ice={int(bool(include_ice))}|'
+                    f'hl={hl or ""}'),
         hovermode='closest',
         clickmode='event+select',
     )
@@ -1172,7 +1727,7 @@ def status_message(status: dict) -> str:
         f'{status.get("n_nodes", 0)} species, {status.get("n_edges", 0)} links '
         f'(upstream {status.get("upstream_depth")}, '
         f'downstream {status.get("downstream_depth")}{extra}). '
-        f'Click a box to isolate its links.'
+        f'Click a box to isolate its links and highlight linked species.'
     )
 
 

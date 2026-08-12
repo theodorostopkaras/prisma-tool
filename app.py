@@ -5389,8 +5389,8 @@ app.layout = html.Div(
                     figure=placeholder_fig(),
                     config={**_GRAPH_CFG, 'responsive': True},
                     style={'width': '100%', 'maxWidth': '100%',
-                           'height': 'min(900px, 78vh)', 'maxHeight': '900px',
-                           'minHeight': '640px', 'marginBottom': '16px',
+                           'height': '1020px', 'maxHeight': '1020px',
+                           'minHeight': '720px', 'marginBottom': '16px',
                            'overflow': 'hidden'},
                 ),
             ]),
@@ -7314,6 +7314,7 @@ def update_reaction_plots(*args_in):
 def update_react_net_highlight(click_data, clear_clicks, species, current):
     """Click a species box to isolate its links; Clear / species change resets."""
     from dash import ctx
+    import re
     trig = getattr(ctx, 'triggered_id', None)
     if trig in ('btn-react-net-clear', 'react-species'):
         return None
@@ -7324,14 +7325,25 @@ def update_react_net_highlight(click_data, clear_clicks, species, current):
         return current
     pt = pts[0]
     # Node traces carry plain species names in customdata.
+    name = None
     cd = pt.get('customdata')
     if isinstance(cd, (list, tuple)):
         cd = cd[0] if cd else None
-    if cd:
-        name = str(cd)
-        # Toggle off if the same box is clicked again.
-        return None if current == name else name
-    return current
+    if cd is not None and str(cd).strip():
+        name = str(cd).strip()
+    if not name:
+        # Fallback: marker text may be HTML-formatted (CO⁺, H₂O, …).
+        raw = pt.get('text')
+        if raw:
+            plain = re.sub(r'<[^>]+>', '', str(raw)).strip()
+            # Reject empty / multi-line hover garbage; species labels are short.
+            if plain and '\n' not in plain and len(plain) <= 24:
+                name = plain
+    if not name:
+        # Clicked an edge / empty area — keep current highlight.
+        return current
+    # Toggle off if the same box is clicked again.
+    return None if current == name else name
 
 
 @app.callback(

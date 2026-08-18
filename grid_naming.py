@@ -9,6 +9,10 @@ Shorter encodings are expanded to the full six-token tuple internally:
 * 5 tokens ``DD_MM_FF_ZZ_CC`` — ``atten = 0``
 * 4 tokens ``DD_MM_FF_00`` — metallicity from the fourth token (often fixed
   ``00``); cosmic-ray rate and attenuation use defaults (no CR grid axis)
+
+Physical values (n_H, M, χ, Z, ζ) can be mapped onto the same integer tokens
+with ``physical_values_to_tokens`` when a filename does not follow this
+convention.
 """
 
 from __future__ import annotations
@@ -20,10 +24,24 @@ from typing import Optional, Tuple
 N_GRID_PARAMS = 6
 MIN_GRID_PARAMS = 4
 DEFAULT_ATTEN_TOKEN = 0
+DEFAULT_MASS_TOKEN = 0       # 10^(0/10) = 1 Msun
+DEFAULT_FUV_TOKEN = 0        # 10^(0/10) = 1 Draine
+DEFAULT_METAL_TOKEN = 10     # 10^((10-10)/10) = 1 Zsun
 # ζ = 2×10⁻¹⁷ s⁻¹ when CR is omitted from filenames (decode: 10^(-token) s⁻¹).
 DEFAULT_CRIR_RATE_S = 2e-17
 DEFAULT_CRIR_TOKEN = -math.log10(DEFAULT_CRIR_RATE_S)
 PARAM_KEYS = ('density', 'mass', 'fuv', 'metal', 'crir', 'atten')
+
+# Encoded filename tokens are compact integers, not physical values
+# (n_H=1e5 → 50, not 100000).  Used to reject lookalike names.
+ENCODED_TOKEN_RANGES = {
+    'density': (-40, 120),
+    'mass': (-80, 120),
+    'fuv': (-40, 120),
+    'metal': (-20, 50),
+    'crir': (0, 40),
+    'atten': (0, 99),
+}
 
 # KoSens / map_fit meshgrid dict keys for each parameter axis.
 PARAM_MESH_KEYS = {
@@ -208,3 +226,70 @@ def parse_model_tokens_from_stem(stem: str) -> Optional[Tuple[int, ...]]:
     if tag_idx is None:
         return None
     return parse_model_tokens_from_parts(parts, tag_idx)
+
+
+def tokens_look_encoded(tokens) -> bool:
+    """True when a 6-token tuple looks like KoSens encoded integers, not physical values."""
+    if tokens is None or len(tokens) != N_GRID_PARAMS:
+        return False
+    for key, tok in zip(PARAM_KEYS, tokens):
+        lo, hi = ENCODED_TOKEN_RANGES[key]
+        try:
+            value = float(tok)
+        except (TypeError, ValueError):
+            return False
+        if not (lo <= value <= hi):
+            return False
+    return True
+
+
+def encode_param(key: str, value) -> Optional[int]:
+    """Map a physical grid value onto the integer filename token for ``key``."""
+    if value is None:
+        return None
+    try:
+        phys = abs(float(value)) if key == 'crir' else float(value)
+    except (TypeError, ValueError):
+        return None
+    if key == 'atten':
+        return int(round(phys))
+    if not math.isfinite(phys) or phys <= 0:
+        return None
+    if key in ('density', 'mass', 'fuv'):
+        return int(round(10.0 * math.log10(phys)))
+    if key == 'metal':
+        return int(round(10.0 * math.log10(phys) + 10.0))
+    if key == 'crir':
+        return int(round(-math.log10(phys)))
+    return None
+
+
+def physical_values_to_tokens(
+    density=None,
+    mass=None,
+    fuv=None,
+    metal=None,
+    crir=None,
+    atten=None,
+) -> Optional[Tuple]:
+    """Encode physical PDR parameters as a 6-token grid key.
+
+    Density is required.  Missing mass / FUV / metallicity / CRIR / attenuation
+    fall back to the same defaults used for short filenames.
+    """
+    dens_t = encode_param('density', density)
+    if dens_t is None:
+        return None
+    mass_t = encode_param('mass', mass)
+    fuv_t = encode_param('fuv', fuv)
+    metal_t = encode_param('metal', metal)
+    crir_t = encode_param('crir', crir)
+    atten_t = encode_param('atten', atten)
+    return (
+        dens_t,
+        mass_t if mass_t is not None else DEFAULT_MASS_TOKEN,
+        fuv_t if fuv_t is not None else DEFAULT_FUV_TOKEN,
+        metal_t if metal_t is not None else DEFAULT_METAL_TOKEN,
+        crir_t if crir_t is not None else DEFAULT_CRIR_TOKEN,
+        atten_t if atten_t is not None else DEFAULT_ATTEN_TOKEN,
+    )

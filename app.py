@@ -19,6 +19,11 @@ model parameters:
                 |  +-------------- MM : clump mass                  -> 10^(MM/10) Msun
                 +----------------- DD : gas density n_H             -> 10^(DD/10) cm^-3
 
+When a filename does not follow that convention, grid values are read from the
+HDF5 itself (``protdens``, ``cmass``, ``radm_ini``, ``metal``, ``cosray`` /
+``zeta``).  A single imported model still loads; a set of such files still
+builds a grid from whichever parameters vary.
+
 The tool scans a directory of such files, works out which parameters vary,
 and exposes one slider per varying parameter.  The current grid varies
 density x FUV x CRIR (a 3-D cube) at fixed mass/metallicity, but the code is
@@ -44,7 +49,7 @@ import numpy as np
 import h5py
 
 import dash
-from dash import dcc, html, Input, Output, State
+from dash import dcc, html, Input, Output, State, ALL
 from dash.exceptions import PreventUpdate
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -74,7 +79,7 @@ DEFAULT_DIR = '/home/teotopkaras/Desktop/Projects/Models/new_teo_grid/pdrgrid_hd
 
 parser = argparse.ArgumentParser(description="KOSMA-tau Grid Explorer")
 parser.add_argument('--dir', default=DEFAULT_DIR, type=str,
-                    help='Directory containing the per-model .hdf5 files.')
+                    help='Directory of per-model .hdf5 files, or a single .hdf5 model.')
 parser.add_argument('--recursive', action='store_true',
                     help='Search the directory tree recursively for .hdf5 files.')
 parser.add_argument('--port',  default=8050, type=int)
@@ -495,14 +500,228 @@ def _plane_by_slot(slot_id):
 
 
 def parse_filename(fname):
-    """Return a tuple of 6 integer tokens (DD, MM, FF, ZZ, CC, AA) or None.
+    """Return a tuple of 6 encoded tokens (DD, MM, FF, ZZ, CC, AA) or None.
 
     Works for both ``Model<tag>_DD_MM_FF_ZZ_CC_AA.hdf5`` and
     ``Model<tag>_DD_MM_FF_ZZ_CC.hdf5`` (missing ``AA`` -> atten 0), plus
-    chemistry-grid ``chem_Model<tag>_…`` names.
+    chemistry-grid ``chem_Model<tag>_…`` names.  Names that parse as numbers
+    but are physical values (e.g. ``n_H=100000`` instead of token ``50``)
+    return None so the HDF5 fallback can run.
     """
     stem = os.path.splitext(os.path.basename(fname))[0]
-    return gn.parse_model_tokens_from_stem(stem)
+    tokens = gn.parse_model_tokens_from_stem(stem)
+    if tokens is None or not gn.tokens_look_encoded(tokens):
+        return None
+    return tokens
+
+
+def _hdf5_cell_float(cell):
+    """Parse one HDF5 cell (numeric, bytes, or string) to float, or None."""
+    if cell is None:
+        return None
+    if isinstance(cell, (bytes, np.bytes_)):
+        text = cell.decode('utf-8', 'replace').strip()
+        if not text:
+            return None
+        try:
+            value = float(text)
+        except ValueError:
+            return None
+        return value if np.isfinite(value) else None
+    if isinstance(cell, str):
+        text = cell.strip()
+        if not text:
+            return None
+        try:
+            value = float(text)
+        except ValueError:
+            return None
+        return value if np.isfinite(value) else None
+    try:
+        value = float(cell)
+    except (TypeError, ValueError):
+        return None
+    return value if np.isfinite(value) else None
+
+
+def _hdf5_first_float(hf, path, idx):
+    """First (surface / initial) value of a metadata-mapped HDF5 column."""
+    try:
+        arr = np.asarray(hf[path][:])
+    except (KeyError, TypeError, OSError, ValueError):
+        return None
+    if arr.size == 0:
+        return None
+    if arr.ndim == 0:
+        return _hdf5_cell_float(arr.item())
+    if arr.ndim == 1:
+        if 0 <= int(idx) < arr.size:
+            value = _hdf5_cell_float(arr[int(idx)])
+            if value is not None:
+                return value
+        return _hdf5_cell_float(arr[0])
+    col = int(idx) if 0 <= int(idx) < arr.shape[1] else 0
+    return _hdf5_cell_float(arr[0, col])
+
+
+def _hdf5_wanted_field_map(hf, wanted):
+    """Map selected metadata keys to ``(dataset_path, column_index)``."""
+    field_map = {}
+    if METADATA_PATH not in hf:
+        return field_map
+    try:
+        md = hf[METADATA_PATH][:]
+    except (KeyError, TypeError, OSError):
+        return field_map
+    for row in md:
+        key = _dec(row[3])
+        if key not in wanted or key in field_map:
+            continue
+        group = _dec(row[0])
+        dset = _dec(row[1])
+        try:
+            idx = int(float(_dec(row[2])))
+        except (ValueError, TypeError):
+            continue
+        path = group.rstrip('/') + '/' + dset
+        field_map[key] = (path, idx)
+        if len(field_map) >= len(wanted):
+            break
+    return field_map
+
+
+_PDR_CONFIG_PATHS = ('Parameters/pdr_config.json', 'pdr_config.json')
+_PDR_CONFIG_KEY_MAP = {
+    'surface_density': 'density',
+    'radiation_field_strength': 'fuv',
+    'cosmic_ray_rate': 'crir',
+    'metallicity': 'metal',
+}
+_PDR_CONFIG_RE = re.compile(
+    r'"(surface_density|radiation_field_strength|cosmic_ray_rate|metallicity)"'
+    r'\s*:\s*([-+0-9.eE]+)'
+)
+
+
+def _pdr_config_physicals(hf):
+    """Fill missing grid params from an embedded ``pdr_config.json`` dataset."""
+    out = {}
+    ds = None
+    for path in _PDR_CONFIG_PATHS:
+        if path in hf:
+            ds = hf[path]
+            break
+    if ds is None:
+        return out
+    try:
+        arr = np.asarray(ds[()])
+    except (TypeError, OSError, ValueError):
+        return out
+    chunks = []
+    for cell in np.ravel(arr):
+        if isinstance(cell, (bytes, np.bytes_)):
+            chunks.append(cell.decode('utf-8', 'replace'))
+        else:
+            chunks.append(str(cell))
+    for raw_key, raw_val in _PDR_CONFIG_RE.findall('\n'.join(chunks)):
+        param = _PDR_CONFIG_KEY_MAP.get(raw_key)
+        if param is None or param in out:
+            continue
+        value = _hdf5_cell_float(raw_val)
+        if value is not None:
+            out[param] = value
+    return out
+
+
+def _hdf5_column_floats(hf, path, idx):
+    """Numeric values of one metadata-mapped column, or None."""
+    try:
+        arr = np.asarray(hf[path][:])
+    except (KeyError, TypeError, OSError, ValueError):
+        return None
+    if arr.size == 0:
+        return None
+    if arr.ndim == 0:
+        value = _hdf5_cell_float(arr.item())
+        return np.array([value], dtype=float) if value is not None else None
+    if arr.ndim == 1:
+        cells = arr
+    else:
+        col = int(idx) if 0 <= int(idx) < arr.shape[1] else 0
+        cells = arr[:, col]
+    values = [_hdf5_cell_float(cell) for cell in np.ravel(cells)]
+    values = [v for v in values if v is not None]
+    return np.asarray(values, dtype=float) if values else None
+
+
+def read_hdf5_grid_physicals(path):
+    """Physical grid (and extra) values from one KOSMA-τ HDF5 file.
+
+    Returns a dict with any of ``density``, ``mass``, ``fuv``, ``metal``,
+    ``crir``, plus extras ``av_max`` and ``radius`` when those columns exist.
+    Missing keys are omitted (not defaulted).
+    """
+    wanted = {
+        'protdens', 'cmass', 'metal', 'radm_ini', 'cosray', 'zeta',
+        'av', 'radius', 'distance',
+    }
+    phys = {}
+    try:
+        with h5py.File(path, 'r') as hf:
+            fmap = _hdf5_wanted_field_map(hf, wanted)
+            if 'protdens' in fmap:
+                phys['density'] = _hdf5_first_float(hf, *fmap['protdens'])
+            if 'cmass' in fmap:
+                phys['mass'] = _hdf5_first_float(hf, *fmap['cmass'])
+            if 'radm_ini' in fmap:
+                phys['fuv'] = _hdf5_first_float(hf, *fmap['radm_ini'])
+            if 'metal' in fmap:
+                phys['metal'] = _hdf5_first_float(hf, *fmap['metal'])
+            crir = None
+            if 'cosray' in fmap:
+                crir = _hdf5_first_float(hf, *fmap['cosray'])
+            if crir is None and 'zeta' in fmap:
+                crir = _hdf5_first_float(hf, *fmap['zeta'])
+            if crir is not None:
+                phys['crir'] = abs(crir)
+            for key, value in _pdr_config_physicals(hf).items():
+                if phys.get(key) is None:
+                    phys[key] = abs(value) if key == 'crir' else value
+            if 'av' in fmap:
+                av_col = _hdf5_column_floats(hf, *fmap['av'])
+                if av_col is not None and av_col.size:
+                    phys['av_max'] = float(np.nanmax(av_col))
+            radius_key = 'radius' if 'radius' in fmap else (
+                'distance' if 'distance' in fmap else None)
+            if radius_key:
+                rad_col = _hdf5_column_floats(hf, *fmap[radius_key])
+                if rad_col is not None and rad_col.size:
+                    radius = float(np.nanmax(rad_col))
+                    if radius > 1e15:
+                        radius = radius / PC_TO_CM
+                    phys['radius'] = radius
+    except OSError:
+        return {}
+    return {k: v for k, v in phys.items() if v is not None and np.isfinite(v)}
+
+
+def parse_tokens_from_hdf5(path):
+    """Encode grid tokens from KOSMA-τ HDF5 fields when the filename is nonstandard.
+
+    Returns ``(tokens, phys)`` or ``None``.  ``phys`` holds the actual HDF5
+    numbers used for display (not the rounded decoded tokens).
+    """
+    phys = read_hdf5_grid_physicals(path)
+    tokens = gn.physical_values_to_tokens(
+        density=phys.get('density'),
+        mass=phys.get('mass'),
+        fuv=phys.get('fuv'),
+        metal=phys.get('metal'),
+        crir=phys.get('crir'),
+    )
+    if tokens is None:
+        return None
+    return tokens, phys
 
 
 def _clean_rate_label(label, kind):
@@ -511,6 +730,53 @@ def _clean_rate_label(label, kind):
         if label.startswith(prefix):
             return label[len(prefix):]
     return label
+
+
+def _species_name_from_density_label(label, key=''):
+    """Turn a Densities metadata label ``n(C+)`` into the species name ``C+``."""
+    text = str(label or '').strip()
+    match = re.match(r'^n\((.+)\)$', text)
+    if match:
+        name = match.group(1).strip()
+        if name in ('e-', 'e'):
+            return 'ELECTR'
+        return name
+    key = str(key or '').strip()
+    if key.startswith('n_') and key != 'n_electr':
+        return key[2:]
+    if key == 'n_electr':
+        return 'ELECTR'
+    return text or None
+
+
+def _species_from_density_metadata(md):
+    """Species names ordered by Densities column index (older KOSMA-τ HDF5)."""
+    by_idx = {}
+    for row in md:
+        dset = _dec(row[1])
+        group = _dec(row[0])
+        if dset != 'Densities' or 'Column' in group:
+            continue
+        try:
+            idx = int(float(_dec(row[2])))
+        except (ValueError, TypeError):
+            continue
+        if idx in by_idx:
+            continue
+        name = _species_name_from_density_label(_dec(row[4]), _dec(row[3]))
+        if name:
+            by_idx[idx] = name
+    return [by_idx[i] for i in sorted(by_idx)]
+
+
+def _read_species_list(hf, md):
+    """Species names from ``species involved``, else Densities metadata labels."""
+    if SPECIES_PATH in hf:
+        try:
+            return [_dec(x[0]) for x in hf[SPECIES_PATH][:]]
+        except (KeyError, TypeError, OSError, ValueError):
+            pass
+    return _species_from_density_metadata(md)
 
 
 def build_structure(sample_file):
@@ -547,40 +813,88 @@ def build_structure(sample_file):
                     cr_idx = idx
             elif dset == 'Cooling rates':
                 cool_comp.append((_clean_rate_label(label, 'c'), idx))
-        species = [_dec(x[0]) for x in hf[SPECIES_PATH][:]]
+        species = _read_species_list(hf, md)
     heat_comp.sort(key=lambda t: t[1])
     cool_comp.sort(key=lambda t: t[1])
     return field_map, species, heat_comp, cool_comp, cr_idx
 
 
-def _scan_files(directory, recursive):
-    """Return (directory, files, axis_tokens, n_skipped) for a grid directory."""
-    directory = os.path.expanduser((directory or '').strip())
-    if not directory or not os.path.isdir(directory):
-        raise FileNotFoundError(f'Directory not found: {directory!r}')
+def _scan_status_note(n_from_hdf5=0, n_skipped=0):
+    """Short parenthetical for load-status lines."""
+    bits = []
+    if n_from_hdf5:
+        bits.append(f'{n_from_hdf5} from HDF5 metadata')
+    if n_skipped:
+        bits.append(f'{n_skipped} file(s) skipped')
+    return f'  ({"; ".join(bits)})' if bits else ''
 
-    pattern = os.path.join(directory, '**', '*.hdf5') if recursive \
-        else os.path.join(directory, '*.hdf5')
-    paths = sorted(glob.glob(pattern, recursive=recursive))
-    if not paths:
-        raise FileNotFoundError(f'No .hdf5 files found in {directory!r}')
+
+def _collect_hdf5_paths(source, recursive=False):
+    """Return ``(source, hdf5_paths)`` for a directory or a single HDF5 file."""
+    source = os.path.expanduser((source or '').strip())
+    if not source:
+        raise FileNotFoundError('No grid directory or HDF5 file specified.')
+    source = os.path.abspath(source)
+    if os.path.isfile(source):
+        if not source.lower().endswith(('.hdf5', '.h5')):
+            raise FileNotFoundError(f'Not an HDF5 file: {source!r}')
+        return source, [source]
+    if os.path.isdir(source):
+        paths = []
+        for ext in ('*.hdf5', '*.h5'):
+            pattern = os.path.join(source, '**', ext) if recursive \
+                else os.path.join(source, ext)
+            paths.extend(glob.glob(pattern, recursive=recursive))
+        paths = sorted(set(paths))
+        if not paths:
+            raise FileNotFoundError(f'No .hdf5 files found in {source!r}')
+        return source, paths
+    raise FileNotFoundError(f'Directory or HDF5 file not found: {source!r}')
+
+
+def _config_scan_root(source):
+    """Directory used to look up ``Models/**/config_files`` next to a grid."""
+    if os.path.isdir(source):
+        return source
+    return os.path.dirname(source) or source
+
+
+def _scan_files(directory, recursive):
+    """Return (source, files, axis_tokens, n_skipped, n_from_hdf5, phys_by_path).
+
+    ``directory`` may be a folder of models or a single ``.hdf5`` file.
+    Filenames that follow the encoded-token convention are used as-is (fast
+    path).  Anything else is opened and tagged from HDF5 metadata.
+    """
+    source, paths = _collect_hdf5_paths(directory, recursive)
 
     files = {}
+    phys_by_path = {}
     skipped = 0
+    n_from_hdf5 = 0
     for path in paths:
         tokens = parse_filename(path)
         if tokens is None:
-            skipped += 1
-            continue
+            parsed = parse_tokens_from_hdf5(path)
+            if parsed is None:
+                skipped += 1
+                continue
+            tokens, phys = parsed
+            n_from_hdf5 += 1
+            if phys:
+                phys_by_path[path] = phys
         files[tokens] = path
     if not files:
-        raise ValueError('Found .hdf5 files but none matched the expected '
-                         '<tag>_DD_MM_FF_ZZ_CC[_AA] naming convention.')
+        raise ValueError(
+            'Found .hdf5 files but none had encoded <tag>_DD_MM_FF_ZZ_CC[_AA] '
+            'names or readable KOSMA-τ grid parameters (protdens / cmass / '
+            'radm_ini / metal / cosray).'
+        )
 
     axis_tokens = {}
     for d, p in enumerate(PARAM_DEFS):
         axis_tokens[p['key']] = _sorted_axis_tokens(p['key'], {tok[d] for tok in files})
-    return directory, files, axis_tokens, skipped
+    return source, files, axis_tokens, skipped, n_from_hdf5, phys_by_path
 
 
 def scan_directory(directory, recursive=False):
@@ -589,7 +903,8 @@ def scan_directory(directory, recursive=False):
     global _heat_components, _cool_components, _cr_heat_idx
     global _model_config_summary
 
-    directory, files, axis_tokens, skipped = _scan_files(directory, recursive)
+    source, files, axis_tokens, skipped, n_from_hdf5, phys_by_path = _scan_files(
+        directory, recursive)
     field_map, species, heat_comp, cool_comp, cr_idx = \
         build_structure(next(iter(files.values())))
 
@@ -599,15 +914,17 @@ def scan_directory(directory, recursive=False):
     _heat_components = heat_comp
     _cool_components = cool_comp
     _cr_heat_idx = cr_idx
-    _model_config_summary = mc.scan_model_configs(directory)
+    _model_config_summary = mc.scan_model_configs(_config_scan_root(source))
     _grid = dict(
-        directory=directory,
+        directory=source,
         files=files,
         axis_tokens=axis_tokens,
         species=species,
         species_idx={s: i for i, s in enumerate(species)},
         n_files=len(files),
         n_skipped=skipped,
+        n_from_hdf5=n_from_hdf5,
+        phys_by_path=phys_by_path,
         simline_only=False,
         has_hdf5=True,
     )
@@ -622,18 +939,21 @@ def scan_overlay(directory, recursive=False):
     attenuated counterpart (different AA tag) lines up with each main model.
     """
     global _overlay
-    directory, files, axis_tokens, skipped = _scan_files(directory, recursive)
+    source, files, axis_tokens, skipped, n_from_hdf5, phys_by_path = _scan_files(
+        directory, recursive)
     # Index ignoring the attenuation token (last entry in PARAM order).
     by_non_atten = {}
     for tokens, path in files.items():
         by_non_atten.setdefault(tokens[:N_PARAMS - 1], path)
     _overlay = dict(
-        directory=directory,
+        directory=source,
         files=files,
         by_non_atten=by_non_atten,
         axis_tokens=axis_tokens,
         n_files=len(files),
         n_skipped=skipped,
+        n_from_hdf5=n_from_hdf5,
+        phys_by_path=phys_by_path,
     )
     return _overlay
 
@@ -718,20 +1038,23 @@ def build_chem_structure(sample_file):
 def scan_chem(directory, recursive=False):
     """Scan a chemistry (reaction-rate) grid directory."""
     global _chem, _reaction_cache
-    directory, files, axis_tokens, skipped = _scan_files(directory, recursive)
+    source, files, axis_tokens, skipped, n_from_hdf5, phys_by_path = _scan_files(
+        directory, recursive)
     species, labels = build_chem_structure(next(iter(files.values())))
     by_non_atten = {}
     for tokens, path in files.items():
         by_non_atten.setdefault(tokens[:N_PARAMS - 1], path)
     _reaction_cache = {}
     _chem = dict(
-        directory=directory,
+        directory=source,
         files=files,
         by_non_atten=by_non_atten,
         species=species,
         labels=labels,
         n_files=len(files),
         n_skipped=skipped,
+        n_from_hdf5=n_from_hdf5,
+        phys_by_path=phys_by_path,
     )
     return _chem
 
@@ -982,6 +1305,8 @@ def bootstrap_grid_from_simline():
         species_idx={s: i for i, s in enumerate(species)},
         n_files=len(token_tuples),
         n_skipped=_simline.get('n_skipped', 0),
+        n_from_hdf5=0,
+        phys_by_path={},
         simline_only=True,
         has_hdf5=False,
         token_cores=token_cores,
@@ -1157,7 +1482,7 @@ def _default_simline_transition(species, idef):
 
 
 def _grid_decode_param(key, token):
-    return PARAM_DEFS[_PARAM_IDX[key]]['decode'](token)
+    return _physical_param_value(key, token)
 
 
 def _grid_param_logscale(key):
@@ -1283,24 +1608,45 @@ def _read_optional(hf, path):
         return None
 
 
+def _relative_from_number_densities(dens, nH):
+    """Convert n(species) [cm⁻³] to x = n / n_H when Relative densities are absent."""
+    dens = np.asarray(dens, dtype=float)
+    nH = np.asarray(nH, dtype=float)
+    if dens.ndim != 2 or nH.size == 0:
+        return dens
+    nH_col = nH.reshape(-1, 1)
+    n_rows = min(dens.shape[0], nH_col.shape[0])
+    with np.errstate(divide='ignore', invalid='ignore'):
+        return dens[:n_rows] / np.where(nH_col[:n_rows] > 0, nH_col[:n_rows], np.nan)
+
+
 def get_model(filepath):
     """Load (and cache) the depth profiles needed for plotting one model."""
     if filepath in _profile_cache:
         return _profile_cache[filepath]
     with h5py.File(filepath, 'r') as hf:
+        nH = _read_field(hf, KEY_NH)
+        dens = _read_optional(hf, DENS_PATH)
+        rel = _read_optional(hf, RELDENS_PATH)
+        if rel is None and dens is not None and nH is not None:
+            rel = _relative_from_number_densities(dens, nH)
+        if rel is None:
+            rel = np.zeros((0, 0))
+        if dens is None:
+            dens = np.zeros((0, 0))
         model = dict(
             av     = _read_field(hf, KEY_AV),
-            nH     = _read_field(hf, KEY_NH),
+            nH     = nH,
             tgas   = _read_field(hf, KEY_TGAS),
             tdust  = _read_field(hf, KEY_TDUST),
             nelectr = _read_field(hf, KEY_NELECTR),
             cosray = _read_field(hf, KEY_COSRAY),
             nh2_profile = _read_field(hf, KEY_NH2_PROFILE),
             radius = _read_field(hf, KEY_RADIUS),
-            rel    = np.asarray(hf[RELDENS_PATH][:], dtype=float),   # (n_depth, n_species)
-            dens   = np.asarray(hf[DENS_PATH][:], dtype=float),
-            heat   = _read_optional(hf, HEATING_PATH),               # (n_depth, n_heat)
-            cool   = _read_optional(hf, COOLING_PATH),               # (n_depth, n_cool)
+            rel    = rel,
+            dens   = dens,
+            heat   = _read_optional(hf, HEATING_PATH),
+            cool   = _read_optional(hf, COOLING_PATH),
         )
     _profile_cache[filepath] = model
     return model
@@ -1309,9 +1655,10 @@ def get_model(filepath):
 def species_abundance(model, name, yscale):
     """Relative abundance profile for a species, clipped for log scale."""
     idx = _grid['species_idx'].get(name)
-    if idx is None or idx >= model['rel'].shape[1]:
+    rel = model.get('rel')
+    if idx is None or rel is None or rel.ndim != 2 or idx >= rel.shape[1]:
         return None
-    ab = model['rel'][:, idx].astype(float)
+    ab = rel[:, idx].astype(float)
     if yscale == 'log':
         ab = np.where(ab > 0, ab, MIN_AB)
     return ab
@@ -1616,11 +1963,85 @@ def _sci_label(v):
     return f'{man:.1f}\u00D710{_sup(exp)}'
 
 
+def _atten_disp(token):
+    try:
+        return f'{int(round(float(token))):02d}'
+    except (TypeError, ValueError):
+        return str(token)
+
+
+def _format_phys_number(val):
+    """Format an HDF5 / decoded physical value for the info bar and sliders."""
+    if val is None:
+        return '—'
+    try:
+        val = float(val)
+    except (TypeError, ValueError):
+        return str(val)
+    if not np.isfinite(val):
+        return '—'
+    if val == 0:
+        return '0'
+    av = abs(val)
+    if av >= 1e4 or av < 1e-3:
+        return f'{val:.4g}'
+    return f'{val:.6g}'
+
+
+def _phys_lookup(filepath, key):
+    """Actual HDF5 value for ``key`` if this file was tagged from metadata."""
+    if not filepath:
+        return None
+    for store in (_grid, _overlay, _chem):
+        phys = (store or {}).get('phys_by_path', {}).get(filepath)
+        if phys and phys.get(key) is not None:
+            return phys[key]
+    return None
+
+
+def _path_for_param_token(key, token, store=None):
+    """A model file whose encoded token on ``key`` matches ``token``."""
+    store = store or _grid
+    files = (store or {}).get('files') or {}
+    idx = _PARAM_IDX.get(key)
+    if idx is None:
+        return None
+    for tokens, path in files.items():
+        if len(tokens) > idx and tokens[idx] == token:
+            return path
+    return None
+
+
+def _physical_param_value(key, token, filepath=None, tokens=None):
+    """Prefer the HDF5 number; fall back to decoding the grid token."""
+    path = filepath
+    if path is None and tokens is not None:
+        path = (_grid.get('files') or {}).get(tuple(tokens))
+        if path is None and _overlay:
+            path = (_overlay.get('files') or {}).get(tuple(tokens))
+    value = _phys_lookup(path, key)
+    if value is not None:
+        return float(value)
+    if path is None:
+        path = _path_for_param_token(key, token)
+        value = _phys_lookup(path, key)
+        if value is not None:
+            return float(value)
+    return PARAM_DEFS[_PARAM_IDX[key]]['decode'](token)
+
+
+def _param_token_disp(sdef, token):
+    """Slider / slice title text for one parameter token."""
+    if sdef['key'] == 'atten':
+        return _atten_disp(token)
+    return _format_phys_number(_physical_param_value(sdef['key'], token))
+
+
 def param_value_label(param, token):
-    """Decoded physical value formatted for a parameter."""
-    val = param['decode'](token)
+    """Physical value formatted for a parameter (HDF5 value when available)."""
     if param['key'] == 'atten':
-        return f'{token:02d}'
+        return _atten_disp(token)
+    val = _physical_param_value(param['key'], token)
     return _sci_label(val)
 
 
@@ -1803,10 +2224,13 @@ def find_h_h2_transition(model, xvar):
     """x-coordinate (Av or nH) where x(H) = x(H2) (first crossing)."""
     idx_h = _grid['species_idx'].get('H')
     idx_h2 = _grid['species_idx'].get('H2')
-    if idx_h is None or idx_h2 is None:
+    rel = model.get('rel') if model else None
+    if idx_h is None or idx_h2 is None or rel is None or rel.ndim != 2:
         return None
-    ab_h = model['rel'][:, idx_h].astype(float)
-    ab_h2 = model['rel'][:, idx_h2].astype(float)
+    if idx_h >= rel.shape[1] or idx_h2 >= rel.shape[1]:
+        return None
+    ab_h = rel[:, idx_h].astype(float)
+    ab_h2 = rel[:, idx_h2].astype(float)
     xv = np.asarray(model['nH'] if xvar == 'nH' else model['av'], dtype=float)
 
     diff = ab_h - ab_h2
@@ -1830,7 +2254,7 @@ def add_h_h2_vline(fig, x_cross, theme='light'):
                   line=dict(color=t['vline'], width=1, dash='dot'))
 
 
-def placeholder_fig(msg='Load a grid directory to begin', theme='light'):
+def placeholder_fig(msg='Load a grid directory or HDF5 file to begin', theme='light'):
     t = _theme_colors(theme)
     fig = go.Figure()
     fig.add_annotation(text=msg, showarrow=False,
@@ -1846,7 +2270,12 @@ def placeholder_fig(msg='Load a grid directory to begin', theme='light'):
 
 
 def _temperature(model, key, yscale):
-    arr = np.asarray(model[key], dtype=float)
+    arr = model.get(key) if model else None
+    if arr is None:
+        return None
+    arr = np.asarray(arr, dtype=float)
+    if arr.size == 0:
+        return None
     if yscale == 'log':
         arr = np.where(arr > 0, arr, np.nan)
     return arr
@@ -2181,7 +2610,8 @@ def make_reaction_plots(values, species, xscale, yscale, top_n,
                         av_range=DEFAULT_AV_RANGE,
                         chain_upstream=None, chain_downstream=None,
                         chain_include_isotopes=False, chain_include_ice=False,
-                        network_highlight=None):
+                        network_highlight=None, network_hidden=None,
+                        partner_label_size=None, species_label_size=None):
     """Return formation/destruction figures, tables, and pathway network."""
     ranking_metric = _parse_react_ranking(ranking_metric)
     av_range = _parse_av_range(av_range)
@@ -2201,6 +2631,8 @@ def make_reaction_plots(values, species, xscale, yscale, top_n,
         down = chem_network.DEFAULT_CHAIN_DOWNSTREAM
     include_isotopes = bool(chain_include_isotopes)
     include_ice = bool(chain_include_ice)
+    partner_pt = partner_label_size
+    species_pt = species_label_size
     if not _chem or not species:
         p = placeholder_fig('Load a chemistry grid and pick a species', theme=theme)
         return (p, empty, p, empty, net_placeholder, net_status)
@@ -2220,10 +2652,13 @@ def make_reaction_plots(values, species, xscale, yscale, top_n,
             order_f, labels_f, stats_f, 'formation', ranking_metric)
         tbl_d = _reaction_contribution_table(
             order_d, labels_d, stats_d, 'destruction', ranking_metric)
+        selected_f = [labels_f[i] for i in (order_f or []) if 0 <= int(i) < len(labels_f)]
+        selected_d = [labels_d[i] for i in (order_d or []) if 0 <= int(i) < len(labels_d)]
     else:
         missing = placeholder_fig('No chemistry file for this model point', theme=theme)
         fig_f = fig_d = missing
         tbl_f = tbl_d = empty
+        selected_f = selected_d = None
     sp_html = format_species_html(species)
     fig_net, net_meta = chem_network.build_network_panels(
         _chem.get('labels') or {}, species,
@@ -2233,6 +2668,11 @@ def make_reaction_plots(values, species, xscale, yscale, top_n,
         highlight_species=network_highlight,
         theme_colors=tc,
         title=f'Reaction pathway network — {sp_html}',
+        focal_formation=selected_f,
+        focal_destruction=selected_d,
+        hidden_species=network_hidden,
+        partner_label_size=partner_pt,
+        species_label_size=species_pt,
     )
     return (fig_f, tbl_f, fig_d, tbl_d, fig_net,
             chem_network.status_message(net_meta))
@@ -2943,10 +3383,7 @@ def fig_spaghetti_plane(plane, slice_idx, contour_entries, idef,
 
     t = _theme_colors(theme)
     sdef = _param_def(sk)
-    if sdef['key'] == 'atten':
-        slice_disp = f'{slice_token:02d}'
-    else:
-        slice_disp = f'{sdef["decode"](slice_token):.4g}'
+    slice_disp = _param_token_disp(sdef, slice_token)
     slice_unit = f' {sdef["unit"]}' if sdef['unit'] else ''
     unit = _intensity_unit_label(idef)
     title = (f'{plane["title"]}<br>'
@@ -3192,8 +3629,8 @@ def _native_abundance_grid(plane, slice_token, quantity):
             if path:
                 Z[iy, ix] = get_grid_scalar(path, quantity)
 
-    x_phys = np.array([xdef['decode'](t) for t in x_tokens], dtype=float)
-    y_phys = np.array([ydef['decode'](t) for t in y_tokens], dtype=float)
+    x_phys = np.array([_physical_param_value(xdef['key'], t) for t in x_tokens], dtype=float)
+    y_phys = np.array([_physical_param_value(ydef['key'], t) for t in y_tokens], dtype=float)
     x_phys, y_phys, Z = gi.align_grid_axes_ascending(
         x_phys, y_phys, Z, x_logscale=xdef['logscale'], y_logscale=ydef['logscale'],
     )
@@ -3219,8 +3656,8 @@ def _native_intensity_grid(plane, slice_token, species, idef, transition_idx,
             Z[iy, ix] = get_smli_intensity(
                 tokens, species, idef, transition_idx)
 
-    x_phys = np.array([xdef['decode'](t) for t in x_tokens], dtype=float)
-    y_phys = np.array([ydef['decode'](t) for t in y_tokens], dtype=float)
+    x_phys = np.array([_physical_param_value(xdef['key'], t) for t in x_tokens], dtype=float)
+    y_phys = np.array([_physical_param_value(ydef['key'], t) for t in y_tokens], dtype=float)
     x_phys, y_phys, Z = gi.align_grid_axes_ascending(
         x_phys, y_phys, Z, x_logscale=xdef['logscale'], y_logscale=ydef['logscale'],
     )
@@ -3602,8 +4039,8 @@ def build_slice_grid(plane, slice_token, quantity, interp_config=None):
             if path:
                 Z[iy, ix] = get_grid_scalar(path, quantity)
 
-    x_phys = np.array([xdef['decode'](t) for t in x_tokens], dtype=float)
-    y_phys = np.array([ydef['decode'](t) for t in y_tokens], dtype=float)
+    x_phys = np.array([_physical_param_value(xdef['key'], t) for t in x_tokens], dtype=float)
+    y_phys = np.array([_physical_param_value(ydef['key'], t) for t in y_tokens], dtype=float)
 
     x_phys, y_phys, Z = gi.align_grid_axes_ascending(
         x_phys, y_phys, Z,
@@ -3635,8 +4072,8 @@ def build_overlay_slice_grid(plane, slice_token, quantity, interp_config=None):
             if path:
                 Z[iy, ix] = get_grid_scalar(path, quantity)
 
-    x_phys = np.array([xdef['decode'](t) for t in x_tokens], dtype=float)
-    y_phys = np.array([ydef['decode'](t) for t in y_tokens], dtype=float)
+    x_phys = np.array([_physical_param_value(xdef['key'], t) for t in x_tokens], dtype=float)
+    y_phys = np.array([_physical_param_value(ydef['key'], t) for t in y_tokens], dtype=float)
 
     x_phys, y_phys, Z = gi.align_grid_axes_ascending(
         x_phys, y_phys, Z,
@@ -3677,10 +4114,7 @@ def fig_contour_plane(plane, slice_idx, quantity, zscale,
     if not np.any(np.isfinite(Z)):
         return placeholder_fig('No model points for this slice', theme=theme)
 
-    if sdef['key'] == 'atten':
-        slice_disp = f'{slice_token:02d}'
-    else:
-        slice_disp = f'{sdef["decode"](slice_token):.4g}'
+    slice_disp = _param_token_disp(sdef, slice_token)
     unit = f' {sdef["unit"]}' if sdef['unit'] else ''
     slice_title = (f'{plane["title"]}<br>'
                    f'<sup style="font-size:11px">{sdef["name"]} = {slice_disp}{unit}</sup>')
@@ -3757,8 +4191,8 @@ def build_intensity_slice_grid(plane, slice_token, species, idef, transition_idx
             Z[iy, ix] = get_smli_intensity(
                 tokens, species, idef, transition_idx, overlay=overlay)
 
-    x_phys = np.array([xdef['decode'](t) for t in x_tokens], dtype=float)
-    y_phys = np.array([ydef['decode'](t) for t in y_tokens], dtype=float)
+    x_phys = np.array([_physical_param_value(xdef['key'], t) for t in x_tokens], dtype=float)
+    y_phys = np.array([_physical_param_value(ydef['key'], t) for t in y_tokens], dtype=float)
 
     x_phys, y_phys, Z = gi.align_grid_axes_ascending(
         x_phys, y_phys, Z,
@@ -3820,10 +4254,7 @@ def fig_intensity_contour_plane(plane, slice_idx, species, idef, transition_idx,
     else:
         cbar_title = f'I [{unit}]'
 
-    if sdef['key'] == 'atten':
-        slice_disp = f'{slice_token:02d}'
-    else:
-        slice_disp = f'{sdef["decode"](slice_token):.4g}'
+    slice_disp = _param_token_disp(sdef, slice_token)
     slice_unit = f' {sdef["unit"]}' if sdef['unit'] else ''
     slice_title = (f'{plane["title"]}<br>'
                    f'<sup style="font-size:11px">{sdef["name"]} = {slice_disp}{slice_unit}'
@@ -3908,10 +4339,7 @@ def _slice_token_from_index(plane, slice_idx):
 
 def _rgb_slice_title(plane, slice_token, subtitle):
     sdef = _param_def(plane['slice'])
-    if sdef['key'] == 'atten':
-        slice_disp = f'{slice_token:02d}'
-    else:
-        slice_disp = f'{sdef["decode"](slice_token):.4g}'
+    slice_disp = _param_token_disp(sdef, slice_token)
     unit = f' {sdef["unit"]}' if sdef['unit'] else ''
     return (f'{plane["title"]}<br>'
             f'<sup style="font-size:11px">{sdef["name"]} = {slice_disp}{unit}'
@@ -4677,16 +5105,16 @@ def _model_profile_label(tokens, include_atten=True):
     """Legend label from model token tuple: n_H, FUV χ, and ζ (optional atten tag)."""
     if not tokens or len(tokens) < N_PARAMS:
         return 'model'
-    dens = PARAM_DEFS[_PARAM_IDX['density']]['decode'](tokens[_PARAM_IDX['density']])
-    fuv = PARAM_DEFS[_PARAM_IDX['fuv']]['decode'](tokens[_PARAM_IDX['fuv']])
-    zeta = PARAM_DEFS[_PARAM_IDX['crir']]['decode'](tokens[_PARAM_IDX['crir']])
+    dens = _physical_param_value('density', tokens[_PARAM_IDX['density']], tokens=tokens)
+    fuv = _physical_param_value('fuv', tokens[_PARAM_IDX['fuv']], tokens=tokens)
+    zeta = _physical_param_value('crir', tokens[_PARAM_IDX['crir']], tokens=tokens)
     parts = [
         f'n<sub>H</sub> = {_sci_label(dens)} cm\u207b\u00b3',
         f'\u03c7 = {_sci_label(fuv)}',
         f'\u03b6 = {_sci_label(zeta)} s\u207b\u00b9',
     ]
     if include_atten:
-        parts.append(f'atten {tokens[_PARAM_IDX["atten"]]:02d}')
+        parts.append(f'atten {_atten_disp(tokens[_PARAM_IDX["atten"]])}')
     return ', '.join(parts)
 
 
@@ -5531,20 +5959,21 @@ app.layout = html.Div(
         dcc.Tab(label='Load grids', value='load', style=_TAB_STYLE, selected_style=_TAB_SEL,
                 children=[
             html.Div(style={'paddingTop': '14px'}, children=[
-                html.P('Load the main HDF5 model grid and/or a SIMLINE intensity directory. '
+                html.P('Load a main HDF5 model grid (a directory of files, or one .hdf5 model) '
+                       'and/or a SIMLINE intensity directory. '
                        'If you only have SIMLINE output, load that directory alone — '
                        'density, FUV, CRIR, mass, and other parameters are read from the '
                        'filenames and drive the parameter sliders. HDF5-dependent tabs '
                        '(profiles, chemistry, CR attenuation, etc.) stay disabled until '
-                       'a grid directory is loaded.',
+                       'a grid directory or HDF5 file is loaded.',
                        style=_PAGE_INTRO),
 
                 html.Div([
-                    html.Label('Grid directory  (optional if SIMLINE is loaded)',
+                    html.Label('Grid directory or HDF5 file  (optional if SIMLINE is loaded)',
                                style=_CTRL_LABEL),
                     html.Div([
                         dcc.Input(id='dir-input', type='text', value=args.dir,
-                                  placeholder='/path/to/pdrgrid_hdf5',
+                                  placeholder='/path/to/pdrgrid_hdf5  or  /path/to/model.hdf5',
                                   style={'flex': '1', 'padding': '8px 10px', 'fontSize': '13px',
                                          'border': '1px solid #bbc', 'borderRadius': '6px',
                                          'marginRight': '10px'}),
@@ -5569,7 +5998,7 @@ app.layout = html.Div(
                                style=_CTRL_LABEL),
                     html.Div([
                         dcc.Input(id='overlay-dir-input', type='text', value='',
-                                  placeholder='/path/to/attenuated_grid_hdf5',
+                                  placeholder='/path/to/attenuated_grid_hdf5  or  /path/to/model.hdf5',
                                   style={'flex': '1', 'padding': '8px 10px', 'fontSize': '13px',
                                          'border': '1px solid #cbb', 'borderRadius': '6px',
                                          'marginRight': '10px'}),
@@ -5627,7 +6056,7 @@ app.layout = html.Div(
                                'Chemistry tab)', style=_CTRL_LABEL),
                     html.Div([
                         dcc.Input(id='chem-dir-input', type='text', value='',
-                                  placeholder='/path/to/chemistrygrid',
+                                  placeholder='/path/to/chemistrygrid  or  /path/to/chem_model.hdf5',
                                   style={'flex': '1', 'padding': '8px 10px', 'fontSize': '13px',
                                          'border': '1px solid #b9c5b0', 'borderRadius': '6px',
                                          'marginRight': '10px'}),
@@ -5838,6 +6267,7 @@ app.layout = html.Div(
                         style={'fontSize': '14px', 'margin': '22px 0 6px', 'fontWeight': '600'}),
                 html.Div(id='react-network-status', style={**_PAGE_INTRO, 'marginBottom': '8px'}),
                 dcc.Store(id='react-net-highlight', data=None),
+                dcc.Store(id='react-net-hidden', data=[]),
                 html.Div([
                     html.Div([
                         html.Label('Upstream depth', style=_CTRL_LABEL),
@@ -5852,6 +6282,24 @@ app.layout = html.Div(
                         dcc.Input(id='react-chain-downstream', type='number',
                                   min=0, max=6, step=1,
                                   value=chem_network.DEFAULT_CHAIN_DOWNSTREAM,
+                                  style={'width': '90px', 'padding': '7px 9px', 'fontSize': '13px',
+                                         'border': '1px solid #bbc', 'borderRadius': '6px'}),
+                    ], style={'marginRight': '18px'}),
+                    html.Div([
+                        html.Label('Species text', style=_CTRL_LABEL,
+                                   title='Font size of species names in the boxes (pt)'),
+                        dcc.Input(id='react-species-label-size', type='number',
+                                  min=8, max=40, step=1,
+                                  value=chem_network.DEFAULT_SPECIES_LABEL_SIZE,
+                                  style={'width': '90px', 'padding': '7px 9px', 'fontSize': '13px',
+                                         'border': '1px solid #bbc', 'borderRadius': '6px'}),
+                    ], style={'marginRight': '18px'}),
+                    html.Div([
+                        html.Label('Partner text', style=_CTRL_LABEL,
+                                   title='Font size of reaction partners on the arrows (pt)'),
+                        dcc.Input(id='react-partner-label-size', type='number',
+                                  min=8, max=40, step=1,
+                                  value=chem_network.DEFAULT_PARTNER_LABEL_SIZE,
                                   style={'width': '90px', 'padding': '7px 9px', 'fontSize': '13px',
                                          'border': '1px solid #bbc', 'borderRadius': '6px'}),
                     ], style={'marginRight': '22px'}),
@@ -5873,13 +6321,26 @@ app.layout = html.Div(
                     ], style={'marginRight': '18px', 'alignSelf': 'flex-end'}),
                     html.Div([
                         html.Label('\u00a0', style=_CTRL_LABEL),
+                        html.Button('Hide selected', id='btn-react-net-hide', n_clicks=0,
+                                    title='Click a species box, then hide it from the figure',
+                                    style={'padding': '7px 12px', 'fontSize': '13px',
+                                           'border': '1px solid #bbc', 'borderRadius': '6px',
+                                           'backgroundColor': '#f7f7f7', 'cursor': 'pointer',
+                                           'marginRight': '8px'}),
+                        html.Button('Show all', id='btn-react-net-show-all', n_clicks=0,
+                                    title='Restore every hidden species',
+                                    style={'padding': '7px 12px', 'fontSize': '13px',
+                                           'border': '1px solid #bbc', 'borderRadius': '6px',
+                                           'backgroundColor': '#f7f7f7', 'cursor': 'pointer',
+                                           'marginRight': '8px'}),
                         html.Button('Clear highlight', id='btn-react-net-clear', n_clicks=0,
                                     style={'padding': '7px 12px', 'fontSize': '13px',
                                            'border': '1px solid #bbc', 'borderRadius': '6px',
                                            'backgroundColor': '#f7f7f7', 'cursor': 'pointer'}),
                     ], style={'alignSelf': 'flex-end'}),
                 ], style={'display': 'flex', 'alignItems': 'flex-end',
-                          'flexWrap': 'wrap', 'marginBottom': '10px'}),
+                          'flexWrap': 'wrap', 'marginBottom': '8px'}),
+                html.Div(id='react-net-hidden-bar', style={'marginBottom': '10px'}),
                 dcc.Graph(
                     id='plot-react-network',
                     figure=placeholder_fig(),
@@ -6655,9 +7116,7 @@ def handle_load(n_clicks, directory, recursive):
         for p in PARAM_DEFS if len(grid['axis_tokens'][p['key']]) > 1
     ) or 'single model'
 
-    note = ''
-    if grid['n_skipped']:
-        note = f'  ({grid["n_skipped"]} file(s) skipped: bad name)'
+    note = _scan_status_note(grid.get('n_from_hdf5', 0), grid.get('n_skipped', 0))
     cfg_note = ''
     if _model_config_summary and not _model_config_summary.get('error'):
         cfg_note = f'   \u2014   {_model_config_summary["n_configs"]} JSON configs'
@@ -6763,27 +7222,38 @@ def update_labels(*values):
 
     labels = []
     info = []
+    filepath = current_file(values)
+    phys = ((_grid.get('phys_by_path') or {}).get(filepath) or {}) if filepath else {}
     for d, p in enumerate(PARAM_DEFS):
         tokens = _grid['axis_tokens'][p['key']]
         try:
             tok = tokens[int(values[d])]
         except (IndexError, TypeError, ValueError):
             tok = tokens[0]
-        val = p['decode'](tok)
-        unit = f' {p["unit"]}' if p['unit'] else ''
         varies = len(tokens) > 1
         if p['key'] == 'atten':
-            disp = f'{tok:02d}'
+            disp = _atten_disp(tok)
         else:
-            disp = f'{val:.4g}'
+            val = _physical_param_value(p['key'], tok, filepath=filepath)
+            disp = _format_phys_number(val)
+        unit = f' {p["unit"]}' if p['unit'] else ''
         labels.append(f'{disp}{unit}')
+        if phys and p['key'] not in phys and p['key'] in ('mass', 'atten'):
+            continue
         info.append(html.Span(
             f'{p["name"]} = {disp}{unit}',
             style={'marginRight': '20px', 'color': p['color'],
                    'fontWeight': '600' if varies else '400',
                    'opacity': 1.0 if varies else 0.55}))
+    if phys.get('av_max') is not None:
+        info.append(html.Span(
+            f'Max A_V = {_format_phys_number(phys["av_max"])} mag',
+            style={'marginRight': '20px', 'color': '#555'}))
+    if phys.get('radius') is not None:
+        info.append(html.Span(
+            f'Radius = {_format_phys_number(phys["radius"])} pc',
+            style={'marginRight': '20px', 'color': '#555'}))
 
-    filepath = current_file(values)
     if filepath:
         fname = os.path.basename(filepath)
     elif _grid.get('simline_only'):
@@ -6811,9 +7281,9 @@ def _slice_axis_ui(plane, idx):
     except (IndexError, TypeError, ValueError):
         tok = tokens[0]
     if sdef['key'] == 'atten':
-        disp = f'{tok:02d}'
+        disp = _atten_disp(tok)
     else:
-        disp = f'{sdef["decode"](tok):.4g}'
+        disp = _format_phys_number(_physical_param_value(sdef['key'], tok))
     unit = f' {sdef["unit"]}' if sdef['unit'] else ''
     role = 'Slice' if varies else 'Fixed'
     fixed_lbl = f'{role}: {sdef["name"]}{unit}'
@@ -7190,7 +7660,7 @@ def handle_overlay(n_load, n_clear, directory, recursive, state):
         return (html.Span(f'\u2717  {exc}',
                           style={'color': '#d62728', 'fontWeight': '600'}), state + 1)
 
-    note = f'  ({ov["n_skipped"]} skipped)' if ov['n_skipped'] else ''
+    note = _scan_status_note(ov.get('n_from_hdf5', 0), ov.get('n_skipped', 0))
     status = html.Span([
         html.Span('\u2713  Overlay ', style={'color': '#8c564b', 'fontWeight': '700'}),
         html.Code(ov['directory']),
@@ -7276,7 +7746,7 @@ def handle_chem(n_load, n_clear, directory, recursive, state, cur_species):
     value = cur_species if cur_species in species else \
         (CHEM_DEFAULT_SPECIES if CHEM_DEFAULT_SPECIES in species else (species[0] if species else None))
 
-    note = f'  ({ch["n_skipped"]} skipped)' if ch['n_skipped'] else ''
+    note = _scan_status_note(ch.get('n_from_hdf5', 0), ch.get('n_skipped', 0))
     status = html.Span([
         html.Span('\u2713  Chemistry ', style={'color': '#2ca02c', 'fontWeight': '700'}),
         html.Code(ch['directory']),
@@ -7629,10 +8099,7 @@ def update_ie_panels(*args_in):
                 )
                 sk = plane['slice']
                 sdef = _param_def(sk)
-                if sdef['key'] == 'atten':
-                    slice_disp = f'{slice_token:02d}'
-                else:
-                    slice_disp = f'{sdef["decode"](slice_token):.4g}'
+                slice_disp = _param_token_disp(sdef, slice_token)
                 unit_l = _ie_quantity_unit(quantity)
                 title = (f'Abundance / diagnostic &mdash; {_ie_plane_label(plane["id"])}'
                          f'<br><sup>{_quantity_label(quantity)}'
@@ -7670,10 +8137,7 @@ def update_ie_panels(*args_in):
                 )
                 sk = plane['slice']
                 sdef = _param_def(sk)
-                if sdef['key'] == 'atten':
-                    slice_disp = f'{slice_token:02d}'
-                else:
-                    slice_disp = f'{sdef["decode"](slice_token):.4g}'
+                slice_disp = _param_token_disp(sdef, slice_token)
                 trans_rows = _simline_transition_options(ie_species, ie_idef)
                 tlabel = trans_rows[tidx]['label'] if 0 <= tidx < len(trans_rows) else str(tidx)
                 unit_l = _intensity_unit_label(ie_idef or SIMLINE_DEFAULT_IDEF)
@@ -7928,13 +8392,16 @@ def update_thermal_plots(*args_in):
        Input('react-chain-downstream', 'value'),
        Input('react-chain-isotopes', 'value'),
        Input('react-chain-ice', 'value'),
-       Input('react-net-highlight', 'data')],
+       Input('react-species-label-size', 'value'),
+       Input('react-partner-label-size', 'value'),
+       Input('react-net-highlight', 'data'),
+       Input('react-net-hidden', 'data')],
 )
 def update_reaction_plots(*args_in):
     values = list(args_in[:N_PARAMS])
     (species, top_n, ranking, xscale, yscale, av_range, _chem_state,
      plot_theme, chain_up, chain_down, chain_iso, chain_ice,
-     net_highlight) = args_in[N_PARAMS:]
+     species_pt, partner_pt, net_highlight, net_hidden) = args_in[N_PARAMS:]
     top_n = top_n or CHEM_DEFAULT_NREAC
     return make_reaction_plots(values, species, xscale, yscale, top_n,
                                ranking_metric=ranking,
@@ -7944,7 +8411,10 @@ def update_reaction_plots(*args_in):
                                chain_downstream=chain_down,
                                chain_include_isotopes=bool(chain_iso and 'iso' in chain_iso),
                                chain_include_ice=bool(chain_ice and 'ice' in chain_ice),
-                               network_highlight=net_highlight)
+                               network_highlight=net_highlight,
+                               network_hidden=net_hidden,
+                               partner_label_size=partner_pt,
+                               species_label_size=species_pt)
 
 
 @app.callback(
@@ -7988,6 +8458,76 @@ def update_react_net_highlight(click_data, clear_clicks, species, current):
         return current
     # Toggle off if the same box is clicked again.
     return None if current == name else name
+
+
+def _hidden_species_bar(hidden):
+    """Chip row of hidden species; click a chip to restore that box."""
+    names = [str(n).strip() for n in (hidden or []) if str(n).strip()]
+    if not names:
+        return html.Div()
+    chips = []
+    for n in names:
+        chips.append(html.Button(
+            n,
+            id={'type': 'react-net-unhide', 'name': n},
+            n_clicks=0,
+            title=f'Show {n} again',
+            style={'padding': '3px 9px', 'fontSize': '12px', 'marginRight': '6px',
+                   'marginBottom': '4px', 'border': '1px solid #c5b48a',
+                   'borderRadius': '12px', 'backgroundColor': '#fff6e0',
+                   'cursor': 'pointer', 'color': '#5a4a20'},
+        ))
+    return html.Div([
+        html.Span('Hidden: ', style={'fontSize': '12px', 'color': '#666',
+                                     'marginRight': '6px'}),
+        html.Div(chips, style={'display': 'inline'}),
+        html.Span(' (click a name to restore)',
+                  style={'fontSize': '12px', 'color': '#888', 'marginLeft': '4px'}),
+    ])
+
+
+@app.callback(
+    Output('react-net-hidden', 'data'),
+    Input('btn-react-net-hide', 'n_clicks'),
+    Input('btn-react-net-show-all', 'n_clicks'),
+    Input({'type': 'react-net-unhide', 'name': ALL}, 'n_clicks'),
+    Input('react-species', 'value'),
+    State('react-net-highlight', 'data'),
+    State('react-net-hidden', 'data'),
+    prevent_initial_call=True,
+)
+def update_react_net_hidden(hide_clicks, show_all_clicks, _unhide_clicks,
+                            species, highlight, current):
+    """Hide the highlighted species, restore one chip, or restore all."""
+    from dash import ctx
+    trig = getattr(ctx, 'triggered_id', None)
+    hidden = [str(n).strip() for n in (current or []) if str(n).strip()]
+    if trig in ('react-species', 'btn-react-net-show-all'):
+        return []
+    if isinstance(trig, dict) and trig.get('type') == 'react-net-unhide':
+        name = str(trig.get('name') or '').strip()
+        return [n for n in hidden if n != name]
+    if trig != 'btn-react-net-hide':
+        return hidden
+    name = str(highlight or '').strip()
+    if not name:
+        return hidden
+    # The chemistry-tab species is the tree root and cannot be removed.
+    if species and chem_network._species_match_key(name) == chem_network._species_match_key(species):
+        return hidden
+    if any(chem_network._species_match_key(n) == chem_network._species_match_key(name)
+           for n in hidden):
+        return hidden
+    hidden.append(name)
+    return hidden
+
+
+@app.callback(
+    Output('react-net-hidden-bar', 'children'),
+    Input('react-net-hidden', 'data'),
+)
+def update_react_net_hidden_bar(hidden):
+    return _hidden_species_bar(hidden)
 
 
 @app.callback(

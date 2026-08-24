@@ -14,6 +14,7 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import plotly.graph_objects as go
+import plot_style as ps
 
 try:
     from PIL import Image as PILImage
@@ -320,36 +321,36 @@ def fig_rgb_phase(
         ))
 
     fig.update_layout(
-        title=dict(text=title, font=dict(size=12, color=title_c), x=0.02, xanchor='left'),
+        title=dict(text=title, font=ps.title_font(title_c), x=0.02, xanchor='left'),
         paper_bgcolor=paper,
         plot_bgcolor=plot_bg,
         width=width,
         height=height,
         autosize=False,
         margin=dict(l=64, r=90, t=52, b=58),
-        font=dict(family='Arial, sans-serif', size=12, color=font),
+        font=ps.layout_font(font),
         annotations=annotations,
         showlegend=False,
         uirevision=f'rgb|{title}',
         xaxis=dict(
-            title=dict(text=xlabel, font=dict(size=11, color=font)),
+            title=dict(text=xlabel, font=ps.axis_title_font(font)),
             range=[x_lo, x_hi],
             autorange=False,
             showgrid=False,
             gridcolor=grid_c,
             linecolor=axis_c,
-            tickfont=dict(color=font),
+            tickfont=ps.tick_font(font),
             constrain='domain',
             domain=[0.0, 0.84],
         ),
         yaxis=dict(
-            title=dict(text=ylabel, font=dict(size=11, color=font)),
+            title=dict(text=ylabel, font=ps.axis_title_font(font)),
             range=[y_lo, y_hi],
             autorange=False,
             showgrid=False,
             gridcolor=grid_c,
             linecolor=axis_c,
-            tickfont=dict(color=font),
+            tickfont=ps.tick_font(font),
             constrain='domain',
             domain=[0.0, 1.0],
         ),

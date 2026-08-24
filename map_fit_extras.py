@@ -103,11 +103,128 @@ def parse_transition(transition_name):
     rotational and fine-structure labels.
     """
     return _spectroscopic_line_key_metadata(transition_name)
+
+
+# KoSens inter-molecule ratio ordering (higher number → numerator).
+MOLECULE_RATIO_PRIORITY = {
+    'C+': 13,
+    'C': 12,
+    'HCO+': 11,
+    'CO': 10,
+    '13CO': 9,
+    'C18O': 8,
+    'H13CO+': 7,
+    'HCN': 6,
+    'HNC': 5,
+    'H3O+': 4,
+    'N2H+': 3,
+    'SO2': 2,
+    'SO': 1,
+    'AR': 0,
+}
+
+
+def divide_ratio_grids(num_grid, den_grid):
+    """Element-wise ``num / den`` with NaN where the denominator is invalid."""
+    num = np.asarray(num_grid, dtype=float)
+    den = np.asarray(den_grid, dtype=float)
+    out = np.full(num.shape, np.nan, dtype=float)
+    ok = (den != 0) & np.isfinite(den) & np.isfinite(num)
+    np.divide(num, den, out=out, where=ok)
+    return out
+
+
+def abundance_ratio_pairs(species_names):
+    """Unique species pairs with KoSens priority in the numerator.
+
+    Unknown species keep the caller’s selection order when priorities are equal,
+    so diagnostic pairs such as H/H₂ are still created.
+    """
+    names = [str(s) for s in dict.fromkeys(species_names or []) if s]
+    pairs = []
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            pa = MOLECULE_RATIO_PRIORITY.get(a, 0)
+            pb = MOLECULE_RATIO_PRIORITY.get(b, 0)
+            if pa > pb:
+                pairs.append((a, b))
+            elif pb > pa:
+                pairs.append((b, a))
+            else:
+                pairs.append((a, b))
+    return pairs
+
+
+def transition_ratio_pairs(line_keys):
+    """KoSens intra- and inter-molecule line pairs ``(numerator, denominator)``.
+
+    Intra-molecule: higher energy / lower energy.
+    Inter-molecule: higher ``MOLECULE_RATIO_PRIORITY`` / lower; equal priority skipped.
+    """
+    all_transitions = []
+    for key in line_keys or []:
+        name = str(key)
+        if not name or '/' in name.split('(', 1)[0]:
+            continue
+        try:
+            molecule, upper, lower, energy_level = _spectroscopic_line_key_metadata(name)
+        except Exception:
+            continue
+        if molecule is None or energy_level is None:
+            continue
+        all_transitions.append({
+            'name': name,
+            'molecule': molecule,
+            'energy_level': energy_level,
+        })
+
+    pairs = []
+    seen = set()
+    molecules = {}
+    for trans in all_transitions:
+        molecules.setdefault(trans['molecule'], []).append(trans)
+
+    for transitions in molecules.values():
+        if len(transitions) < 2:
+            continue
+        transitions.sort(key=lambda x: x['energy_level'], reverse=True)
+        for i, numerator in enumerate(transitions):
+            for denominator in transitions[i + 1:]:
+                if numerator['energy_level'] <= denominator['energy_level']:
+                    continue
+                key = (numerator['name'], denominator['name'])
+                if key in seen:
+                    continue
+                seen.add(key)
+                pairs.append(key)
+
+    unique_molecules = list(molecules.keys())
+    for i, mol1 in enumerate(unique_molecules):
+        for j, mol2 in enumerate(unique_molecules):
+            if i >= j:
+                continue
+            p1 = MOLECULE_RATIO_PRIORITY.get(mol1, 0)
+            p2 = MOLECULE_RATIO_PRIORITY.get(mol2, 0)
+            if p1 > p2:
+                nums, dens = molecules[mol1], molecules[mol2]
+            elif p2 > p1:
+                nums, dens = molecules[mol2], molecules[mol1]
+            else:
+                continue
+            for num_trans in nums:
+                for den_trans in dens:
+                    key = (num_trans['name'], den_trans['name'])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    pairs.append(key)
+    return pairs
 ########################################################################################################################################
 #                                               Function for creating transition ratios
 ########################################################################################################################################
 
-def create_transition_ratios(grid_dict, species_list=None,convert_transition_names=False):
+def create_transition_ratios(grid_dict, species_list=None, convert_transition_names=False,
+                             verbose=True):
     """
     Create line intensity ratio grids from molecular transition grids.
 
@@ -255,137 +372,32 @@ def create_transition_ratios(grid_dict, species_list=None,convert_transition_nam
             seen.add(key)
             transition_keys.append(key)
 
-    all_transitions = []
-    for key in transition_keys:
-        if key not in grid_dict:
-            continue
-        try:
-            molecule, upper, lower, energy_level = _spectroscopic_line_key_metadata(key)
-        except Exception:
-            continue
-        if molecule is None or energy_level is None:
-            continue
-        all_transitions.append({
-            'name': key,
-            'molecule': molecule,
-            'upper': upper,
-            'lower': lower,
-            'energy_level': energy_level,
-            'grid_data': grid_dict[key],
-        })
+    if verbose:
+        print('Molecule priority order (higher in numerator): '
+              f'{dict(sorted(MOLECULE_RATIO_PRIORITY.items(), key=lambda x: x[1], reverse=True))}')
 
-    # Create ratios within same molecule (higher energy / lower energy)
-    molecules = {}
-    for trans in all_transitions:
-        mol = trans['molecule']
-        if mol not in molecules:
-            molecules[mol] = []
-        molecules[mol].append(trans)
-    
-    for molecule, transitions in molecules.items():
-        if len(transitions) > 1:
-            # Sort by energy level (higher energy transitions first)
-            transitions.sort(key=lambda x: x['energy_level'], reverse=True)
-            
-            # Create ratios: higher transition / lower transition
-            for i in range(len(transitions)):
-                for j in range(i+1, len(transitions)):
-                    numerator = transitions[i]
-                    denominator = transitions[j]
-                    
-                    # Verify higher/lower ordering
-                    if numerator['energy_level'] > denominator['energy_level']:
-                        # Create ratio name
-                        ratio_name = f"{numerator['name']}/{denominator['name']}"
-                        
-                        # Calculate ratio grid
-                        num_grid = numerator['grid_data']['grid']
-                        den_grid = denominator['grid_data']['grid']
-                        
-                        # Avoid division by zero
-                        ratio_grid = np.divide(num_grid, den_grid, 
-                                             out=np.full_like(num_grid, np.nan), 
-                                             where=(den_grid != 0) & (~np.isnan(den_grid)))
-                        ax1, ax2 = _spatial_keys(numerator['grid_data'])
-                        ratio_grids[ratio_name] = {
-                            'grid': ratio_grid,
-                            ax1: numerator['grid_data'][ax1],
-                            ax2: numerator['grid_data'][ax2],
-                        }
-                        
-                        print(f"  Created: {ratio_name}")
-    
-    # Define molecule priority (higher number = higher priority, goes in numerator)
-    # Based on your examples: C+ > C > HCO+ > CO
-    molecule_priority = {
-        'C+'    : 13,
-        'C'     : 12,
-        'HCO+'  : 11,
-        'CO'    : 10,
-        '13CO'  : 9,
-        'C18O'  : 8,
-        'H13CO+': 7,
-        'HCN'   : 6,
-        'HNC'   : 5 ,
-        'H3O+'  : 4 ,
-        'N2H+'  : 3,
-        'SO2'   : 2,
-        'SO'    : 1,
-        'AR'    : 0 
-    }
-    
-    print(f"Molecule priority order (higher in numerator): {dict(sorted(molecule_priority.items(), key=lambda x: x[1], reverse=True))}")
-    
-    # Get unique molecules and create unique pairs to avoid duplicates
-    unique_molecules = list(molecules.keys())
-    
-    # Process each unique pair of molecules only once
-    for i, mol1 in enumerate(unique_molecules):
-        for j, mol2 in enumerate(unique_molecules):
-            if i < j:  # Only process unique pairs once (i < j ensures each pair processed only once)
-                # Determine which molecule should be in numerator based on priority
-                priority1 = molecule_priority.get(mol1, 0)
-                priority2 = molecule_priority.get(mol2, 0)
-                
-                if priority1 > priority2:
-                    numerator_transitions = molecules[mol1]
-                    denominator_transitions = molecules[mol2]
-                elif priority2 > priority1:
-                    numerator_transitions = molecules[mol2]
-                    denominator_transitions = molecules[mol1]
-                else:
-                    # Equal priority, skip to avoid duplicates
-                    continue
-                
-                # Create ratios: higher_priority_molecule / lower_priority_molecule
-                for num_trans in numerator_transitions:
-                    for den_trans in denominator_transitions:
-                        # Create ratio name
-                        ratio_name = f"{num_trans['name']}/{den_trans['name']}"
-                        
-                        # Check if this ratio already exists (safety check)
-                        if ratio_name in ratio_grids:
-                            print(f"  Warning: {ratio_name} already exists, skipping duplicate")
-                            continue
-                        
-                        # Calculate ratio grid
-                        num_grid = num_trans['grid_data']['grid']
-                        den_grid = den_trans['grid_data']['grid']
-                        
-                        # Avoid division by zero
-                        ratio_grid = np.divide(num_grid, den_grid, 
-                                             out=np.full_like(num_grid, np.nan), 
-                                             where=(den_grid != 0) & (~np.isnan(den_grid)))
-                        ax1, ax2 = _spatial_keys(num_trans['grid_data'])
-                        ratio_grids[ratio_name] = {
-                            'grid': ratio_grid,
-                            ax1: num_trans['grid_data'][ax1],
-                            ax2: num_trans['grid_data'][ax2],
-                        }
-                        
-                        print(f"  Created: {ratio_name}")
-    
-    print(f"Total ratios created: {len(ratio_grids)}")
+    for num_key, den_key in transition_ratio_pairs(transition_keys):
+        if num_key not in grid_dict or den_key not in grid_dict:
+            continue
+        ratio_name = f'{num_key}/{den_key}'
+        if ratio_name in ratio_grids:
+            if verbose:
+                print(f'  Warning: {ratio_name} already exists, skipping duplicate')
+            continue
+        num_data = grid_dict[num_key]
+        den_data = grid_dict[den_key]
+        ratio_grid = divide_ratio_grids(num_data['grid'], den_data['grid'])
+        ax1, ax2 = _spatial_keys(num_data)
+        ratio_grids[ratio_name] = {
+            'grid': ratio_grid,
+            ax1: num_data[ax1],
+            ax2: num_data[ax2],
+        }
+        if verbose:
+            print(f'  Created: {ratio_name}')
+
+    if verbose:
+        print(f'Total ratios created: {len(ratio_grids)}')
     return ratio_grids
 ########################################################################################################################################
 #                                               Function for reading FITS files and creating grid structure
@@ -564,17 +576,7 @@ def create_transition_ratios_3d(species_list, grid_dict_3d, convert_transition_n
                         print(f"  Created 3D ratio: {ratio_name}")
     
     # Define molecule priority (higher number = higher priority, goes in numerator)
-    molecule_priority = {
-        'C+'    : 9,
-        'C'     : 8,
-        'HCO+'  : 7,
-        'CO'    : 6,
-        '13CO'  : 5,
-        'C18O'  : 4,
-        'H13CO+': 3,
-        'HNC'   : 2,
-        'HCN'   : 1 
-    }
+    molecule_priority = MOLECULE_RATIO_PRIORITY
     
     # Get unique molecules and create unique pairs
     unique_molecules = list(molecules.keys())

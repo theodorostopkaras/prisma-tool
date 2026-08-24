@@ -13,6 +13,7 @@ import grid_interp as gi
 import grid_naming as gn
 import map_fit as _map_fit_mod
 import smli_labels
+import plot_style as ps
 
 try:
     from astropy.io import fits
@@ -587,7 +588,7 @@ def fig_fits_map(
     t = _fit_theme_colors(theme)
     fig.update_layout(
         title=dict(text=title, x=0.02, xanchor='left',
-                   font=dict(size=13, color=t['title'])),
+                   font=ps.title_font(t['title'])),
         paper_bgcolor=t['paper_bg'],
         plot_bgcolor=t['plot_bg'],
         margin=dict(l=60, r=20, t=48, b=54),
@@ -595,15 +596,15 @@ def fig_fits_map(
         height=plot_height,
         font=dict(color=t['font']),
         xaxis=dict(
-            title=dict(text=x_label, font=dict(color=t['font'])),
+            title=dict(text=x_label, font=ps.axis_title_font(t['font'])),
             showgrid=True, gridcolor=t['grid'],
-            tickfont=dict(color=t['font']),
+            tickfont=ps.tick_font(t['font']),
             **x_axis_kw,
         ),
         yaxis=dict(
-            title=dict(text=y_label, font=dict(color=t['font'])),
+            title=dict(text=y_label, font=ps.axis_title_font(t['font'])),
             showgrid=True, gridcolor=t['grid'],
-            tickfont=dict(color=t['font']),
+            tickfont=ps.tick_font(t['font']),
             scaleanchor='x', scaleratio=sky_ratio,
             **y_axis_kw,
         ),
@@ -691,7 +692,7 @@ def fig_chi2_dominant_map(
     fig.update_layout(
         title=dict(
             text='Dominant χ² contributor at best-fit grid point',
-            x=0.02, xanchor='left', font=dict(size=13, color=t['title']),
+            x=0.02, xanchor='left', font=ps.title_font(t['title']),
         ),
         paper_bgcolor=t['paper_bg'],
         plot_bgcolor=t['plot_bg'],
@@ -701,15 +702,15 @@ def fig_chi2_dominant_map(
         font=dict(color=t['font']),
         legend=dict(title='Dominant line', font=dict(color=t['font'])),
         xaxis=dict(
-            title=dict(text=x_label, font=dict(color=t['font'])),
+            title=dict(text=x_label, font=ps.axis_title_font(t['font'])),
             showgrid=True, gridcolor=t['grid'],
-            tickfont=dict(color=t['font']),
+            tickfont=ps.tick_font(t['font']),
             **x_axis_kw,
         ),
         yaxis=dict(
-            title=dict(text=y_label, font=dict(color=t['font'])),
+            title=dict(text=y_label, font=ps.axis_title_font(t['font'])),
             showgrid=True, gridcolor=t['grid'],
-            tickfont=dict(color=t['font']),
+            tickfont=ps.tick_font(t['font']),
             scaleanchor='x', scaleratio=sky_ratio,
             **y_axis_kw,
         ),
@@ -799,7 +800,7 @@ def fig_chi2_pixel_map(
         ))
     t = _fit_theme_colors(theme)
     fig.update_layout(
-        title=dict(text=title, x=0.02, xanchor='left', font=dict(size=13, color=t['title'])),
+        title=dict(text=title, x=0.02, xanchor='left', font=ps.title_font(t['title'])),
         paper_bgcolor=t['paper_bg'],
         plot_bgcolor=t['plot_bg'],
         margin=dict(l=60, r=20, t=48, b=54),
@@ -925,7 +926,7 @@ def fig_chi2_corner(
 
     t = _fit_theme_colors(theme)
     fig.update_layout(
-        title=dict(text=title, x=0.02, xanchor='left', font=dict(size=13, color=t['title'])),
+        title=dict(text=title, x=0.02, xanchor='left', font=ps.title_font(t['title'])),
         paper_bgcolor=t['paper_bg'],
         plot_bgcolor=t['plot_bg'],
         margin=dict(l=60, r=20, t=56, b=54),
@@ -979,7 +980,7 @@ def fig_chi2_vs_third_axis(chi2_results: dict, *, theme: str = 'light') -> Any:
     fig.update_layout(
         title=dict(
             text=f'Δχ² vs {z_label} (marginalized over other axes)',
-            x=0.02, xanchor='left', font=dict(size=13, color=t['title']),
+            x=0.02, xanchor='left', font=ps.title_font(t['title']),
         ),
         paper_bgcolor=t['paper_bg'],
         plot_bgcolor=t['plot_bg'],
@@ -1030,7 +1031,7 @@ def fig_chi2_obs_model_bars(
     fig.update_layout(
         title=dict(
             text='Observed vs model at best-fit point',
-            x=0.02, xanchor='left', font=dict(size=13, color=t['title']),
+            x=0.02, xanchor='left', font=ps.title_font(t['title']),
         ),
         barmode='group',
         paper_bgcolor=t['paper_bg'],
@@ -1111,7 +1112,7 @@ def fig_fitted_params_kde(result: dict, *, theme: str = 'light') -> Any:
     fig.update_layout(
         title=dict(
             text='KDE of fitted parameters (valid map pixels)',
-            x=0.02, xanchor='left', font=dict(size=13, color=t['title']),
+            x=0.02, xanchor='left', font=ps.title_font(t['title']),
         ),
         paper_bgcolor=t['paper_bg'],
         plot_bgcolor=t['plot_bg'],
@@ -1294,7 +1295,7 @@ def fig_species_contour_slices(
     fig.update_layout(
         title=dict(
             text='Species contours (model = observed) at best-fit slices',
-            x=0.02, xanchor='left', font=dict(size=13, color=t['title']),
+            x=0.02, xanchor='left', font=ps.title_font(t['title']),
         ),
         paper_bgcolor=t['paper_bg'],
         plot_bgcolor=t['plot_bg'],

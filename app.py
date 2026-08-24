@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-KOSMA-tau Grid Explorer
-=======================
+PRISMA - PDR Results Interactive Simulation Mapping & Analysis
+==============================================================
 
 Interactive browser for KOSMA-tau / KoSens3D photodissociation-region (PDR)
 model grids.
@@ -49,7 +49,7 @@ import numpy as np
 import h5py
 
 import dash
-from dash import dcc, html, Input, Output, State, ALL
+from dash import dcc, html, Input, Output, State, ALL, MATCH
 from dash.exceptions import PreventUpdate
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -63,6 +63,8 @@ import cr_attenuation as cra
 import grid_naming as gn
 import rgb_phase
 import chem_network
+import plot_style as ps
+import map_fit_extras as mfe
 
 
 # --- CLI ----------------------------------------------------------------------
@@ -77,7 +79,7 @@ DEFAULT_OBS_V_HIGH = 20.0
 DEFAULT_DIR = '/home/teotopkaras/Desktop/Projects/Models/new_teo_grid/pdrgrid_hdf5'
 
 
-parser = argparse.ArgumentParser(description="KOSMA-tau Grid Explorer")
+parser = argparse.ArgumentParser(description="PRISMA - PDR Results Interactive Simulation Mapping & Analysis")
 parser.add_argument('--dir', default=DEFAULT_DIR, type=str,
                     help='Directory of per-model .hdf5 files, or a single .hdf5 model.')
 parser.add_argument('--recursive', action='store_true',
@@ -196,6 +198,7 @@ COMPACT_FIG_HEIGHT = int(round(
 ))
 # Page shell: wide enough for three compact panels side by side.
 APP_MAX_WIDTH = 'min(1920px, 98vw)'
+# Plot text sizes live in plot_style.py (PLOT_AXIS_FONT_SIZE, PLOT_TICK_FONT_SIZE, …).
 # Legacy alias used by a few non-compact figure paths.
 COMPACT_CONTOUR_PANEL_W = COMPACT_PLOT_BOX
 INTERP_METHOD_OPTIONS = [
@@ -1691,6 +1694,63 @@ def _integrate_sphere(radius_pc, profile):
     return float(np.trapezoid(4.0 * np.pi * radius_cm ** 2 * prof_cm, radius_cm))
 
 
+def _integrate_sphere_columns(radius_pc, dens):
+    """Volume integrals for every species column of ``dens[n_r, n_sp]``."""
+    radius = np.asarray(radius_pc, dtype=float)
+    dens = np.asarray(dens, dtype=float)
+    if dens.ndim == 1:
+        dens = dens[:, None]
+    n = min(radius.size, dens.shape[0])
+    n_sp = dens.shape[1]
+    if n == 0 or n_sp == 0:
+        return np.full(n_sp, np.nan)
+    radius = radius[:n]
+    dens = dens[:n]
+    radius_cm = np.empty(n + 1, dtype=float)
+    radius_cm[0] = 0.0
+    radius_cm[1:] = radius[::-1] * PC_TO_CM
+    dens_cm = np.empty((n + 1, n_sp), dtype=float)
+    flipped = dens[::-1]
+    dens_cm[0] = flipped[0]
+    dens_cm[1:] = flipped
+    integrand = (4.0 * np.pi * radius_cm[:, None] ** 2) * dens_cm
+    return np.trapezoid(integrand, radius_cm, axis=0)
+
+
+def _integrated_x_for_species(model, species_names):
+    """Clump-integrated X for many species from one dens array."""
+    out = {sp: np.nan for sp in species_names}
+    if not species_names or not _grid or model.get('radius') is None:
+        return out
+    dens = np.asarray(model.get('dens'), dtype=float)
+    if dens.ndim != 2 or dens.size == 0:
+        return out
+    idx_map = _grid['species_idx']
+    idx_h = idx_map.get('H')
+    idx_h2 = idx_map.get('H2')
+    if idx_h is None or idx_h2 is None:
+        return out
+    wanted = []
+    for sp in species_names:
+        idx = idx_map.get(sp)
+        if idx is not None and 0 <= idx < dens.shape[1]:
+            wanted.append(idx)
+    cols = sorted(set([idx_h, idx_h2] + wanted))
+    cols = [c for c in cols if 0 <= c < dens.shape[1]]
+    if not cols:
+        return out
+    masses = _integrate_sphere_columns(model['radius'], dens[:, cols])
+    mass_of = {c: masses[i] for i, c in enumerate(cols)}
+    m_total = mass_of.get(idx_h, np.nan) + 2.0 * mass_of.get(idx_h2, np.nan)
+    if not np.isfinite(m_total) or m_total <= 0:
+        return out
+    for sp in species_names:
+        idx = idx_map.get(sp)
+        if idx in mass_of:
+            out[sp] = mass_of[idx] / m_total
+    return out
+
+
 def _integrate_rate_volume(radius_pc, rate, density):
     """Integral of 4 pi r^2 rate(r) n_spec(r) dr (KoSens chem contribution)."""
     radius = np.asarray(radius_pc, dtype=float)
@@ -2106,9 +2166,10 @@ def _base_layout(theme='light'):
         paper_bgcolor=t['paper_bg'],
         plot_bgcolor=t['plot_bg'],
         margin=dict(l=70, r=20, t=44, b=54),
-        font=dict(family='Arial, sans-serif', size=12, color=t['font']),
+        font=ps.layout_font(t['font']),
         height=320,
-        legend=dict(bgcolor=t['legend_bg'], borderwidth=1, bordercolor=t['legend_border']),
+        legend=dict(bgcolor=t['legend_bg'], borderwidth=1, bordercolor=t['legend_border'],
+                    font=ps.legend_font(t['font'])),
     )
 
 
@@ -2118,7 +2179,7 @@ def _axis_style(theme='light'):
         showgrid=True, gridcolor=t['grid'], gridwidth=1,
         zeroline=False, linecolor=t['axis_line'], mirror=True,
         exponentformat='e', showexponent='all',
-        tickfont=dict(color=t['font']),
+        tickfont=ps.tick_font(t['font']),
     )
 
 
@@ -2130,14 +2191,14 @@ def _apply_layout(fig, title, xlabel, xtype, xrange, ylabel, ytype, theme='light
         uirev = f'{uirev}|{uirevision_extra}'
     fig.update_layout(
         **_base_layout(theme),
-        title=dict(text=title, font=dict(size=13, color=t['title']), x=0.02, xanchor='left'),
+        title=dict(text=title, font=ps.title_font(t['title']), x=0.02, xanchor='left'),
         # Reset zoom/colorbar when log↔linear / A_V range changes (uirevision must change).
         uirevision=uirev,
         xaxis=dict(**_axis_style(theme),
-                   title=dict(text=xlabel, font=dict(size=12, color=t['font'])),
+                   title=dict(text=xlabel, font=ps.axis_title_font(t['font'])),
                    type=xtype, range=xrange, autorange=False),
         yaxis=dict(**_axis_style(theme),
-                   title=dict(text=ylabel, font=dict(size=12, color=t['font'])),
+                   title=dict(text=ylabel, font=ps.axis_title_font(t['font'])),
                    type=ytype, autorange=True),
     )
 
@@ -2592,7 +2653,7 @@ def fig_reactions(filepath, species, mode, xscale, yscale, top_n, model=None,
                   uirevision_extra=av_range)
     yr_tag = f'{yr[0]:.4g}:{yr[1]:.4g}' if yr is not None else 'auto'
     fig.update_layout(
-        legend=dict(font=dict(size=10)),
+        legend=dict(font=ps.legend_font()),
         uirevision=(
             f'react|{xt}|{yscale}|{av_range}|{top_n}|{species}|{mode}|'
             f'{ranking_metric}|{yr_tag}|{_parse_plot_theme(theme)}'
@@ -2756,7 +2817,30 @@ def _quantity_label(quantity):
     if quantity.startswith('species:'):
         sp = quantity.split(':', 1)[1]
         return f'X<sub>{format_species_html(sp)}</sub>'
+    if quantity.startswith('X(') and ')/X(' in quantity:
+        try:
+            left, right = quantity.split(')/X(', 1)
+            num = left[2:]
+            den = right.rstrip(')')
+            return (f'X<sub>{format_species_html(num)}</sub>/'
+                    f'X<sub>{format_species_html(den)}</sub>')
+        except ValueError:
+            return quantity
     return quantity
+
+
+def _as_str_list(value):
+    """Normalize a dropdown value to a list of non-empty strings."""
+    if value is None or value == '':
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value if v is not None and v != '']
+    return [str(value)]
+
+
+def _first_str(value):
+    items = _as_str_list(value)
+    return items[0] if items else None
 
 
 def get_grid_scalar(filepath, quantity):
@@ -2833,8 +2917,8 @@ def _contour_colorbar(title, theme='light', zscale='log'):
     else:
         tick_kw = dict(exponentformat='e', showexponent='all')
     return dict(
-        title=dict(text=title, font=dict(size=11, color=t['font'])),
-        tickfont=dict(size=10, color=t['font']),
+        title=dict(text=title, font=ps.cbar_title_font(t['font'])),
+        tickfont=ps.cbar_tick_font(t['font']),
         len=0.82,
         thickness=14,
         x=1.02,
@@ -2877,17 +2961,17 @@ def _compact_slice_layout_kw(title, xlabel, ylabel, theme='light', uirevision='s
     t = _theme_colors(theme)
     axis_common = dict(
         type='linear', showgrid=bool(showgrid), gridcolor=t['grid'],
-        linecolor=t['axis_line'], tickfont=dict(color=t['font']),
+        linecolor=t['axis_line'], tickfont=ps.tick_font(t['font']),
         constrain='domain',
         fixedrange=False,
     )
     xaxis = dict(
-        title=dict(text=xlabel, font=dict(size=11, color=t['font'])),
+        title=dict(text=xlabel, font=ps.axis_title_font(t['font'])),
         domain=list(_COMPACT_XDOMAIN),
         **axis_common,
     )
     yaxis = dict(
-        title=dict(text=ylabel, font=dict(size=11, color=t['font'])),
+        title=dict(text=ylabel, font=ps.axis_title_font(t['font'])),
         domain=list(_COMPACT_YDOMAIN),
         **axis_common,
     )
@@ -2902,7 +2986,7 @@ def _compact_slice_layout_kw(title, xlabel, ylabel, theme='light', uirevision='s
     else:
         yaxis['autorange'] = True
     return dict(
-        title=dict(text=title, font=dict(size=12, color=t['title']),
+        title=dict(text=title, font=ps.title_font(t['title']),
                    x=0.02, xanchor='left'),
         paper_bgcolor=t['paper_bg'],
         plot_bgcolor=t['plot_bg'],
@@ -2910,7 +2994,7 @@ def _compact_slice_layout_kw(title, xlabel, ylabel, theme='light', uirevision='s
         height=COMPACT_FIG_HEIGHT,
         autosize=False,
         margin=dict(_COMPACT_FIG_MARGIN),
-        font=dict(family='Arial, sans-serif', size=12, color=t['font']),
+        font=ps.layout_font(t['font']),
         uirevision=uirevision,
         xaxis=xaxis,
         yaxis=yaxis,
@@ -2936,11 +3020,11 @@ def _apply_square_contour_layout(fig, x_plot, y_plot, xdef, ydef, title,
         ))
         return fig
 
-    title_kw = dict(text=title, font=dict(size=13, color=t['title']),
+    title_kw = dict(text=title, font=ps.title_font(t['title']),
                     x=0.02, xanchor='left')
     axis_common = dict(
         type='linear', showgrid=True, gridcolor=t['grid'],
-        linecolor=t['axis_line'], tickfont=dict(color=t['font']),
+        linecolor=t['axis_line'], tickfont=ps.tick_font(t['font']),
         autorange=True,
     )
     aspect = _contour_data_aspect(x_plot, y_plot)
@@ -2954,15 +3038,15 @@ def _apply_square_contour_layout(fig, x_plot, y_plot, xdef, ydef, title,
         height=fig_h,
         autosize=False,
         margin=dict(l=60, r=80, t=52, b=54),
-        font=dict(family='Arial, sans-serif', size=12, color=t['font']),
+        font=ps.layout_font(t['font']),
         uirevision=uirev,
         xaxis=dict(
-            title=dict(text=_axis_label_contour(xdef), font=dict(size=12, color=t['font'])),
+            title=dict(text=_axis_label_contour(xdef), font=ps.axis_title_font(t['font'])),
             constrain='domain',
             **axis_common,
         ),
         yaxis=dict(
-            title=dict(text=_axis_label_contour(ydef), font=dict(size=12, color=t['font'])),
+            title=dict(text=_axis_label_contour(ydef), font=ps.axis_title_font(t['font'])),
             scaleanchor='x', scaleratio=aspect,
             constrain='domain',
             **axis_common,
@@ -3206,8 +3290,34 @@ def _parse_spaghetti_contour_spec(text, available_keys=None):
     return entries
 
 
+def compute_chi2_surface(x_plot, y_plot, grids, levels, errors):
+    """Compute χ² = Σ ((Z − level)/error)² surface over the grid.
+
+    Returns
+    -------
+    chi2_grid : 2-D array shaped (len(y_plot), len(x_plot))
+        The χ² value at each grid point.
+    """
+    x_arr = np.asarray(x_plot, dtype=float)
+    y_arr = np.asarray(y_plot, dtype=float)
+    chi2_grid = np.zeros((y_arr.size, x_arr.size), dtype=float)
+    
+    for grid, level, err in zip(grids, levels, errors):
+        z = np.asarray(grid, dtype=float)
+        if z.shape == (y_arr.size, x_arr.size) and err > 0:
+            residual = (z - level) / err
+            chi2_grid += np.where(np.isfinite(residual), residual ** 2, 0)
+    
+    return chi2_grid
+
+
 def find_nearest_contour_point(x_plot, y_plot, grids, levels, errors):
     """Minimise χ² = Σ ((Z − level)/error)² over plot-coordinate space.
+
+    Uses multiple starting points to avoid local minima:
+    - Grid center
+    - Grid corners
+    - Points near the minimum of the chi2 surface
 
     Parameters
     ----------
@@ -3221,12 +3331,12 @@ def find_nearest_contour_point(x_plot, y_plot, grids, levels, errors):
     Returns
     -------
     dict or None
-        ``x``, ``y`` (plot coords), ``chi2``, ``relative_chi2`` on success.
+        ``x``, ``y`` (plot coords), ``chi2``, ``relative_chi2``, ``chi2_surface`` on success.
     """
     from scipy.interpolate import RegularGridInterpolator
     from scipy.optimize import minimize
 
-    if len(grids) < 2:
+    if len(grids) < 1:
         return None
     x_arr = np.asarray(x_plot, dtype=float)
     y_arr = np.asarray(y_plot, dtype=float)
@@ -3236,6 +3346,15 @@ def find_nearest_contour_point(x_plot, y_plot, grids, levels, errors):
     y_min, y_max = float(np.nanmin(y_arr)), float(np.nanmax(y_arr))
     if not np.isfinite([x_min, x_max, y_min, y_max]).all():
         return None
+
+    # Compute chi2 surface for plotting and finding starting points
+    chi2_surface = compute_chi2_surface(x_plot, y_plot, grids, levels, errors)
+    
+    # Find approximate minimum from grid (for starting point)
+    finite_chi2 = np.where(np.isfinite(chi2_surface), chi2_surface, np.inf)
+    min_idx = np.unravel_index(np.argmin(finite_chi2), finite_chi2.shape)
+    grid_min_x = x_arr[min_idx[1]]
+    grid_min_y = y_arr[min_idx[0]]
 
     interpolators = []
     for grid in grids:
@@ -3255,50 +3374,132 @@ def find_nearest_contour_point(x_plot, y_plot, grids, levels, errors):
                 chi2 += ((val - level) / err) ** 2
         return chi2
 
-    result = minimize(
-        chi2_func,
-        np.array([(x_min + x_max) / 2.0, (y_min + y_max) / 2.0]),
-        method='L-BFGS-B',
-        bounds=[(x_min, x_max), (y_min, y_max)],
-    )
-    if not result.success:
-        return None
-    chi2_min = float(result.fun)
+    # Multiple starting points: center, corners, grid minimum, and intermediate points
+    starting_points = [
+        ((x_min + x_max) / 2.0, (y_min + y_max) / 2.0),  # center
+        (grid_min_x, grid_min_y),                         # grid-based minimum
+        (x_min, y_min), (x_max, y_min),                   # corners
+        (x_min, y_max), (x_max, y_max),
+        ((x_min + x_max) / 2.0, y_min),                   # edge midpoints
+        ((x_min + x_max) / 2.0, y_max),
+        (x_min, (y_min + y_max) / 2.0),
+        (x_max, (y_min + y_max) / 2.0),
+    ]
+    
+    best_result = None
+    best_chi2 = np.inf
+    
+    for x0, y0 in starting_points:
+        try:
+            result = minimize(
+                chi2_func,
+                np.array([x0, y0]),
+                method='L-BFGS-B',
+                bounds=[(x_min, x_max), (y_min, y_max)],
+            )
+            if result.success and result.fun < best_chi2:
+                best_chi2 = result.fun
+                best_result = result
+        except Exception:
+            continue
+    
+    if best_result is None:
+        # Fall back to grid minimum
+        best_x, best_y = grid_min_x, grid_min_y
+        best_chi2 = float(finite_chi2[min_idx])
+    else:
+        best_x = float(best_result.x[0])
+        best_y = float(best_result.x[1])
+        best_chi2 = float(best_result.fun)
+    
     n = len(levels)
     return dict(
-        x=float(result.x[0]),
-        y=float(result.x[1]),
-        chi2=chi2_min,
-        relative_chi2=chi2_min / n if n else chi2_min,
+        x=best_x,
+        y=best_y,
+        chi2=best_chi2,
+        relative_chi2=best_chi2 / n if n else best_chi2,
+        chi2_surface=chi2_surface,
     )
 
 
 def _add_spaghetti_contour(fig, x_plot, y_plot, z, level, error, color, name,
                            show_band=True):
-    """Draw one observed-level contour (+ optional ±error band) on ``fig``."""
+    """Draw one observed-level contour (+ optional ±error band) on ``fig``.
+    
+    Error bands are shown as filled regions between level-error and level+error,
+    with thin dashed boundary lines.
+    """
     z_arr = np.asarray(z, dtype=float)
     if not np.any(np.isfinite(z_arr)):
         return False
     drawn = False
+    fill_color = _hex_to_rgba(color, INT_SPAGHETTI_BAND_OPACITY)
+
+    # Draw error band as filled region between lower and upper contours
     if show_band and error is not None and error > 0:
         lo, hi = float(level - error), float(level + error)
-        if hi > lo:
-            fill = _hex_to_rgba(color, INT_SPAGHETTI_BAND_OPACITY)
-            fig.add_trace(go.Contour(
-                x=x_plot, y=y_plot, z=z_arr,
-                contours=dict(
-                    coloring='fill', showlines=False,
-                    start=lo, end=hi, size=max(hi - lo, 1e-30),
-                ),
-                colorscale=[[0, fill], [1, fill]],
-                showscale=False,
-                hoverinfo='skip',
-                name=f'{name} ±err',
+        
+        # Extract paths for lower and upper bounds
+        paths_lo = gf._extract_contour_paths(x_plot, y_plot, z_arr, lo)
+        paths_hi = gf._extract_contour_paths(x_plot, y_plot, z_arr, hi)
+        
+        # Create filled polygons between lower and upper contour paths
+        # Try to pair paths and create filled regions
+        if paths_lo and paths_hi:
+            # For each pair of lo/hi paths, create a filled polygon
+            for i, path_lo in enumerate(paths_lo):
+                path_hi = paths_hi[i] if i < len(paths_hi) else paths_hi[-1]
+                # Create closed polygon: go along hi path, then reverse along lo path
+                poly_x = list(path_hi[:, 0]) + list(path_lo[::-1, 0]) + [path_hi[0, 0]]
+                poly_y = list(path_hi[:, 1]) + list(path_lo[::-1, 1]) + [path_hi[0, 1]]
+                fig.add_trace(go.Scatter(
+                    x=poly_x, y=poly_y,
+                    mode='lines',
+                    line=dict(width=0),
+                    fill='toself',
+                    fillcolor=fill_color,
+                    legendgroup=name,
+                    showlegend=False,
+                    hoverinfo='skip',
+                ))
+                drawn = True
+        elif paths_lo or paths_hi:
+            # If only one bound exists, draw it as a thin line
+            for path in (paths_lo or paths_hi):
+                fig.add_trace(go.Scatter(
+                    x=path[:, 0], y=path[:, 1],
+                    mode='lines',
+                    line=dict(color=color, width=1.0, dash='dot'),
+                    legendgroup=name,
+                    showlegend=False,
+                    hoverinfo='skip',
+                    opacity=0.5,
+                ))
+                drawn = True
+        
+        # Draw boundary lines (thin dashed) for the error bounds
+        for path in paths_lo:
+            fig.add_trace(go.Scatter(
+                x=path[:, 0], y=path[:, 1],
+                mode='lines',
+                line=dict(color=color, width=0.8, dash='dot'),
+                legendgroup=name,
                 showlegend=False,
-                opacity=1.0,
+                hoverinfo='skip',
+                opacity=0.7,
             ))
-            drawn = True
+        for path in paths_hi:
+            fig.add_trace(go.Scatter(
+                x=path[:, 0], y=path[:, 1],
+                mode='lines',
+                line=dict(color=color, width=0.8, dash='dot'),
+                legendgroup=name,
+                showlegend=False,
+                hoverinfo='skip',
+                opacity=0.7,
+            ))
 
+    # Draw the main contour line at the central level (on top)
     paths = gf._extract_contour_paths(x_plot, y_plot, z_arr, level)
     for i, path in enumerate(paths):
         fig.add_trace(go.Scatter(
@@ -3311,6 +3512,7 @@ def _add_spaghetti_contour(fig, x_plot, y_plot, z, level, error, color, name,
             hoverinfo='skip',
         ))
         drawn = True
+    
     if not paths:
         # Fallback: Plotly Contour line when matplotlib finds no path.
         fig.add_trace(go.Contour(
@@ -3328,6 +3530,7 @@ def _add_spaghetti_contour(fig, x_plot, y_plot, z, level, error, color, name,
         ))
         fin = z_arr[np.isfinite(z_arr)]
         drawn = fin.size > 0 and float(np.nanmin(fin)) <= level <= float(np.nanmax(fin))
+
     return drawn
 
 
@@ -3336,17 +3539,17 @@ def fig_spaghetti_plane(plane, slice_idx, contour_entries, idef,
                         show_error_bands=True, mark_closest=True):
     """KoSens-style spaghetti plot: multi-line observed contours on one slice."""
     if not plane.get('active'):
-        return placeholder_fig(theme=theme), None
+        return placeholder_fig(theme=theme), None, None
     if not _grid or not _simline:
-        return placeholder_fig('Load grids and a SIMLINE directory', theme=theme), None
+        return placeholder_fig('Load grids and a SIMLINE directory', theme=theme), None, None
     if not contour_entries:
         return placeholder_fig(
-            'Provide observed intensities (line = value) above', theme=theme), None
+            'Provide observed intensities (line = value) above', theme=theme), None, None
 
     sk = plane['slice']
     slice_tokens = _grid['axis_tokens'][sk]
     if not slice_tokens:
-        return placeholder_fig('No slice axis', theme=theme), None
+        return placeholder_fig('No slice axis', theme=theme), None, None
     try:
         slice_token = slice_tokens[int(slice_idx)]
     except (IndexError, TypeError, ValueError):
@@ -3379,7 +3582,7 @@ def fig_spaghetti_plane(plane, slice_idx, contour_entries, idef,
 
     if not names or x_plot is None:
         return placeholder_fig('No matching SIMLINE lines for the given names',
-                               theme=theme), None
+                               theme=theme), None, None
 
     t = _theme_colors(theme)
     sdef = _param_def(sk)
@@ -3419,55 +3622,126 @@ def fig_spaghetti_plane(plane, slice_idx, contour_entries, idef,
 
     if n_drawn == 0:
         return placeholder_fig('Contours outside grid range for this slice',
-                               theme=theme), chi2_info
+                               theme=theme), None, chi2_info
 
     fig = _apply_square_contour_layout(
         fig, x_plot, y_plot, xdef, ydef, title,
         fixed_size=True, theme=theme, zscale='linear',
     )
+    # Legend sits in the reserved right strip (axis domain ends at 0.84),
+    # outside the heatmap and still inside this panel.
     fig.update_layout(
         showlegend=True,
         legend=dict(
             orientation='v',
             yanchor='top', y=1.0,
-            xanchor='left', x=1.02,
+            xanchor='left', x=_COMPACT_XDOMAIN[1] + 0.015,
             bgcolor=t['legend_bg'],
             bordercolor=t['legend_border'],
             borderwidth=1,
-            font=dict(size=10, color=t['font']),
-            tracegroupgap=2,
+            font=ps.legend_font(t['font']),
+            tracegroupgap=1,
+            itemsizing='constant',
+            itemwidth=30,
         ),
-        margin=dict(l=64, r=160, t=52, b=58),
     )
-    # Widen figure slightly for the legend strip.
-    if fig.layout.width:
-        fig.update_layout(width=int(fig.layout.width) + 70)
-    return fig, chi2_info
+
+    # Create chi2 surface figure
+    chi2_fig = None
+    if chi2_info is not None and 'chi2_surface' in chi2_info:
+        chi2_surface = chi2_info['chi2_surface']
+        chi2_title = (f'{plane["title"]} \u2014 \u03c7\u00b2 surface<br>'
+                      f'<sup style="font-size:13px">{sdef["name"]} = {slice_disp}{slice_unit}'
+                      f'  |  min \u03c7\u00b2 = {chi2_info["chi2"]:.3g}</sup>')
+
+        # Use log scale for better visualization of chi2 variations
+        chi2_log = np.log10(np.clip(chi2_surface, 1e-10, None))
+
+        chi2_fig = go.Figure()
+        chi2_fig.add_trace(go.Heatmap(
+            x=x_plot, y=y_plot, z=chi2_log,
+            colorscale='Viridis_r',
+            colorbar=_contour_colorbar(
+                'log\u2081\u2080(\u03c7\u00b2)', theme=theme, zscale='log',
+            ),
+            hovertemplate='x: %{x:.3g}<br>y: %{y:.3g}<br>log₁₀(χ²): %{z:.3g}<extra></extra>',
+        ))
+        # Mark the minimum
+        chi2_fig.add_trace(go.Scatter(
+            x=[chi2_info['x']], y=[chi2_info['y']],
+            mode='markers',
+            marker=dict(symbol='star', size=14, color='red',
+                        line=dict(width=1.5, color='white')),
+            name='\u03c7\u00b2 min',
+            showlegend=False,
+            hovertemplate=(
+                f'χ² min = {chi2_info["chi2"]:.4g}<br>'
+                f'x: {chi2_info["x"]:.4g}<br>y: {chi2_info["y"]:.4g}<extra></extra>'
+            ),
+        ))
+        chi2_fig = _apply_square_contour_layout(
+            chi2_fig, x_plot, y_plot, xdef, ydef, chi2_title,
+            fixed_size=True, theme=theme, zscale='linear',
+        )
+        # Pin the colorbar to the reserved strip, matching the heatmap height.
+        cbar = chi2_fig.data[0].colorbar
+        cbar.x = _COMPACT_XDOMAIN[1] + 0.015
+        cbar.xanchor = 'left'
+        cbar.xpad = 2
+        cbar.len = _COMPACT_YSPAN
+        cbar.lenmode = 'fraction'
+        cbar.y = 0.5
+        cbar.yanchor = 'middle'
+        cbar.thickness = 16
+        cbar.title.font.size = ps.PLOT_CBAR_FONT_SIZE
+        cbar.tickfont.size = ps.PLOT_CBAR_TICK_FONT_SIZE
+        chi2_fig.update_layout(showlegend=False)
+    
+    return fig, chi2_fig, chi2_info
 
 
 def make_spaghetti_plots(contour_text, idef, slice_indices,
                          interp_config=None, theme='light', slider_values=None,
                          show_error_bands=True, mark_closest=True):
-    """Build spaghetti figures for every active slice plane."""
+    """Build spaghetti figures for every active slice plane.
+    
+    Returns
+    -------
+    spaghetti_figs : list of go.Figure
+        Spaghetti contour figures (one per active slice plane).
+    chi2_figs : list of go.Figure
+        Chi2 surface figures (one per active slice plane).
+    chi2_info : dict or None
+        Info about the best chi2 minimum across all planes.
+    """
     available = gf.list_simline_line_keys(_simline, idef or SIMLINE_DEFAULT_IDEF) if _simline else []
     entries = _parse_spaghetti_contour_spec(contour_text, available_keys=available)
-    figs = []
+    spaghetti_figs = []
+    chi2_figs = []
     chi2_first = None
     for i, plane in enumerate(active_slice_planes()):
-        fig, chi2_info = fig_spaghetti_plane(
-            plane, slice_indices[i], entries, idef,
-            interp_config=interp_config, theme=theme,
-            slider_values=slider_values,
-            show_error_bands=show_error_bands,
-            mark_closest=mark_closest,
-        ) if plane.get('active') else (placeholder_fig(theme=theme), None)
-        figs.append(fig)
+        if plane.get('active'):
+            fig, chi2_fig, chi2_info = fig_spaghetti_plane(
+                plane, slice_indices[i], entries, idef,
+                interp_config=interp_config, theme=theme,
+                slider_values=slider_values,
+                show_error_bands=show_error_bands,
+                mark_closest=mark_closest,
+            )
+        else:
+            fig = placeholder_fig(theme=theme)
+            chi2_fig = placeholder_fig(theme=theme)
+            chi2_info = None
+        spaghetti_figs.append(fig)
+        chi2_figs.append(chi2_fig if chi2_fig else placeholder_fig('Need ≥1 line for χ² surface', theme=theme))
         if chi2_first is None and chi2_info is not None:
             chi2_first = dict(chi2_info)
+            # Remove the surface from the summary dict (too large to store)
+            chi2_first.pop('chi2_surface', None)
             chi2_first['plane'] = plane.get('title') or plane.get('id')
             chi2_first['n_lines'] = len(entries)
             chi2_first['names'] = [e['name'] for e in entries]
-    return tuple(figs), chi2_first
+    return tuple(spaghetti_figs), tuple(chi2_figs), chi2_first
 
 
 def _spaghetti_status_children(chi2_info, theme='light'):
@@ -3502,14 +3776,14 @@ def _multi_panel_layout_kw(theme='light', height=420):
         width=None,
         height=height,
         margin=dict(l=58, r=88, t=64, b=50),
-        font=dict(family='Arial, sans-serif', size=12, color=t['font']),
+        font=ps.layout_font(t['font']),
     )
 
 
 def _subplot_axis_kw(theme='light'):
     t = _theme_colors(theme)
     return dict(showgrid=True, gridcolor=t['grid'], zeroline=False,
-                linecolor=t['axis_line'], tickfont=dict(color=t['font']))
+                linecolor=t['axis_line'], tickfont=ps.tick_font(t['font']))
 
 
 def _overlay_path_for_tokens(tokens):
@@ -3707,7 +3981,7 @@ def fig_interpolation_comparison(result, xdef, ydef, *, title, zscale, color_map
         contour_kw['line']['width'] = 0
     cbar_tick = dict(exponentformat='none' if zscale == 'log' else 'e',
                      showexponent='none' if zscale == 'log' else 'all',
-                     tickfont=dict(size=9, color=t['font']))
+                     tickfont=ps.cbar_tick_font(t['font']))
     flux_z = {}
     if z0a is not None and z1a is not None:
         flux_z = dict(zmin=min(z0a, z1a), zmax=max(z0b, z1b), zauto=False)
@@ -3726,19 +4000,19 @@ def fig_interpolation_comparison(result, xdef, ydef, *, title, zscale, color_map
     )
     fig.add_trace(go.Contour(
         x=x_plot_n, y=y_plot_n, z=z0, colorscale=cmap,
-        colorbar=dict(title=dict(text=flux_cbar, font=dict(size=10, color=t['font'])),
+        colorbar=dict(title=dict(text=flux_cbar, font=ps.cbar_title_font(t['font'])),
                       len=0.88, thickness=12, x=0.28, xref='paper', **cbar_tick),
         **flux_z, **contour_kw), row=1, col=1)
     fig.add_trace(go.Contour(
         x=x_plot_f, y=y_plot_f, z=z1, colorscale=cmap,
-        colorbar=dict(title=dict(text=flux_cbar, font=dict(size=10, color=t['font'])),
+        colorbar=dict(title=dict(text=flux_cbar, font=ps.cbar_title_font(t['font'])),
                       len=0.88, thickness=12, x=0.635, xref='paper', **cbar_tick),
         **flux_z, **contour_kw), row=1, col=2)
     fig.add_trace(go.Contour(
         x=x_plot_n, y=y_plot_n, z=err, colorscale=ERROR_PANEL_CMAP,
-        colorbar=dict(title=dict(text=err_cbar, font=dict(size=10, color=t['font'])),
+        colorbar=dict(title=dict(text=err_cbar, font=ps.cbar_title_font(t['font'])),
                       len=0.88, thickness=12, x=1.01, xref='paper',
-                      tickfont=dict(size=9, color=t['font'])),
+                      tickfont=ps.cbar_tick_font(t['font'])),
         connectgaps=False,
         hovertemplate='x=%{x:.3g}<br>y=%{y:.3g}<br>z=%{z:.3g}<extra></extra>',
     ), row=1, col=3)
@@ -3755,7 +4029,7 @@ def fig_interpolation_comparison(result, xdef, ydef, *, title, zscale, color_map
 
     fig.update_layout(
         title=dict(text=f'{title}<br><sup style="font-size:11px">{stats_note}</sup>',
-                   font=dict(size=13, color=t['title']), x=0.01, xanchor='left'),
+                   font=ps.title_font(t['title']), x=0.01, xanchor='left'),
         uirevision=f'interp|{zscale}|{_parse_plot_theme(theme)}',
         **_multi_panel_layout_kw(theme, height=420),
     )
@@ -3958,7 +4232,7 @@ def fig_triple_atten_grid(plane, slice_title, Z_ref, Z_atten, x_phys, y_phys,
     contour_kw['line']['width'] = 0.6
     cbar_tick = dict(exponentformat='none' if zscale == 'log' else 'e',
                      showexponent='none' if zscale == 'log' else 'all',
-                     tickfont=dict(size=9, color=t['font']))
+                     tickfont=ps.cbar_tick_font(t['font']))
 
     panel = 380
     fig = make_subplots(
@@ -3980,18 +4254,18 @@ def fig_triple_atten_grid(plane, slice_title, Z_ref, Z_atten, x_phys, y_phys,
         flux_z = dict(zmin=min(z0min, z1min), zmax=max(z0max, z1max), zauto=False)
     fig.add_trace(go.Contour(
         x=x_plot, y=y_plot, z=p0, colorscale=cmap,
-        colorbar=dict(title=dict(text=cbar_ref, font=dict(size=10, color=t['font'])),
+        colorbar=dict(title=dict(text=cbar_ref, font=ps.cbar_title_font(t['font'])),
                       len=0.88, thickness=12, x=0.30, xref='paper', **cbar_tick),
         **flux_z, **contour_kw), row=1, col=1)
     fig.add_trace(go.Contour(
         x=x_plot, y=y_plot, z=p1, colorscale=cmap,
-        colorbar=dict(title=dict(text=cbar_ref, font=dict(size=10, color=t['font'])),
+        colorbar=dict(title=dict(text=cbar_ref, font=ps.cbar_title_font(t['font'])),
                       len=0.88, thickness=12, x=0.635, xref='paper', **cbar_tick),
         **flux_z, **contour_kw), row=1, col=2)
     fig.add_trace(go.Contour(
         x=x_plot, y=y_plot, z=shift, colorscale=shift_cmap,
         colorbar=dict(title=dict(text=_shift_panel_colorbar_title(xdef),
-                                 font=dict(size=10, color=t['font'])),
+                                 font=ps.cbar_title_font(t['font'])),
                       len=0.88, thickness=12, x=1.01, xref='paper'),
         **shift_trace_kw, **contour_kw), row=1, col=3)
 
@@ -4008,8 +4282,8 @@ def fig_triple_atten_grid(plane, slice_title, Z_ref, Z_atten, x_phys, y_phys,
     layout_kw = _multi_panel_layout_kw(theme, height=panel + 95)
     layout_kw.update(
         margin=dict(l=62, r=80, t=70, b=48),
-        font=dict(family='Arial, sans-serif', size=11, color=t['font']),
-        title=dict(text=slice_title, font=dict(size=13, color=t['title']),
+        font=ps.layout_font(t['font']),
+        title=dict(text=slice_title, font=ps.title_font(t['title']),
                    x=0.01, xanchor='left'),
         uirevision=f'triple|{zscale}|{_parse_plot_theme(theme)}',
     )
@@ -4086,12 +4360,79 @@ def build_overlay_slice_grid(plane, slice_token, quantity, interp_config=None):
     return x_phys, y_phys, Z, xdef, ydef
 
 
+def build_slice_grids_for_quantities(plane, slice_token, quantities, interp_config=None,
+                                     overlay=False):
+    """Build several 2-D slice maps from one walk over the model files.
+
+    Species abundances are integrated together from each model's dens array so
+    ``Add all species`` does not repeat the HDF5 / volume-integral work.
+    """
+    quantities = [q for q in dict.fromkeys(quantities) if q]
+    if not quantities or not plane.get('active') or not _grid:
+        return {q: None for q in quantities}
+
+    xk, yk, sk = _plane_plot_axes(plane)
+    x_tokens = _grid['axis_tokens'][xk]
+    y_tokens = _grid['axis_tokens'][yk]
+    xdef, ydef = _param_def(xk), _param_def(yk)
+    nx, ny = len(x_tokens), len(y_tokens)
+    Zs = {q: np.full((ny, nx), np.nan) for q in quantities}
+
+    species_qtys = [q for q in quantities if str(q).startswith('species:')]
+    other_qtys = [q for q in quantities if q not in species_qtys]
+    species_names = [q.split(':', 1)[1] for q in species_qtys]
+
+    ixk, iyk, isk = _PARAM_IDX[xk], _PARAM_IDX[yk], _PARAM_IDX[sk]
+    base_tokens = [_middle_token(p['key']) for p in PARAM_DEFS]
+
+    for ix, xt in enumerate(x_tokens):
+        for iy, yt in enumerate(y_tokens):
+            tokens = list(base_tokens)
+            tokens[ixk] = xt
+            tokens[iyk] = yt
+            tokens[isk] = slice_token
+            path = (_overlay_path_for_tokens(tokens) if overlay
+                    else _grid['files'].get(tuple(tokens)))
+            if not path:
+                continue
+            if species_qtys:
+                model = get_model(path)
+                xs = _integrated_x_for_species(model, species_names)
+                for q, sp in zip(species_qtys, species_names):
+                    val = xs[sp]
+                    Zs[q][iy, ix] = val
+                    _scalar_cache[(path, q)] = val
+            for q in other_qtys:
+                Zs[q][iy, ix] = get_grid_scalar(path, q)
+
+    x_phys = np.array([_physical_param_value(xdef['key'], t) for t in x_tokens], dtype=float)
+    y_phys = np.array([_physical_param_value(ydef['key'], t) for t in y_tokens], dtype=float)
+    results = {}
+    for q, Z in Zs.items():
+        xp, yp, Zq = gi.align_grid_axes_ascending(
+            x_phys, y_phys, Z,
+            x_logscale=xdef['logscale'],
+            y_logscale=ydef['logscale'],
+        )
+        if interp_config:
+            results[q] = resample_slice_grid(xp, yp, Zq, xdef, ydef, **interp_config)
+        else:
+            results[q] = (xp, yp, Zq, xdef, ydef)
+    return results
+
+
 def fig_contour_plane(plane, slice_idx, quantity, zscale,
                       shift_rtol=X_SHIFT_MATCH_RTOL,
                       shift_scan_direction=X_SHIFT_SCAN_DIRECTION,
                       interp_config=None,
-                      colorscale=DEFAULT_GRID_COLORMAP, theme='light'):
-    """Contour plot for one (x, y) slice plane with the third axis on a slider."""
+                      colorscale=DEFAULT_GRID_COLORMAP, theme='light',
+                      slice_grid=None, overlay_grid=None, show_lines=True):
+    """Contour plot for one (x, y) slice plane with the third axis on a slider.
+
+    ``slice_grid`` / ``overlay_grid`` are optional precomputed
+    ``(x_phys, y_phys, Z, xdef, ydef)`` tuples from
+    ``build_slice_grids_for_quantities``.
+    """
     if not plane.get('active'):
         return placeholder_fig(theme=theme)
     if not _grid:
@@ -4108,39 +4449,46 @@ def fig_contour_plane(plane, slice_idx, quantity, zscale,
         slice_token = slice_tokens[0]
 
     sdef = _param_def(sk)
-    x_phys, y_phys, Z, xdef, ydef = build_slice_grid(
-        plane, slice_token, quantity, interp_config=interp_config)
+    if slice_grid is not None:
+        x_phys, y_phys, Z, xdef, ydef = slice_grid
+    else:
+        x_phys, y_phys, Z, xdef, ydef = build_slice_grid(
+            plane, slice_token, quantity, interp_config=interp_config)
 
     if not np.any(np.isfinite(Z)):
         return placeholder_fig('No model points for this slice', theme=theme)
 
     slice_disp = _param_token_disp(sdef, slice_token)
     unit = f' {sdef["unit"]}' if sdef['unit'] else ''
-    slice_title = (f'{plane["title"]}<br>'
-                   f'<sup style="font-size:11px">{sdef["name"]} = {slice_disp}{unit}</sup>')
-
     qlabel = _quantity_label(quantity)
+    slice_title = (f'{plane["title"]}<br>'
+                   f'<sup style="font-size:11px">{sdef["name"]} = {slice_disp}{unit}'
+                   f'  \u2014  {qlabel}</sup>')
+
     if zscale == 'log':
         cbar_title = f'log<sub>10</sub>({qlabel})'
     else:
         cbar_title = qlabel
 
     cmap = _parse_grid_colorscale(colorscale)
-    if _overlay:
+    Z_ov = None
+    if overlay_grid is not None:
+        _, _, Z_ov, _, _ = overlay_grid
+    elif _overlay and slice_grid is None:
         _, _, Z_ov, _, _ = build_overlay_slice_grid(
             plane, slice_token, quantity, interp_config=interp_config)
-        if np.any(np.isfinite(Z_ov)):
-            return fig_triple_atten_grid(
-                plane, slice_title, Z, Z_ov, x_phys, y_phys, xdef, ydef, zscale, cbar_title,
-                shift_rtol=shift_rtol, shift_scan_direction=shift_scan_direction,
-                colorscale=cmap, theme=theme)
+    if Z_ov is not None and np.any(np.isfinite(Z_ov)):
+        return fig_triple_atten_grid(
+            plane, slice_title, Z, Z_ov, x_phys, y_phys, xdef, ydef, zscale, cbar_title,
+            shift_rtol=shift_rtol, shift_scan_direction=shift_scan_direction,
+            colorscale=cmap, theme=theme)
 
     Zplot, zmin, zmax = _apply_zscale(Z, zscale)
 
     x_plot = _axis_plot_coords(x_phys, xdef)
     y_plot = _axis_plot_coords(y_phys, ydef)
 
-    trace_kw = _contour_trace_kw(theme, show_lines=True)
+    trace_kw = _contour_trace_kw(theme, show_lines=show_lines)
     if zmin is not None:
         trace_kw = {**trace_kw, 'zmin': zmin, 'zmax': zmax, 'zauto': False}
     fig = go.Figure(go.Contour(
@@ -4160,15 +4508,76 @@ def make_contour_plots(quantity, zscale, slice_indices,
                        shift_scan_direction=X_SHIFT_SCAN_DIRECTION,
                        interp_config=None,
                        colorscale=DEFAULT_GRID_COLORMAP, theme='light'):
-    """Return one contour figure per active slice-plane slot."""
+    """Return one contour figure per active slice-plane slot.
+
+    ``quantity`` may be a single value or a list; the first entry is plotted
+    on the primary three panels.
+    """
+    qty = _first_str(quantity)
+    if not qty:
+        return tuple(placeholder_fig('Load a grid and pick a quantity', theme=theme)
+                     for _ in SLICE_PLANES)
     return tuple(
-        fig_contour_plane(plane, slice_indices[i], quantity, zscale,
+        fig_contour_plane(plane, slice_indices[i], qty, zscale,
                           shift_rtol=shift_rtol, shift_scan_direction=shift_scan_direction,
                           interp_config=interp_config,
                           colorscale=colorscale, theme=theme)
         if plane.get('active') else placeholder_fig(theme=theme)
         for i, plane in enumerate(active_slice_planes())
     )
+
+
+def _intensity_map_combos(species_value, transition_value, idef):
+    """``(species, transition_idx)`` pairs that exist in the loaded SIMLINE grid.
+
+    Transition dropdown indices come from the first selected species. Other
+    species are matched by spectroscopic transition name when possible, then
+    by row index.
+    """
+    combos = []
+    seen = set()
+    idef = idef or SIMLINE_DEFAULT_IDEF
+    species_list = _as_str_list(species_value)
+    trans_vals = _as_str_list(transition_value)
+    if not species_list or not trans_vals:
+        return combos
+
+    primary_opts = _simline_transition_options(species_list[0], idef)
+    wanted = []
+    for raw in trans_vals:
+        try:
+            tidx = int(raw)
+        except (TypeError, ValueError):
+            continue
+        tname = None
+        if 0 <= tidx < len(primary_opts):
+            tname = primary_opts[tidx].get('transition')
+        wanted.append((tidx, tname))
+
+    for sp in species_list:
+        opts = _simline_transition_options(sp, idef)
+        n = len(opts)
+        name_to_idx = {}
+        for o in opts:
+            name = o.get('transition')
+            if name is None:
+                continue
+            try:
+                name_to_idx[str(name)] = int(o.get('idx', o.get('value')))
+            except (TypeError, ValueError):
+                continue
+        for tidx, tname in wanted:
+            if tname is not None and str(tname) in name_to_idx:
+                mapped = name_to_idx[str(tname)]
+            elif 0 <= tidx < n:
+                mapped = tidx
+            else:
+                continue
+            key = (sp, mapped)
+            if key not in seen:
+                seen.add(key)
+                combos.append(key)
+    return combos
 
 
 def build_intensity_slice_grid(plane, slice_token, species, idef, transition_idx,
@@ -4302,11 +4711,17 @@ def make_intensity_contour_plots(species, idef, transition_idx, zscale, slice_in
                                  show_obs_boundary=True,
                                  extra_contour_levels=None,
                                  extra_contour_color='black'):
-    """Return one SIMLINE intensity contour per active slice plane."""
-    try:
-        tidx = int(transition_idx)
-    except (TypeError, ValueError):
-        tidx = 0
+    """Return one SIMLINE intensity contour per active slice plane.
+
+    ``species`` / ``transition_idx`` may be lists; the first valid
+    (species, transition) pair is drawn on the primary three panels.
+    """
+    combos = _intensity_map_combos(species, transition_idx, idef)
+    if not combos:
+        return tuple(placeholder_fig('Load grids and pick species / transition',
+                                     theme=theme)
+                     for _ in SLICE_PLANES)
+    species, tidx = combos[0]
     idef = idef or SIMLINE_DEFAULT_IDEF
     line_contours = _build_intensity_line_contours(
         idef, zscale or 'log', show_obs_boundary,
@@ -4631,54 +5046,68 @@ def make_intensity_rgb_plots(line_keys, idef, transition_flags, slice_indices,
 
 
 def fig_intensity_spectrum(values, species, idef, theme='light', int_slice_indices=None):
-    """All SIMLINE line intensities for the selected model point."""
+    """All SIMLINE line intensities for the selected model point.
+
+    ``species`` may be a list; each selected species is overplotted.
+    """
     if not _grid:
         return placeholder_fig('Load a grid or SIMLINE directory', theme=theme)
     if not _simline:
         return placeholder_fig('Load a SIMLINE directory on the Load tab', theme=theme)
-    if not species:
+    species_list = _as_str_list(species)
+    if not species_list:
         return placeholder_fig('Select a species', theme=theme)
 
     tokens = _model_point_tokens(values, int_slice_indices)
     if tokens is None:
         return placeholder_fig('No model file for this parameter combination', theme=theme)
 
-    path = smli_file(tokens, species, idef or SIMLINE_DEFAULT_IDEF)
-    if not path:
-        return placeholder_fig('No .smli file for this model point / species', theme=theme)
-
-    rows = read_smli_file(path)
-    if not rows:
-        return placeholder_fig('Empty .smli file', theme=theme)
-
-    freqs = np.array([r['frequency'] for r in rows], dtype=float)
-    ints = np.array([r['intensity'] for r in rows], dtype=float)
-    labels = [_smli_transition_label(r['transition']) for r in rows]
     idef = idef or SIMLINE_DEFAULT_IDEF
     unit = _intensity_unit_label(idef)
     ylab = _quantity_axis_label(idef)
-    sp_html = format_species_html(species)
     t = _theme_colors(theme)
     qty_word = 'optical depths' if idef == 'tau' else 'intensities'
     y_hover = '\u03c4 = %{y:.4g}' if idef == 'tau' else 'I = %{y:.4g}'
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=freqs, y=ints, mode='lines+markers',
-        marker=dict(size=5, color='#1f77b4'),
-        line=dict(color='#1f77b4', width=1.5),
-        text=labels,
-        hovertemplate=f'%{{text}}<br>\u03bd = %{{x:.4g}} GHz<br>{y_hover}<extra></extra>',
-    ))
+    any_rows = False
+    all_positive = True
+    for i, sp in enumerate(species_list):
+        path = smli_file(tokens, sp, idef)
+        if not path:
+            continue
+        rows = read_smli_file(path)
+        if not rows:
+            continue
+        any_rows = True
+        freqs = np.array([r['frequency'] for r in rows], dtype=float)
+        ints = np.array([r['intensity'] for r in rows], dtype=float)
+        labels = [_smli_transition_label(r['transition']) for r in rows]
+        color = COLORS[i % len(COLORS)]
+        if not np.any(ints[np.isfinite(ints)] > 0):
+            all_positive = False
+        fig.add_trace(go.Scatter(
+            x=freqs, y=ints, mode='lines+markers',
+            marker=dict(size=5, color=color),
+            line=dict(color=color, width=1.5),
+            name=sp,
+            text=labels,
+            hovertemplate=f'{sp} %{{text}}<br>\u03bd = %{{x:.4g}} GHz<br>{y_hover}<extra></extra>',
+        ))
+    if not any_rows:
+        return placeholder_fig('No .smli file for this model point / species', theme=theme)
+
+    names = ', '.join(format_species_html(sp) for sp in species_list)
     fig.update_layout(
         **_base_layout(theme),
         title=dict(
-            text=f'{sp_html} line {qty_word}  [{unit}]',
-            font=dict(size=13, color=t['title']), x=0.02, xanchor='left'),
-        xaxis=dict(**_axis_style(theme), title=dict(text='Frequency (GHz)', font=dict(size=12)),
+            text=f'{names} line {qty_word}  [{unit}]',
+            font=ps.title_font(t['title']), x=0.02, xanchor='left'),
+        xaxis=dict(**_axis_style(theme), title=dict(text='Frequency (GHz)', font=ps.axis_title_font()),
                    type='linear'),
-        yaxis=dict(**_axis_style(theme), title=dict(text=ylab, font=dict(size=12)),
-                   type='log' if idef != 'tau' and np.all(ints[ints > 0] > 0) else 'linear'),
+        yaxis=dict(**_axis_style(theme), title=dict(text=ylab, font=ps.axis_title_font()),
+                   type='log' if idef != 'tau' and all_positive else 'linear'),
+        showlegend=len(species_list) > 1,
     )
     return fig
 
@@ -4969,14 +5398,14 @@ def fig_spectra_plot(values, species, transitions, positions_text,
     layout_kw = {
         **_base_layout(theme),
         'height': 380,
-        'title': dict(text=title, font=dict(size=13, color=t['title']),
+        'title': dict(text=title, font=ps.title_font(t['title']),
                       x=0.02, xanchor='left'),
         'xaxis': dict(**_axis_style(theme),
-                      title=dict(text='Velocity (km/s)', font=dict(size=12)),
+                      title=dict(text='Velocity (km/s)', font=ps.axis_title_font()),
                       type='linear'),
         'yaxis': dict(**_axis_style(theme),
                       title=dict(text=_pv_spectrum_ylabel(pv_quantity, bunit),
-                                 font=dict(size=12)),
+                                 font=ps.axis_title_font()),
                       type='linear'),
         'showlegend': len(fig.data) > 1,
     }
@@ -5069,12 +5498,12 @@ def fig_simline_pv(values, species, transition, pos_min, pos_max, zscale,
         'uirevision': f'pv|{cbar_zscale}|{_parse_plot_theme(theme)}',
         'title': dict(
             text=f'PV diagram — {sp_html} {tr_label}',
-            font=dict(size=13, color=t['title']), x=0.02, xanchor='left'),
+            font=ps.title_font(t['title']), x=0.02, xanchor='left'),
         'xaxis': dict(**_axis_style(theme),
-                      title=dict(text='Position offset (arcsec)', font=dict(size=12, color=t['font'])),
+                      title=dict(text='Position offset (arcsec)', font=ps.axis_title_font(t['font'])),
                       type='linear'),
         'yaxis': dict(**_axis_style(theme),
-                      title=dict(text='Velocity (km/s)', font=dict(size=12, color=t['font'])),
+                      title=dict(text='Velocity (km/s)', font=ps.axis_title_font(t['font'])),
                       type='linear'),
     }
     fig.update_layout(**layout_kw)
@@ -5285,16 +5714,16 @@ def fig_cr_attenuation(profiles, active_keys, x_axis='nh2', show_padovani=True,
         'height': 560,
         'title': dict(
             text='Cosmic-ray attenuation profiles',
-            font=dict(size=14, color=t['title']), x=0.02, xanchor='left'),
+            font=ps.title_font(t['title']), x=0.02, xanchor='left'),
         'xaxis': dict(**_axis_style(theme),
-                      title=dict(text=x_title, font=dict(size=13)),
+                      title=dict(text=x_title, font=ps.axis_title_font()),
                       type=x_type, range=x_range),
         'yaxis': dict(**_axis_style(theme),
-                      title=dict(text='ζ<sub>H₂</sub> (s⁻¹)', font=dict(size=13)),
+                      title=dict(text='ζ<sub>H₂</sub> (s⁻¹)', font=ps.axis_title_font()),
                       type='log',
                       range=y_range),
         'showlegend': True,
-        'legend': dict(font=dict(size=11)),
+        'legend': dict(font=ps.legend_font()),
     }
     fig.update_layout(**layout_kw)
     return fig
@@ -5361,8 +5790,9 @@ def make_thermal_plots(values, xvar, xscale, yscale, theme='light',
 
 app = dash.Dash(
     __name__,
-    title='KOSMA-\u03C4 Grid Explorer',
+    title='PRISMA - PDR Results Interactive Simulation Mapping & Analysis',
     meta_tags=[{'name': 'viewport', 'content': 'width=device-width, initial-scale=1'}],
+    suppress_callback_exceptions=True,
 )
 server = app.server
 
@@ -5380,12 +5810,21 @@ _XVAR_OPTIONS = [{'label': ' A\u1D65 (mag)', 'value': 'Av'},
                  {'label': ' n_H (cm\u207B\u00B3)', 'value': 'nH'}]
 
 _CTRL_LABEL = {'fontWeight': '600', 'fontSize': '13px', 'display': 'block', 'marginBottom': '5px'}
+_ALL_BTN_STYLE = {
+    'padding': '7px 12px', 'backgroundColor': '#1f77b4', 'color': 'white',
+    'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
+    'fontSize': '12px', 'fontWeight': '600', 'whiteSpace': 'nowrap',
+    'marginTop': '22px',
+}
 _CTRL_BOX = {'flex': '1', 'minWidth': '110px', 'marginRight': '18px'}
 _GRAPH_CFG = {'toImageButtonOptions': {'format': 'png', 'scale': 2}}
 _SLICE_GRAPH_CFG = {**_GRAPH_CFG, 'responsive': False}
 _TAB_STYLE = {'padding': '10px 18px', 'fontWeight': '600', 'fontSize': '13px'}
 _TAB_SEL = {'borderTop': '3px solid #1f77b4', 'padding': '10px 18px',
             'fontWeight': '700', 'fontSize': '13px', 'backgroundColor': '#f5f7ff'}
+_NESTED_TAB_STYLE = {'padding': '8px 14px', 'fontWeight': '600', 'fontSize': '12px'}
+_NESTED_TAB_SEL = {'borderTop': '3px solid #1f77b4', 'padding': '8px 14px',
+                   'fontWeight': '700', 'fontSize': '12px', 'backgroundColor': '#f5f7ff'}
 _PAGE_INTRO = {'margin': '0 0 12px', 'fontSize': '13px', 'opacity': 0.88}
 _PANEL_ROW = {
     'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
@@ -5647,6 +6086,7 @@ def _spaghetti_controls():
            style={'display': 'flex', 'alignItems': 'flex-start', 'flexWrap': 'wrap',
                   'padding': '12px 18px', 'marginBottom': '8px'}),
         html.Div(id='int-spaghetti-status', style={'padding': '0 18px 8px'}),
+        # Spaghetti contour plots
         html.Div(
             [_rgb_slice_panel(p['id'], prefix='int-spag-',
                               plot_id=f'plot-int-spag-{p["id"]}')
@@ -5654,6 +6094,27 @@ def _spaghetti_controls():
             id='int-spag-panels-wrap',
             style=_SLICE_PANELS_ROW_STYLE,
         ),
+        # Chi2 surface plots (below spaghetti)
+        html.Details([
+            html.Summary('\u03c7\u00b2 surface plots (click to expand)',
+                         style={'fontSize': '13px', 'fontWeight': '600', 'cursor': 'pointer',
+                                'padding': '8px 0', 'color': '#1f77b4'}),
+            html.P('The \u03c7\u00b2 = \u03a3((Z - obs)/\u03c3)\u00b2 surface for each slice plane. '
+                   'Lower values (darker) indicate better fit. The star marks the minimum.',
+                   style={**_PAGE_INTRO, 'marginTop': '6px', 'marginBottom': '10px'}),
+            html.Div(
+                [html.Div([
+                    dcc.Graph(id=f'plot-int-spag-chi2-{p["id"]}', figure=placeholder_fig(),
+                              config=_SLICE_GRAPH_CFG, style=_SLICE_GRAPH_STYLE),
+                ], id=f'int-spag-chi2-panel-{p["id"]}', style=_SLICE_PANEL_ROW)
+                 for p in SLICE_PLANES],
+                id='int-spag-chi2-panels-wrap',
+                style={**_SLICE_PANELS_ROW_STYLE, 'flexWrap': 'nowrap',
+                       'overflowX': 'auto'},
+            ),
+        ], open=False, style={'marginTop': '12px', 'padding': '8px 0',
+                              'backgroundColor': 'rgba(31, 119, 180, 0.05)',
+                              'borderRadius': '8px', 'border': '1px solid rgba(31, 119, 180, 0.15)'}),
     ])
 
 
@@ -5865,15 +6326,16 @@ app.layout = html.Div(
 
     # Header + site-wide theme toggle (top-right)
     html.Div(id='app-header', children=[
+        html.Img(src='/assets/prisma_logo.png', id='app-logo', className='app-logo',
+                 style={'width': '72px', 'height': '72px', 'marginRight': '16px',
+                        'borderRadius': '12px', 'flexShrink': '0'}),
         html.Div(id='app-brand', className='app-brand', children=[
-            html.Span('KoSens3D \u00b7 PDR models', className='app-brand-kicker'),
+            html.Span('PDR Results Interactive Simulation Mapping & Analysis', className='app-brand-kicker'),
             html.H1([
-                html.Span('KOSMA-', className='app-brand-name'),
-                html.Span('\u03C4', className='app-brand-tau'),
-                html.Span(' Grid Explorer Toolkit', className='app-brand-name'),
+                html.Span('PRISMA', className='app-brand-name'),
             ], id='app-title', className='app-brand-title'),
             html.P(
-                'Browse photodissociation-region (PDR) model grids from KOSMA-\u03C4 models: '
+                'Browse photodissociation-region (PDR) model grids from KOSMA-\u03C4 / KoSens3D: '
                 'depth profiles, heating & cooling, chemistry, and SIMLINE line intensities '
                 'across density, FUV, cosmic-ray rate, and related parameters.',
                 id='app-subtitle',
@@ -5959,157 +6421,225 @@ app.layout = html.Div(
         dcc.Tab(label='Load grids', value='load', style=_TAB_STYLE, selected_style=_TAB_SEL,
                 children=[
             html.Div(style={'paddingTop': '14px'}, children=[
-                html.P('Load a main HDF5 model grid (a directory of files, or one .hdf5 model) '
-                       'and/or a SIMLINE intensity directory. '
-                       'If you only have SIMLINE output, load that directory alone — '
-                       'density, FUV, CRIR, mass, and other parameters are read from the '
-                       'filenames and drive the parameter sliders. HDF5-dependent tabs '
-                       '(profiles, chemistry, CR attenuation, etc.) stay disabled until '
-                       'a grid directory or HDF5 file is loaded.',
+                html.P('Load model grids and SIMLINE directories to explore PDR models. '
+                       'Primary grids drive the parameter sliders; overlay grids appear as '
+                       'dashed lines for comparison (e.g. attenuated vs. unattenuated models).',
                        style=_PAGE_INTRO),
 
+                # ═══════════════════════════════════════════════════════════════════
+                # PRIMARY GRIDS SECTION
+                # ═══════════════════════════════════════════════════════════════════
                 html.Div([
-                    html.Label('Grid directory or HDF5 file  (optional if SIMLINE is loaded)',
-                               style=_CTRL_LABEL),
+                    html.H3([
+                        html.Span('\u2605 ', style={'color': '#1f77b4', 'marginRight': '6px'}),
+                        'Primary Model Grids'
+                    ], className='load-section-title',
+                       style={'margin': '0 0 6px', 'fontSize': '16px', 'fontWeight': '700',
+                              'color': '#1a2a4a', 'borderBottom': '2px solid #1f77b4',
+                              'paddingBottom': '8px'}),
+                    html.P('Main HDF5 grid and SIMLINE output that define the parameter space. '
+                           'These grids populate the sliders and drive all visualizations.',
+                           style={'fontSize': '12px', 'color': '#666', 'margin': '0 0 14px',
+                                  'lineHeight': '1.5'}),
+
+                    # Main HDF5 Grid
                     html.Div([
-                        dcc.Input(id='dir-input', type='text', value=args.dir,
-                                  placeholder='/path/to/pdrgrid_hdf5  or  /path/to/model.hdf5',
-                                  style={'flex': '1', 'padding': '8px 10px', 'fontSize': '13px',
-                                         'border': '1px solid #bbc', 'borderRadius': '6px',
-                                         'marginRight': '10px'}),
-                        dcc.Checklist(id='recursive-check',
-                                      options=[{'label': ' recursive', 'value': 'rec'}],
-                                      value=['rec'] if args.recursive else [],
-                                      style={'fontSize': '13px', 'marginRight': '10px',
-                                             'whiteSpace': 'nowrap', 'alignSelf': 'center'}),
-                        html.Button('Load grid', id='btn-load', n_clicks=0,
-                                    style={'padding': '8px 22px', 'backgroundColor': '#1f77b4',
-                                           'color': 'white', 'border': 'none', 'borderRadius': '6px',
-                                           'cursor': 'pointer', 'fontSize': '13px', 'fontWeight': '600'}),
-                    ], style={'display': 'flex', 'alignItems': 'stretch'}),
-                ], className='kosma-panel kosma-panel-dashed',
-                          style={'padding': '14px 18px'}),
+                        html.Div([
+                            html.Span('\u25A0', style={'color': '#1f77b4', 'marginRight': '8px',
+                                                       'fontSize': '10px'}),
+                            html.Span('HDF5 Model Grid', style={'fontWeight': '700', 'fontSize': '13px'}),
+                            html.Span(' \u2014 depth profiles, abundances, heating/cooling',
+                                      style={'color': '#666', 'fontSize': '12px', 'marginLeft': '6px'}),
+                        ], style={'marginBottom': '8px'}),
+                        html.Div([
+                            dcc.Input(id='dir-input', type='text', value=args.dir,
+                                      placeholder='/path/to/pdrgrid_hdf5  or  /path/to/model.hdf5',
+                                      style={'flex': '1', 'padding': '8px 10px', 'fontSize': '13px',
+                                             'border': '1px solid #bbc', 'borderRadius': '6px',
+                                             'marginRight': '10px'}),
+                            dcc.Checklist(id='recursive-check',
+                                          options=[{'label': ' recursive', 'value': 'rec'}],
+                                          value=['rec'] if args.recursive else [],
+                                          style={'fontSize': '13px', 'marginRight': '10px',
+                                                 'whiteSpace': 'nowrap', 'alignSelf': 'center'}),
+                            html.Button('Load grid', id='btn-load', n_clicks=0,
+                                        style={'padding': '8px 22px', 'backgroundColor': '#1f77b4',
+                                               'color': 'white', 'border': 'none', 'borderRadius': '6px',
+                                               'cursor': 'pointer', 'fontSize': '13px', 'fontWeight': '600'}),
+                        ], style={'display': 'flex', 'alignItems': 'stretch'}),
+                        html.Div(id='load-status',
+                                 style={'marginTop': '7px', 'fontSize': '13px', 'minHeight': '18px'}),
+                    ], style={'padding': '12px 16px', 'backgroundColor': 'rgba(31, 119, 180, 0.06)',
+                              'borderRadius': '8px', 'border': '1px solid rgba(31, 119, 180, 0.2)',
+                              'marginBottom': '12px'}),
 
-                html.Div(id='load-status',
-                         style={'marginTop': '7px', 'fontSize': '13px', 'minHeight': '22px'}),
+                    # Chemistry Grid
+                    html.Div([
+                        html.Div([
+                            html.Span('\u25A0', style={'color': '#2ca02c', 'marginRight': '8px',
+                                                       'fontSize': '10px'}),
+                            html.Span('Chemistry Grid', style={'fontWeight': '700', 'fontSize': '13px'}),
+                            html.Span(' \u2014 reaction rates (enables Chemistry tab)',
+                                      style={'color': '#666', 'fontSize': '12px', 'marginLeft': '6px'}),
+                        ], style={'marginBottom': '8px'}),
+                        html.Div([
+                            dcc.Input(id='chem-dir-input', type='text', value='',
+                                      placeholder='/path/to/chemistrygrid  or  /path/to/chem_model.hdf5',
+                                      style={'flex': '1', 'padding': '8px 10px', 'fontSize': '13px',
+                                             'border': '1px solid #b9c5b0', 'borderRadius': '6px',
+                                             'marginRight': '10px'}),
+                            dcc.Checklist(id='chem-recursive-check',
+                                          options=[{'label': ' recursive', 'value': 'rec'}], value=[],
+                                          style={'fontSize': '13px', 'marginRight': '10px',
+                                                 'whiteSpace': 'nowrap', 'alignSelf': 'center'}),
+                            html.Button('Load chemistry', id='btn-load-chem', n_clicks=0,
+                                        style={'padding': '8px 18px', 'backgroundColor': '#2ca02c',
+                                               'color': 'white', 'border': 'none', 'borderRadius': '6px',
+                                               'cursor': 'pointer', 'fontSize': '13px', 'fontWeight': '600',
+                                               'marginRight': '8px'}),
+                            html.Button('Clear', id='btn-clear-chem', n_clicks=0,
+                                        style={'padding': '8px 16px', 'backgroundColor': '#eee',
+                                               'color': '#555', 'border': '1px solid #ccc',
+                                               'borderRadius': '6px', 'cursor': 'pointer', 'fontSize': '13px'}),
+                        ], style={'display': 'flex', 'alignItems': 'stretch'}),
+                        html.Div(id='chem-status',
+                                 style={'marginTop': '6px', 'fontSize': '13px', 'minHeight': '16px'}),
+                    ], style={'padding': '12px 16px', 'backgroundColor': 'rgba(44, 160, 44, 0.06)',
+                              'borderRadius': '8px', 'border': '1px solid rgba(44, 160, 44, 0.2)',
+                              'marginBottom': '12px'}),
+                    dcc.Store(id='chem-state', data=0),
 
+                    # SIMLINE Directory
+                    html.Div([
+                        html.Div([
+                            html.Span('\u25A0', style={'color': '#9467bd', 'marginRight': '8px',
+                                                       'fontSize': '10px'}),
+                            html.Span('SIMLINE Directory', style={'fontWeight': '700', 'fontSize': '13px'}),
+                            html.Span(' \u2014 line intensities & spectra (can load standalone)',
+                                      style={'color': '#666', 'fontSize': '12px', 'marginLeft': '6px'}),
+                        ], style={'marginBottom': '8px'}),
+                        html.Div([
+                            dcc.Input(id='simline-dir-input', type='text', value='',
+                                      placeholder='/path/to/simlineoutput',
+                                      style={'flex': '1', 'padding': '8px 10px', 'fontSize': '13px',
+                                             'border': '1px solid #b8c4d8', 'borderRadius': '6px',
+                                             'marginRight': '10px'}),
+                            dcc.Checklist(id='simline-recursive-check',
+                                          options=[{'label': ' recursive', 'value': 'rec'}], value=[],
+                                          style={'fontSize': '13px', 'marginRight': '10px',
+                                                 'whiteSpace': 'nowrap', 'alignSelf': 'center'}),
+                            html.Button('Load SIMLINE', id='btn-load-simline', n_clicks=0,
+                                        style={'padding': '8px 18px', 'backgroundColor': '#9467bd',
+                                               'color': 'white', 'border': 'none', 'borderRadius': '6px',
+                                               'cursor': 'pointer', 'fontSize': '13px', 'fontWeight': '600',
+                                               'marginRight': '8px'}),
+                            html.Button('Clear', id='btn-clear-simline', n_clicks=0,
+                                        style={'padding': '8px 16px', 'backgroundColor': '#eee',
+                                               'color': '#555', 'border': '1px solid #ccc',
+                                               'borderRadius': '6px', 'cursor': 'pointer', 'fontSize': '13px'}),
+                        ], style={'display': 'flex', 'alignItems': 'stretch'}),
+                        html.Div(id='simline-status',
+                                 style={'marginTop': '6px', 'fontSize': '13px', 'minHeight': '16px'}),
+                    ], style={'padding': '12px 16px', 'backgroundColor': 'rgba(148, 103, 189, 0.06)',
+                              'borderRadius': '8px', 'border': '1px solid rgba(148, 103, 189, 0.2)'}),
+                    dcc.Store(id='simline-state', data=0),
+
+                ], className='kosma-panel',
+                   style={'padding': '18px 20px', 'marginBottom': '20px'}),
+
+                # ═══════════════════════════════════════════════════════════════════
+                # OVERLAY GRIDS SECTION
+                # ═══════════════════════════════════════════════════════════════════
                 html.Div([
-                    html.Label('Overlay grid  (optional \u2014 e.g. attenuated; dashed lines)',
-                               style=_CTRL_LABEL),
+                    html.H3([
+                        html.Span('\u25CB ', style={'color': '#8c564b', 'marginRight': '6px'}),
+                        'Overlay Grids',
+                        html.Span(' (comparison)', style={'fontWeight': '400', 'fontSize': '13px',
+                                                          'color': '#888', 'marginLeft': '8px'}),
+                    ], className='load-section-title',
+                       style={'margin': '0 0 6px', 'fontSize': '16px', 'fontWeight': '700',
+                              'color': '#5a3a2a', 'borderBottom': '2px solid #8c564b',
+                              'paddingBottom': '8px'}),
+                    html.P('Secondary grids for comparison (e.g. attenuated CRIR models). '
+                           'Overlays appear as dashed lines on profile plots and enable '
+                           'triple-panel views on intensity grids.',
+                           style={'fontSize': '12px', 'color': '#666', 'margin': '0 0 14px',
+                                  'lineHeight': '1.5'}),
+
+                    # Overlay HDF5 Grid
                     html.Div([
-                        dcc.Input(id='overlay-dir-input', type='text', value='',
-                                  placeholder='/path/to/attenuated_grid_hdf5  or  /path/to/model.hdf5',
-                                  style={'flex': '1', 'padding': '8px 10px', 'fontSize': '13px',
-                                         'border': '1px solid #cbb', 'borderRadius': '6px',
-                                         'marginRight': '10px'}),
-                        dcc.Checklist(id='overlay-recursive-check',
-                                      options=[{'label': ' recursive', 'value': 'rec'}], value=[],
-                                      style={'fontSize': '13px', 'marginRight': '10px',
-                                             'whiteSpace': 'nowrap', 'alignSelf': 'center'}),
-                        html.Button('Load overlay', id='btn-load-overlay', n_clicks=0,
-                                    style={'padding': '8px 18px', 'backgroundColor': '#8c564b',
-                                           'color': 'white', 'border': 'none', 'borderRadius': '6px',
-                                           'cursor': 'pointer', 'fontSize': '13px', 'fontWeight': '600',
-                                           'marginRight': '8px'}),
-                        html.Button('Clear', id='btn-clear-overlay', n_clicks=0,
-                                    style={'padding': '8px 16px', 'backgroundColor': '#eee',
-                                           'color': '#555', 'border': '1px solid #ccc',
-                                           'borderRadius': '6px', 'cursor': 'pointer', 'fontSize': '13px'}),
-                    ], style={'display': 'flex', 'alignItems': 'stretch'}),
-                ], className='kosma-panel kosma-panel-dashed',
-                style={'padding': '12px 18px', 'marginTop': '10px'}),
+                        html.Div([
+                            html.Span('\u25CB', style={'color': '#8c564b', 'marginRight': '8px',
+                                                       'fontSize': '10px'}),
+                            html.Span('Overlay HDF5 Grid', style={'fontWeight': '700', 'fontSize': '13px'}),
+                            html.Span(' \u2014 dashed lines on profiles',
+                                      style={'color': '#666', 'fontSize': '12px', 'marginLeft': '6px'}),
+                        ], style={'marginBottom': '8px'}),
+                        html.Div([
+                            dcc.Input(id='overlay-dir-input', type='text', value='',
+                                      placeholder='/path/to/attenuated_grid_hdf5  or  /path/to/model.hdf5',
+                                      style={'flex': '1', 'padding': '8px 10px', 'fontSize': '13px',
+                                             'border': '1px solid #cbb', 'borderRadius': '6px',
+                                             'marginRight': '10px'}),
+                            dcc.Checklist(id='overlay-recursive-check',
+                                          options=[{'label': ' recursive', 'value': 'rec'}], value=[],
+                                          style={'fontSize': '13px', 'marginRight': '10px',
+                                                 'whiteSpace': 'nowrap', 'alignSelf': 'center'}),
+                            html.Button('Load overlay', id='btn-load-overlay', n_clicks=0,
+                                        style={'padding': '8px 18px', 'backgroundColor': '#8c564b',
+                                               'color': 'white', 'border': 'none', 'borderRadius': '6px',
+                                               'cursor': 'pointer', 'fontSize': '13px', 'fontWeight': '600',
+                                               'marginRight': '8px'}),
+                            html.Button('Clear', id='btn-clear-overlay', n_clicks=0,
+                                        style={'padding': '8px 16px', 'backgroundColor': '#eee',
+                                               'color': '#555', 'border': '1px solid #ccc',
+                                               'borderRadius': '6px', 'cursor': 'pointer', 'fontSize': '13px'}),
+                        ], style={'display': 'flex', 'alignItems': 'stretch'}),
+                        html.Div(id='overlay-status',
+                                 style={'marginTop': '6px', 'fontSize': '13px', 'minHeight': '16px'}),
+                    ], style={'padding': '12px 16px', 'backgroundColor': 'rgba(140, 86, 75, 0.06)',
+                              'borderRadius': '8px', 'border': '1px solid rgba(140, 86, 75, 0.2)',
+                              'marginBottom': '12px'}),
+                    dcc.Store(id='overlay-state', data=0),
 
-                html.Div(id='overlay-status',
-                         style={'marginTop': '6px', 'fontSize': '13px', 'minHeight': '20px'}),
-                html.Div([
-                    html.Label('Overlay SIMLINE directory  (optional \u2014 attenuated .smli; '
-                               'triple-panel shift on Intensities tab)', style=_CTRL_LABEL),
+                    # Overlay SIMLINE Directory
                     html.Div([
-                        dcc.Input(id='simline-overlay-dir-input', type='text', value='',
-                                  placeholder='/path/to/attenuated/simlineoutput',
-                                  style={'flex': '1', 'padding': '8px 10px', 'fontSize': '13px',
-                                         'border': '1px solid #cbb', 'borderRadius': '6px',
-                                         'marginRight': '10px'}),
-                        dcc.Checklist(id='simline-overlay-recursive-check',
-                                      options=[{'label': ' recursive', 'value': 'rec'}], value=[],
-                                      style={'fontSize': '13px', 'marginRight': '10px',
-                                             'whiteSpace': 'nowrap', 'alignSelf': 'center'}),
-                        html.Button('Load overlay SIMLINE', id='btn-load-simline-overlay', n_clicks=0,
-                                    style={'padding': '8px 18px', 'backgroundColor': '#8c564b',
-                                           'color': 'white', 'border': 'none', 'borderRadius': '6px',
-                                           'cursor': 'pointer', 'fontSize': '13px', 'fontWeight': '600',
-                                           'marginRight': '8px'}),
-                        html.Button('Clear', id='btn-clear-simline-overlay', n_clicks=0,
-                                    style={'padding': '8px 16px', 'backgroundColor': '#eee',
-                                           'color': '#555', 'border': '1px solid #ccc',
-                                           'borderRadius': '6px', 'cursor': 'pointer', 'fontSize': '13px'}),
-                    ], style={'display': 'flex', 'alignItems': 'stretch'}),
-                ], className='kosma-panel kosma-panel-dashed',
-                style={'padding': '10px 18px', 'marginTop': '8px'}),
-                html.Div(id='simline-overlay-status',
-                         style={'marginTop': '6px', 'fontSize': '13px', 'minHeight': '20px'}),
-                dcc.Store(id='overlay-state', data=0),
-                dcc.Store(id='simline-overlay-state', data=0),
+                        html.Div([
+                            html.Span('\u25CB', style={'color': '#8c564b', 'marginRight': '8px',
+                                                       'fontSize': '10px'}),
+                            html.Span('Overlay SIMLINE Directory', style={'fontWeight': '700', 'fontSize': '13px'}),
+                            html.Span(' \u2014 triple-panel shift on Intensities tab',
+                                      style={'color': '#666', 'fontSize': '12px', 'marginLeft': '6px'}),
+                        ], style={'marginBottom': '8px'}),
+                        html.Div([
+                            dcc.Input(id='simline-overlay-dir-input', type='text', value='',
+                                      placeholder='/path/to/attenuated/simlineoutput',
+                                      style={'flex': '1', 'padding': '8px 10px', 'fontSize': '13px',
+                                             'border': '1px solid #cbb', 'borderRadius': '6px',
+                                             'marginRight': '10px'}),
+                            dcc.Checklist(id='simline-overlay-recursive-check',
+                                          options=[{'label': ' recursive', 'value': 'rec'}], value=[],
+                                          style={'fontSize': '13px', 'marginRight': '10px',
+                                                 'whiteSpace': 'nowrap', 'alignSelf': 'center'}),
+                            html.Button('Load overlay SIMLINE', id='btn-load-simline-overlay', n_clicks=0,
+                                        style={'padding': '8px 18px', 'backgroundColor': '#8c564b',
+                                               'color': 'white', 'border': 'none', 'borderRadius': '6px',
+                                               'cursor': 'pointer', 'fontSize': '13px', 'fontWeight': '600',
+                                               'marginRight': '8px'}),
+                            html.Button('Clear', id='btn-clear-simline-overlay', n_clicks=0,
+                                        style={'padding': '8px 16px', 'backgroundColor': '#eee',
+                                               'color': '#555', 'border': '1px solid #ccc',
+                                               'borderRadius': '6px', 'cursor': 'pointer', 'fontSize': '13px'}),
+                        ], style={'display': 'flex', 'alignItems': 'stretch'}),
+                        html.Div(id='simline-overlay-status',
+                                 style={'marginTop': '6px', 'fontSize': '13px', 'minHeight': '16px'}),
+                    ], style={'padding': '12px 16px', 'backgroundColor': 'rgba(140, 86, 75, 0.06)',
+                              'borderRadius': '8px', 'border': '1px solid rgba(140, 86, 75, 0.2)'}),
+                    dcc.Store(id='simline-overlay-state', data=0),
 
-                html.Div([
-                    html.Label('Chemistry grid  (optional \u2014 reaction rates; enables the '
-                               'Chemistry tab)', style=_CTRL_LABEL),
-                    html.Div([
-                        dcc.Input(id='chem-dir-input', type='text', value='',
-                                  placeholder='/path/to/chemistrygrid  or  /path/to/chem_model.hdf5',
-                                  style={'flex': '1', 'padding': '8px 10px', 'fontSize': '13px',
-                                         'border': '1px solid #b9c5b0', 'borderRadius': '6px',
-                                         'marginRight': '10px'}),
-                        dcc.Checklist(id='chem-recursive-check',
-                                      options=[{'label': ' recursive', 'value': 'rec'}], value=[],
-                                      style={'fontSize': '13px', 'marginRight': '10px',
-                                             'whiteSpace': 'nowrap', 'alignSelf': 'center'}),
-                        html.Button('Load chemistry', id='btn-load-chem', n_clicks=0,
-                                    style={'padding': '8px 18px', 'backgroundColor': '#2ca02c',
-                                           'color': 'white', 'border': 'none', 'borderRadius': '6px',
-                                           'cursor': 'pointer', 'fontSize': '13px', 'fontWeight': '600',
-                                           'marginRight': '8px'}),
-                        html.Button('Clear', id='btn-clear-chem', n_clicks=0,
-                                    style={'padding': '8px 16px', 'backgroundColor': '#eee',
-                                           'color': '#555', 'border': '1px solid #ccc',
-                                           'borderRadius': '6px', 'cursor': 'pointer', 'fontSize': '13px'}),
-                    ], style={'display': 'flex', 'alignItems': 'stretch'}),
-                ], className='kosma-panel kosma-panel-dashed',
-                style={'padding': '12px 18px', 'marginTop': '10px'}),
+                ], className='kosma-panel',
+                   style={'padding': '18px 20px'}),
 
-                html.Div(id='chem-status',
-                         style={'marginTop': '6px', 'fontSize': '13px', 'minHeight': '20px'}),
-                dcc.Store(id='chem-state', data=0),
-
-                html.Div([
-                    html.Label('SIMLINE directory  (line intensities / spectra; can be loaded '
-                               'without HDF5)', style=_CTRL_LABEL),
-                    html.Div([
-                        dcc.Input(id='simline-dir-input', type='text', value='',
-                                  placeholder='/path/to/simlineoutput',
-                                  style={'flex': '1', 'padding': '8px 10px', 'fontSize': '13px',
-                                         'border': '1px solid #b8c4d8', 'borderRadius': '6px',
-                                         'marginRight': '10px'}),
-                        dcc.Checklist(id='simline-recursive-check',
-                                      options=[{'label': ' recursive', 'value': 'rec'}], value=[],
-                                      style={'fontSize': '13px', 'marginRight': '10px',
-                                             'whiteSpace': 'nowrap', 'alignSelf': 'center'}),
-                        html.Button('Load SIMLINE', id='btn-load-simline', n_clicks=0,
-                                    style={'padding': '8px 18px', 'backgroundColor': '#9467bd',
-                                           'color': 'white', 'border': 'none', 'borderRadius': '6px',
-                                           'cursor': 'pointer', 'fontSize': '13px', 'fontWeight': '600',
-                                           'marginRight': '8px'}),
-                        html.Button('Clear', id='btn-clear-simline', n_clicks=0,
-                                    style={'padding': '8px 16px', 'backgroundColor': '#eee',
-                                           'color': '#555', 'border': '1px solid #ccc',
-                                           'borderRadius': '6px', 'cursor': 'pointer', 'fontSize': '13px'}),
-                    ], style={'display': 'flex', 'alignItems': 'stretch'}),
-                ], className='kosma-panel kosma-panel-dashed',
-                style={'padding': '12px 18px', 'marginTop': '10px'}),
-
-                html.Div(id='simline-status',
-                         style={'marginTop': '6px', 'fontSize': '13px', 'minHeight': '20px'}),
-                dcc.Store(id='simline-state', data=0),
                 dcc.Store(id='cr-atten-profiles', data=[]),
             ]),
         ]),
@@ -6134,31 +6664,33 @@ app.layout = html.Div(
                 html.P('Gas and dust temperatures plus H/H\u2082, C\u207A/C/CO and custom '
                        'species abundance profiles vs depth.',
                        style=_PAGE_INTRO),
-                html.Div([
+                dcc.Loading(id='loading-profiles', type='circle', children=[
                     html.Div([
-                        dcc.Graph(id='plot-tgas', figure=placeholder_fig(), config=_GRAPH_CFG,
-                                  style={'flex': '1', 'minWidth': '0'}),
-                        dcc.Graph(id='plot-h-h2', figure=placeholder_fig(), config=_GRAPH_CFG,
-                                  style={'flex': '1', 'minWidth': '0'}),
-                    ], style={'display': 'flex', 'gap': '12px', 'marginBottom': '12px'}),
-                    html.Div([
-                        dcc.Graph(id='plot-cco', figure=placeholder_fig(), config=_GRAPH_CFG,
-                                  style={'flex': '1', 'minWidth': '0'}),
                         html.Div([
+                            dcc.Graph(id='plot-tgas', figure=placeholder_fig(), config=_GRAPH_CFG,
+                                      style={'flex': '1', 'minWidth': '0'}),
+                            dcc.Graph(id='plot-h-h2', figure=placeholder_fig(), config=_GRAPH_CFG,
+                                      style={'flex': '1', 'minWidth': '0'}),
+                        ], style={'display': 'flex', 'gap': '12px', 'marginBottom': '12px'}),
+                        html.Div([
+                            dcc.Graph(id='plot-cco', figure=placeholder_fig(), config=_GRAPH_CFG,
+                                      style={'flex': '1', 'minWidth': '0'}),
                             html.Div([
-                                html.Label('Species:', style={'fontWeight': '600', 'fontSize': '12px',
-                                                              'whiteSpace': 'nowrap',
-                                                              'marginRight': '8px'}),
-                                dcc.Dropdown(id='species-selector', options=[], value=[], multi=True,
-                                             placeholder='Select species to plot\u2026',
-                                             style={'fontSize': '12px', 'flex': '1'}),
-                            ], style={'display': 'flex', 'alignItems': 'center',
-                                      'padding': '4px 0', 'marginBottom': '4px'}),
-                            dcc.Graph(id='plot-custom', figure=placeholder_fig(), config=_GRAPH_CFG,
-                                      style={'flex': '1'}),
-                        ], style={'flex': '1', 'minWidth': '0', 'display': 'flex',
-                                  'flexDirection': 'column'}),
-                    ], style={'display': 'flex', 'gap': '12px'}),
+                                html.Div([
+                                    html.Label('Species:', style={'fontWeight': '600', 'fontSize': '12px',
+                                                                  'whiteSpace': 'nowrap',
+                                                                  'marginRight': '8px'}),
+                                    dcc.Dropdown(id='species-selector', options=[], value=[], multi=True,
+                                                 placeholder='Select species to plot\u2026',
+                                                 style={'fontSize': '12px', 'flex': '1'}),
+                                ], style={'display': 'flex', 'alignItems': 'center',
+                                          'padding': '4px 0', 'marginBottom': '4px'}),
+                                dcc.Graph(id='plot-custom', figure=placeholder_fig(), config=_GRAPH_CFG,
+                                          style={'flex': '1'}),
+                            ], style={'flex': '1', 'minWidth': '0', 'display': 'flex',
+                                      'flexDirection': 'column'}),
+                        ], style={'display': 'flex', 'gap': '12px'}),
+                    ]),
                 ]),
             ]),
         ]),
@@ -6169,17 +6701,19 @@ app.layout = html.Div(
             html.Div(style={'paddingTop': '10px'}, children=[
                 html.P('Thermal balance and per-component heating and cooling rates vs depth.',
                        style=_PAGE_INTRO),
-                html.Div([
-                    dcc.Graph(id='plot-thermal', figure=placeholder_fig(), config=_GRAPH_CFG,
-                              style={'flex': '1', 'minWidth': '0'}),
-                    dcc.Graph(id='plot-heat-breakdown', figure=placeholder_fig(), config=_GRAPH_CFG,
-                              style={'flex': '1', 'minWidth': '0'}),
-                ], style={'display': 'flex', 'gap': '12px', 'marginBottom': '12px'}),
-                html.Div([
-                    dcc.Graph(id='plot-cool-breakdown', figure=placeholder_fig(), config=_GRAPH_CFG,
-                              style={'flex': '1', 'minWidth': '0'}),
-                    html.Div(style={'flex': '1', 'minWidth': '0'}),
-                ], style={'display': 'flex', 'gap': '12px'}),
+                dcc.Loading(id='loading-thermal', type='circle', children=[
+                    html.Div([
+                        dcc.Graph(id='plot-thermal', figure=placeholder_fig(), config=_GRAPH_CFG,
+                                  style={'flex': '1', 'minWidth': '0'}),
+                        dcc.Graph(id='plot-heat-breakdown', figure=placeholder_fig(), config=_GRAPH_CFG,
+                                  style={'flex': '1', 'minWidth': '0'}),
+                    ], style={'display': 'flex', 'gap': '12px', 'marginBottom': '12px'}),
+                    html.Div([
+                        dcc.Graph(id='plot-cool-breakdown', figure=placeholder_fig(), config=_GRAPH_CFG,
+                                  style={'flex': '1', 'minWidth': '0'}),
+                        html.Div(style={'flex': '1', 'minWidth': '0'}),
+                    ], style={'display': 'flex', 'gap': '12px'}),
+                ]),
             ]),
         ]),
 
@@ -6187,33 +6721,79 @@ app.layout = html.Div(
         dcc.Tab(label='Grid slices', value='grids', style=_TAB_STYLE, selected_style=_TAB_SEL,
                 children=[
             html.Div(style={'paddingTop': '10px'}, children=[
-                html.P('Contour maps over the full model grid. Without an overlay grid the '
-                       'three slice planes appear side by side as square panels. Grids are '
-                       'resampled in log parameter space (KoSens-style) before plotting. '
-                       'With an overlay loaded, each plane expands to three sub-plots '
-                       '(reference, overlay, x-shift) stacked vertically.',
+                html.P('Contour maps over the full model grid. Select several quantities '
+                       '(abundances and/or diagnostics) or use Add all species — the first '
+                       'selection fills the three main panels, and each extra species gets '
+                       'its own row of slice maps. Without an overlay grid the three slice '
+                       'planes appear side by side as square panels. Grids are resampled in '
+                       'log parameter space (KoSens-style) before plotting. With an overlay '
+                       'loaded, each plane expands to three sub-plots (reference, overlay, '
+                       'x-shift) stacked vertically.',
                        style=_PAGE_INTRO),
                 html.Div([
                     html.Div([
                         html.Label('Contoured quantity', style=_CTRL_LABEL),
-                        dcc.Dropdown(id='contour-quantity', options=[], value=None,
-                                     placeholder='Load a grid\u2026',
+                        dcc.Dropdown(id='contour-quantity', options=[], value=[],
+                                     multi=True,
+                                     placeholder='Load a grid\u2026 then pick one or more quantities',
                                      style={'fontSize': '13px'}),
-                    ], style={'flex': '2', 'minWidth': '220px', 'marginRight': '18px'}),
+                    ], style={'flex': '2', 'minWidth': '260px', 'marginRight': '12px'}),
+                    html.Button('Add all species', id='btn-contour-all-species', n_clicks=0,
+                                style=_ALL_BTN_STYLE),
                     html.Div([
                         html.Label('Contour Z scale', style=_CTRL_LABEL),
                         dcc.RadioItems(id='contour-zscale', options=_SCALE_OPTIONS,
                                        value='log', **_RADIO),
-                    ], style={**_CTRL_BOX, 'marginRight': '0'}),
+                    ], style={**_CTRL_BOX, 'marginLeft': '18px', 'marginRight': '0'}),
                 ], className='kosma-panel',
                 style={'display': 'flex', 'alignItems': 'flex-start',
+                       'flexWrap': 'wrap',
                        'padding': '12px 18px', 'marginBottom': '12px'}),
                 _interp_control_row(prefix=''),
                 _shift_control_row(prefix=''),
-                html.Div([_slice_panel(p['id']) for p in SLICE_PLANES],
-                         id='slice-panels-wrap',
-                         style=_SLICE_PANELS_ROW_STYLE),
-                _rgb_grid_controls(),
+                dcc.Tabs(id='grid-subtabs', value='grid-maps',
+                         style={'marginTop': '4px'}, children=[
+                    dcc.Tab(label='Maps', value='grid-maps',
+                            style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
+                            children=[
+                        html.Div([_slice_panel(p['id']) for p in SLICE_PLANES],
+                                 id='slice-panels-wrap',
+                                 style=_SLICE_PANELS_ROW_STYLE),
+                        dcc.Loading(id='loading-grid-contour-extra', type='circle', children=[
+                            html.Div(id='grid-contour-extra-rows'),
+                        ]),
+                        _rgb_grid_controls(),
+                    ]),
+                    dcc.Tab(label='Ratios', value='grid-ratios',
+                            style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
+                            children=[
+                        html.P('KoSens abundance ratios from the species selected above '
+                               '(needs two or more). Intra-list pairs use the KoSens '
+                               'molecule priority so the higher-priority species is in '
+                               'the numerator (C⁺ > C > HCO⁺ > CO > ¹³CO > …). '
+                               'Equal-priority pairs keep your selection order.',
+                               style=_PAGE_INTRO),
+                        html.Div([
+                            html.Div([
+                                html.Label('Abundance ratios', style=_CTRL_LABEL),
+                                dcc.Dropdown(id='grid-ratio-selector', options=[], value=[],
+                                             multi=True,
+                                             placeholder='Select two or more species above\u2026',
+                                             style={'fontSize': '13px'}),
+                            ], style={'flex': '2', 'minWidth': '260px', 'marginRight': '12px'}),
+                            html.Button('Add all ratios', id='btn-grid-all-ratios', n_clicks=0,
+                                        style=_ALL_BTN_STYLE),
+                        ], className='kosma-panel',
+                           style={'display': 'flex', 'alignItems': 'flex-start',
+                                  'flexWrap': 'wrap',
+                                  'padding': '12px 18px', 'marginBottom': '12px'}),
+                        html.Div(id='grid-ratio-hint', className='kosma-muted',
+                                 style={'marginBottom': '8px'}),
+                        dcc.Loading(id='loading-grid-ratios', type='circle', children=[
+                            html.Div(id='grid-ratio-rows'),
+                        ]),
+                    ]),
+                ]),
             ]),
         ]),
 
@@ -6250,19 +6830,21 @@ app.layout = html.Div(
                 ], className='kosma-panel',
                 style={'display': 'flex', 'alignItems': 'flex-start',
                        'padding': '12px 18px'}),
-                html.Div([
+                dcc.Loading(id='loading-chemistry', type='circle', children=[
                     html.Div([
-                        dcc.Graph(id='plot-react-formation', figure=placeholder_fig(), config=_GRAPH_CFG,
-                                  style={'width': '100%'}),
-                        html.Div(id='react-contrib-formation'),
-                    ], style={'flex': '1', 'minWidth': '0'}),
-                    html.Div([
-                        dcc.Graph(id='plot-react-destruction', figure=placeholder_fig(), config=_GRAPH_CFG,
-                                  style={'width': '100%'}),
-                        html.Div(id='react-contrib-destruction'),
-                    ], style={'flex': '1', 'minWidth': '0'}),
-                ], style={'display': 'flex', 'gap': '12px', 'marginTop': '12px',
-                          'alignItems': 'flex-start'}),
+                        html.Div([
+                            dcc.Graph(id='plot-react-formation', figure=placeholder_fig(), config=_GRAPH_CFG,
+                                      style={'width': '100%'}),
+                            html.Div(id='react-contrib-formation'),
+                        ], style={'flex': '1', 'minWidth': '0'}),
+                        html.Div([
+                            dcc.Graph(id='plot-react-destruction', figure=placeholder_fig(), config=_GRAPH_CFG,
+                                      style={'width': '100%'}),
+                            html.Div(id='react-contrib-destruction'),
+                        ], style={'flex': '1', 'minWidth': '0'}),
+                    ], style={'display': 'flex', 'gap': '12px', 'marginTop': '12px',
+                              'alignItems': 'flex-start'}),
+                ]),
                 html.H4('Reaction pathway network',
                         style={'fontSize': '14px', 'margin': '22px 0 6px', 'fontWeight': '600'}),
                 html.Div(id='react-network-status', style={**_PAGE_INTRO, 'marginBottom': '8px'}),
@@ -6357,11 +6939,13 @@ app.layout = html.Div(
         dcc.Tab(label='Intensities', value='intensities', style=_TAB_STYLE,
                 selected_style=_TAB_SEL, children=[
             html.Div(style={'paddingTop': '10px'}, children=[
-                html.P('SIMLINE line intensities from per-model .smli files. Without overlay '
-                       'SIMLINE the three slice planes appear side by side as square panels; '
-                       'grids are resampled in log parameter space before plotting. With '
-                       'overlay SIMLINE each plane expands to three sub-plots side by side '
-                       '(reference, overlay, x-shift) stacked vertically.',
+                html.P('SIMLINE line intensities from per-model .smli files. Select several '
+                       'species and/or transitions (or Add all species / Add all transitions) '
+                       'to overlay spectra and add extra contour rows under the main maps. '
+                       'Without overlay SIMLINE the three slice planes appear side by side as '
+                       'square panels; grids are resampled in log parameter space before '
+                       'plotting. With overlay SIMLINE each plane expands to three sub-plots '
+                       'side by side (reference, overlay, x-shift) stacked vertically.',
                        style=_PAGE_INTRO),
                 html.Div([
                     html.Div([
@@ -6371,16 +6955,23 @@ app.layout = html.Div(
                     ], style={'flex': '1.4', 'minWidth': '220px', 'marginRight': '18px'}),
                     html.Div([
                         html.Label('Species', style=_CTRL_LABEL),
-                        dcc.Dropdown(id='int-species', options=[], value=None,
+                        dcc.Dropdown(id='int-species', options=[], value=[],
+                                     multi=True,
                                      placeholder='Load a SIMLINE directory\u2026',
                                      style={'fontSize': '13px'}),
-                    ], style={'flex': '1', 'minWidth': '140px', 'marginRight': '18px'}),
+                    ], style={'flex': '1.2', 'minWidth': '160px', 'marginRight': '8px'}),
+                    html.Button('Add all species', id='btn-int-all-species', n_clicks=0,
+                                style=_ALL_BTN_STYLE),
                     html.Div([
                         html.Label('Transition (for grid maps)', style=_CTRL_LABEL),
-                        dcc.Dropdown(id='int-transition', options=[], value=None,
+                        dcc.Dropdown(id='int-transition', options=[], value=[],
+                                     multi=True,
                                      placeholder='Select species\u2026',
                                      style={'fontSize': '13px'}),
-                    ], style={'flex': '1.2', 'minWidth': '180px', 'marginRight': '18px'}),
+                    ], style={'flex': '1.4', 'minWidth': '180px', 'marginLeft': '12px',
+                              'marginRight': '8px'}),
+                    html.Button('Add all transitions', id='btn-int-all-transitions', n_clicks=0,
+                                style=_ALL_BTN_STYLE),
                     html.Div([
                         html.Label('Contour Z scale', style=_CTRL_LABEL),
                         dcc.RadioItems(id='int-zscale', options=_SCALE_OPTIONS,
@@ -6388,17 +6979,61 @@ app.layout = html.Div(
                     ], style={**_CTRL_BOX, 'marginRight': '0'}),
                 ], className='kosma-panel',
                 style={'display': 'flex', 'alignItems': 'flex-start',
+                       'flexWrap': 'wrap',
                        'padding': '12px 18px', 'marginBottom': '12px'}),
                 _interp_control_row(prefix='int-'),
                 _shift_control_row(prefix='int-'),
                 _int_contour_overlay_row(),
-                dcc.Graph(id='plot-int-spectrum', figure=placeholder_fig(), config=_GRAPH_CFG,
-                          style={'marginBottom': '12px'}),
-                html.Div([_int_slice_panel(p['id']) for p in SLICE_PLANES],
-                         id='int-slice-panels-wrap',
-                         style=_SLICE_PANELS_ROW_STYLE),
-                _spaghetti_controls(),
-                _rgb_intensity_controls(),
+                dcc.Tabs(id='int-subtabs', value='int-maps',
+                         style={'marginTop': '4px'}, children=[
+                    dcc.Tab(label='Maps', value='int-maps',
+                            style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
+                            children=[
+                        dcc.Loading(id='loading-int-spectrum', type='circle', children=[
+                            dcc.Graph(id='plot-int-spectrum', figure=placeholder_fig(),
+                                      config=_GRAPH_CFG,
+                                      style={'marginBottom': '12px'}),
+                        ]),
+                        html.Div([_int_slice_panel(p['id']) for p in SLICE_PLANES],
+                                 id='int-slice-panels-wrap',
+                                 style=_SLICE_PANELS_ROW_STYLE),
+                        dcc.Loading(id='loading-int-contour-extra', type='circle', children=[
+                            html.Div(id='int-contour-extra-rows'),
+                        ]),
+                        _spaghetti_controls(),
+                        _rgb_intensity_controls(),
+                    ]),
+                    dcc.Tab(label='Ratios', value='int-ratios',
+                            style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
+                            children=[
+                        html.P('KoSens line-intensity ratios from the species and transitions '
+                               'selected above. Intra-molecule (one species, two or more '
+                               'transitions): higher-energy / lower-energy '
+                               '(e.g. CO(2-1)/CO(1-0)). Inter-molecule (two or more species): '
+                               'higher KoSens priority / lower '
+                               '(C⁺ > C > HCO⁺ > CO > …).',
+                               style=_PAGE_INTRO),
+                        html.Div([
+                            html.Div([
+                                html.Label('Line ratios', style=_CTRL_LABEL),
+                                dcc.Dropdown(id='int-ratio-selector', options=[], value=[],
+                                             multi=True,
+                                             placeholder='Select two transitions or two species\u2026',
+                                             style={'fontSize': '13px'}),
+                            ], style={'flex': '2', 'minWidth': '260px', 'marginRight': '12px'}),
+                            html.Button('Add all ratios', id='btn-int-all-ratios', n_clicks=0,
+                                        style=_ALL_BTN_STYLE),
+                        ], className='kosma-panel',
+                           style={'display': 'flex', 'alignItems': 'flex-start',
+                                  'flexWrap': 'wrap',
+                                  'padding': '12px 18px', 'marginBottom': '12px'}),
+                        html.Div(id='int-ratio-hint', className='kosma-muted',
+                                 style={'marginBottom': '8px'}),
+                        dcc.Loading(id='loading-int-ratios', type='circle', children=[
+                            html.Div(id='int-ratio-rows'),
+                        ]),
+                    ]),
+                ]),
             ]),
         ]),
 
@@ -6519,10 +7154,12 @@ app.layout = html.Div(
                     ], style={'display': 'flex', 'alignItems': 'center', 'flexWrap': 'wrap'}),
                 ], className='kosma-panel',
                           style={'padding': '12px 18px', 'marginBottom': '12px'}),
-                dcc.Graph(id='plot-sp-spectrum', figure=placeholder_fig(), config=_GRAPH_CFG,
-                          style={'marginBottom': '8px'}),
-                html.Div(id='sp-fit-summary', style={'padding': '0 18px 12px'}),
-                dcc.Graph(id='plot-sp-pv', figure=placeholder_fig(), config=_GRAPH_CFG),
+                dcc.Loading(id='loading-spectra', type='circle', children=[
+                    dcc.Graph(id='plot-sp-spectrum', figure=placeholder_fig(), config=_GRAPH_CFG,
+                              style={'marginBottom': '8px'}),
+                    html.Div(id='sp-fit-summary', style={'padding': '0 18px 12px'}),
+                    dcc.Graph(id='plot-sp-pv', figure=placeholder_fig(), config=_GRAPH_CFG),
+                ]),
             ]),
         ]),
 
@@ -6632,7 +7269,9 @@ app.layout = html.Div(
                     dcc.Checklist(id='cr-atten-active', options=[], value=[],
                                   style={'fontSize': '13px'}),
                 ], style={'padding': '0 18px 12px'}),
-                dcc.Graph(id='plot-cr-atten', figure=placeholder_fig(), config=_GRAPH_CFG),
+                dcc.Loading(id='loading-cr-atten', type='circle', children=[
+                    dcc.Graph(id='plot-cr-atten', figure=placeholder_fig(), config=_GRAPH_CFG),
+                ]),
             ]),
         ]),
 
@@ -6815,12 +7454,37 @@ app.layout = html.Div(
         ]),
     ]),
 
-    # Footer
+    # Footer with export options
     html.Div([
-        html.Hr(style={'margin': '16px 0 8px', 'borderColor': '#e8e8e8'}),
-        html.P('Use the camera icon on each plot to save it as PNG.',
-               style={'color': '#888', 'fontSize': '12px', 'textAlign': 'center', 'margin': '0 0 6px'}),
-        html.P('KOSMA-\u03C4 Grid Explorer  \u2014  KoSens3D photodissociation-region model navigator.',
+        html.Hr(style={'margin': '16px 0 12px', 'borderColor': '#e8e8e8'}),
+        html.Div([
+            html.Div([
+                html.Span('\u2B07 Export format for camera icon:', 
+                          style={'fontWeight': '600', 'fontSize': '12px',
+                                 'marginRight': '10px', 'color': '#555'}),
+                dcc.RadioItems(
+                    id='export-format-selector',
+                    options=[
+                        {'label': ' PNG (raster)', 'value': 'png'},
+                        {'label': ' SVG (vector)', 'value': 'svg'},
+                    ],
+                    value='png',
+                    inline=True,
+                    style={'fontSize': '12px'},
+                    labelStyle={'marginRight': '16px', 'cursor': 'pointer'},
+                    inputStyle={'marginRight': '4px'},
+                ),
+            ], style={'display': 'flex', 'alignItems': 'center', 'justifyContent': 'center',
+                      'flexWrap': 'wrap', 'gap': '4px'}),
+            html.P([
+                'Select format above, then click the ',
+                html.Span('\U0001F4F7', style={'fontSize': '14px'}),
+                ' camera icon on any plot. ',
+                html.Span('SVG', style={'fontWeight': '600'}),
+                ' is vector format \u2014 ideal for papers & easily converted to PDF.',
+            ], style={'color': '#888', 'fontSize': '12px', 'textAlign': 'center', 'margin': '8px 0 6px'}),
+        ], className='kosma-panel', style={'padding': '12px 18px', 'marginBottom': '10px'}),
+        html.P('PRISMA  \u2014  PDR Results Interactive Simulation Mapping & Analysis',
                style={'color': '#ccc', 'fontSize': '11px', 'textAlign': 'center', 'margin': '0 0 6px'}),
     ]),
 ])
@@ -6912,6 +7576,7 @@ _int_spag_slice_label_outputs = [
     Output(f'int-spag-slice-label-{p["id"]}', 'children') for p in SLICE_PLANES
 ]
 _int_spag_outputs = [Output(f'plot-int-spag-{p["id"]}', 'figure') for p in SLICE_PLANES]
+_int_spag_chi2_outputs = [Output(f'plot-int-spag-chi2-{p["id"]}', 'figure') for p in SLICE_PLANES]
 _int_spag_panel_style_outputs = [Output(f'int-spag-panel-{p["id"]}', 'style') for p in SLICE_PLANES]
 _int_spag_graph_style_outputs = [Output(f'plot-int-spag-{p["id"]}', 'style') for p in SLICE_PLANES]
 
@@ -6944,6 +7609,468 @@ def _default_contour_quantity(species_idx):
     if species_idx:
         return f'species:{next(iter(species_idx))}'
     return 'tgas'
+
+
+def _species_dropdown_cfg(species, species_idx):
+    sp_opts = [{'label': s, 'value': s} for s in species]
+    defaults = [s for s in DEFAULT_CUSTOM if s in species_idx][:3]
+    cq_opts = _contour_quantity_options(species)
+    cq_val = _default_contour_quantity(species_idx)
+    return sp_opts, defaults, cq_opts, [cq_val] if cq_val else [], list(cq_opts), cq_val
+
+
+def _active_slice_plane_ids():
+    planes = [p for p in active_slice_planes() if p.get('active')]
+    return [p['id'] for p in planes] or [p['id'] for p in SLICE_PLANES]
+
+
+def _extra_slice_caption(text):
+    return html.Div(text, style={
+        'fontSize': '12px', 'fontWeight': '600', 'opacity': 0.88,
+        'margin': '12px 0 4px', 'textAlign': 'center',
+    })
+
+
+def _match_output_id():
+    """Pattern-matching component id of the first Output of this callback."""
+    out = dash.callback_context.outputs_list[0]
+    if isinstance(out, list):
+        out = out[0]
+    return out['id']
+
+
+def _ratio_pair_value(num, den):
+    return f'{num}||{den}'
+
+
+def _ratio_pair_parts(value):
+    text = str(value or '')
+    if '||' in text:
+        num, den = text.split('||', 1)
+        return num, den
+    if '/' in text:
+        return text.split('/', 1)
+    return text, ''
+
+
+def _species_from_contour_quantities(quantities):
+    return [q.split(':', 1)[1] for q in _as_str_list(quantities)
+            if str(q).startswith('species:')]
+
+
+def _grid_ratio_dropdown(quantities, current=None):
+    species = _species_from_contour_quantities(quantities)
+    hint = ''
+    if len(species) < 2:
+        hint = ('Select at least two species in the quantity list to build '
+                'KoSens abundance ratios.')
+        return [], [], hint
+    pairs = mfe.abundance_ratio_pairs(species)
+    opts = [{'label': f'X({n})/X({d})', 'value': _ratio_pair_value(n, d)}
+            for n, d in pairs]
+    valid = {o['value'] for o in opts}
+    kept = [v for v in _as_str_list(current) if v in valid]
+    default = kept or ([opts[0]['value']] if opts else [])
+    return opts, default, hint
+
+
+def _intensity_line_key(species, tidx, idef):
+    opts = _simline_transition_options(species, idef)
+    try:
+        raw = opts[int(tidx)].get('transition')
+    except (TypeError, ValueError, IndexError, AttributeError):
+        return None
+    if not raw:
+        return None
+    return gf.spectroscopic_line_key(species, raw)
+
+
+def _selected_line_lookup(species, transition, idef):
+    lookup = {}
+    for sp, tidx in _intensity_map_combos(species, transition, idef):
+        key = _intensity_line_key(sp, tidx, idef)
+        if key:
+            lookup[key] = (sp, tidx)
+    return lookup
+
+
+def _int_ratio_dropdown(species, transition, idef, current=None):
+    hint = ''
+    species_list = _as_str_list(species)
+    trans_list = _as_str_list(transition)
+    if not species_list:
+        hint = ('Select a species and at least two transitions, or two or more '
+                'species, to build KoSens line-intensity ratios.')
+        return [], [], hint
+    if not trans_list:
+        hint = ('Select at least one transition to build KoSens line-intensity ratios.')
+        return [], [], hint
+    if len(species_list) < 2 and len(trans_list) < 2:
+        hint = ('Select at least two transitions of this species, or a second '
+                'species, to build KoSens line-intensity ratios.')
+        return [], [], hint
+    lookup = _selected_line_lookup(species, transition, idef)
+    pairs = mfe.transition_ratio_pairs(list(lookup))
+    opts = [{'label': f'{n}/{d}', 'value': _ratio_pair_value(n, d)}
+            for n, d in pairs]
+    valid = {o['value'] for o in opts}
+    kept = [v for v in _as_str_list(current) if v in valid]
+    default = kept or ([opts[0]['value']] if opts else [])
+    if lookup and not pairs:
+        hint = ('No KoSens ratios for these lines (need parseable spectroscopic '
+                'keys with distinct energy levels; inter-molecule pairs must '
+                'differ in priority).')
+    return opts, default, hint
+
+
+def _divided_slice_grid(num_grid, den_grid):
+    if num_grid is None or den_grid is None:
+        return None
+    x_phys, y_phys, zn, xdef, ydef = num_grid
+    _, _, zd, _, _ = den_grid
+    if zn.shape != zd.shape:
+        return None
+    z_ratio = mfe.divide_ratio_grids(zn, zd)
+    return x_phys, y_phys, z_ratio, xdef, ydef
+
+
+def _pattern_role(ident, role):
+    out = dict(ident)
+    out['role'] = role
+    return out
+
+
+def _extra_slice_key(ident):
+    return (ident.get('qty'), ident.get('sp'), ident.get('tidx'),
+            ident.get('pair'), ident.get('plane'))
+
+
+def _saved_extra_slices(ids, values):
+    saved = {}
+    for ident, val in zip(ids or [], values or []):
+        if ident:
+            saved[_extra_slice_key(ident)] = val
+    return saved
+
+
+def _slice_seed_by_plane(slice_indices):
+    return {
+        p['id']: (slice_indices[i] if i < len(slice_indices) else 0)
+        for i, p in enumerate(SLICE_PLANES)
+    }
+
+
+def _extra_panel_slice_idx(ident, seed_by_plane, saved):
+    key = _extra_slice_key(ident)
+    if key in saved:
+        return saved[key]
+    return seed_by_plane.get(ident.get('plane'), 0)
+
+
+def _extra_slice_slider_props(plane_id, value=None):
+    plane = _plane_by_slot(plane_id)
+    if not _grid or not plane.get('active') or not plane.get('slice'):
+        return dict(min=0, max=1, step=1, value=0, marks={},
+                    tooltip={'placement': 'top', 'always_visible': False})
+    sdef = _param_def(plane['slice'])
+    tokens = _grid['axis_tokens'][plane['slice']]
+    n = len(tokens)
+    vmax = max(n - 1, 0)
+    try:
+        ival = int(value) if value is not None else n // 2
+    except (TypeError, ValueError):
+        ival = n // 2
+    ival = min(max(ival, 0), vmax)
+    return dict(
+        min=0, max=vmax, step=1, value=ival,
+        marks=build_marks(sdef, _grid['axis_tokens']),
+        tooltip={'placement': 'top', 'always_visible': False},
+    )
+
+
+def _extra_slice_graph_row(idents, full_width=False, figures=None, slice_indices=None,
+                           slider_role='grid-extra-slider',
+                           label_role='grid-extra-label',
+                           fixed_role='grid-extra-fixed'):
+    """One row of extra slice panels, each with its own third-axis slider."""
+    wrap = _SLICE_PANELS_COL_STYLE if full_width else {
+        **_SLICE_PANELS_ROW_STYLE, 'marginTop': '4px',
+    }
+    panel = _SLICE_PANEL_ROW_FULL if full_width else _SLICE_PANEL_ROW
+    gstyle = _SLICE_GRAPH_STYLE_FULL if full_width else _SLICE_GRAPH_STYLE
+    if not figures or len(figures) != len(idents):
+        figures = [placeholder_fig() for _ in idents]
+    if not slice_indices or len(slice_indices) != len(idents):
+        slice_indices = [0] * len(idents)
+    children = []
+    for ident, fig, sl_idx in zip(idents, figures, slice_indices):
+        props = _extra_slice_slider_props(ident['plane'], sl_idx)
+        fixed, val, style = _slice_axis_ui(_plane_by_slot(ident['plane']), props['value'])
+        children.append(html.Div([
+            html.Div([
+                html.Label(fixed, id=_pattern_role(ident, fixed_role),
+                           style={**_CTRL_LABEL, 'fontSize': '12px'}),
+                dcc.Slider(id=_pattern_role(ident, slider_role), **props),
+                html.Div(val, id=_pattern_role(ident, label_role), style=style),
+            ], style={'padding': '0 4px 8px'}),
+            dcc.Graph(
+                id=ident,
+                figure=fig,
+                config=_SLICE_GRAPH_CFG,
+                style=gstyle,
+            ),
+        ], style=panel))
+    return html.Div(children, style=wrap)
+
+
+def _plain_quantity_caption(quantity):
+    if str(quantity).startswith('species:'):
+        return f'X({quantity.split(":", 1)[1]})'
+    for key, label in CONTOUR_DIAGNOSTICS:
+        if key == quantity:
+            return (label.replace('<sub>', '').replace('</sub>', '')
+                    .replace('<sup>', '').replace('</sup>', ''))
+    return str(quantity)
+
+
+def _intensity_combo_caption(species, tidx, idef):
+    opts = _simline_transition_options(species, idef)
+    try:
+        tlabel = opts[int(tidx)]['label']
+    except (IndexError, TypeError, ValueError, KeyError):
+        tlabel = str(tidx)
+    return f'{species}  —  {tlabel}'
+
+
+def _grid_ratio_caption(pair_value):
+    num, den = _ratio_pair_parts(pair_value)
+    return f'X({num}) / X({den})'
+
+
+def _int_ratio_caption(pair_value):
+    num, den = _ratio_pair_parts(pair_value)
+    return f'{num} / {den}'
+
+
+def _slice_index_for_plane(plane_id, slice_indices):
+    for i, p in enumerate(SLICE_PLANES):
+        if p['id'] == plane_id and i < len(slice_indices):
+            return slice_indices[i]
+    return 0
+
+
+def _grid_contour_extra_figures(idents, zscale, shift_dir, shift_rtol,
+                                interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+                                interp_method, interp_clip, plot_theme, grid_colorscale,
+                                slice_indices):
+    """Figures for dynamically created extra grid-slice graphs.
+
+    Species that share a plane and slice index are filled in one grid walk.
+    """
+    theme = _parse_plot_theme(plot_theme)
+    if not idents:
+        return []
+    if not _grid:
+        return [placeholder_fig('Load a grid directory', theme=theme)] * len(idents)
+    colorscale = _parse_grid_colorscale(grid_colorscale)
+    icfg = _interp_config(interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+                          interp_method, interp_clip)
+    per_ident = len(slice_indices) == len(idents)
+    groups = {}
+    for i, ident in enumerate(idents):
+        sl_idx = slice_indices[i] if per_ident else _slice_index_for_plane(
+            ident['plane'], slice_indices)
+        groups.setdefault((ident['plane'], sl_idx), []).append((i, ident))
+
+    figs = [None] * len(idents)
+    for (plane_id, sl_idx), items in groups.items():
+        plane = _plane_by_slot(plane_id)
+        if not plane.get('active'):
+            pfig = placeholder_fig(theme=theme)
+            for i, _ident in items:
+                figs[i] = pfig
+            continue
+        slice_token = _slice_token_from_index(plane, sl_idx)
+        qtys = [ident['qty'] for _, ident in items]
+        grids = build_slice_grids_for_quantities(
+            plane, slice_token, qtys, interp_config=icfg)
+        ov_grids = {}
+        if _overlay:
+            ov_grids = build_slice_grids_for_quantities(
+                plane, slice_token, qtys, interp_config=icfg, overlay=True)
+        for i, ident in items:
+            grid = grids.get(ident['qty'])
+            figs[i] = fig_contour_plane(
+                plane, sl_idx, ident['qty'], zscale or 'log',
+                shift_rtol=_parse_shift_rtol(shift_rtol),
+                shift_scan_direction=_parse_shift_scan_direction(shift_dir),
+                interp_config=icfg, colorscale=colorscale, theme=theme,
+                slice_grid=grid, overlay_grid=ov_grids.get(ident['qty']),
+                show_lines=False,
+            )
+    return figs
+
+
+def _int_contour_extra_figures(idents, idef, zscale, shift_dir, shift_rtol,
+                               interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+                               interp_method, interp_clip, obs_boundary, extra_contours,
+                               extra_contour_color, plot_theme, grid_colorscale,
+                               slider_values, slice_indices):
+    """Figures for dynamically created extra intensity-slice graphs."""
+    theme = _parse_plot_theme(plot_theme)
+    if not idents:
+        return []
+    if not _grid or not _simline:
+        p = placeholder_fig('Load grids and a SIMLINE directory', theme=theme)
+        return [p] * len(idents)
+    colorscale = _parse_grid_colorscale(grid_colorscale)
+    icfg = _interp_config(interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+                          interp_method, interp_clip)
+    line_contours = _build_intensity_line_contours(
+        idef or SIMLINE_DEFAULT_IDEF, zscale or 'log',
+        bool(obs_boundary and 'show' in obs_boundary),
+        extra_contours, extra_contour_color,
+    )
+    figs = []
+    per_ident = len(slice_indices) == len(idents)
+    for i, ident in enumerate(idents):
+        try:
+            tidx = int(ident['tidx'])
+        except (TypeError, ValueError):
+            tidx = 0
+        sl_idx = slice_indices[i] if per_ident else _slice_index_for_plane(
+            ident['plane'], slice_indices)
+        plane = _plane_by_slot(ident['plane'])
+        figs.append(fig_intensity_contour_plane(
+            plane, sl_idx, ident['sp'], idef or SIMLINE_DEFAULT_IDEF, tidx, zscale or 'log',
+            shift_rtol=_parse_shift_rtol(shift_rtol),
+            shift_scan_direction=_parse_shift_scan_direction(shift_dir),
+            interp_config=icfg, colorscale=colorscale, theme=theme,
+            slider_values=slider_values, line_contours=line_contours,
+        ))
+    return figs
+
+
+def _grid_ratio_figures(idents, zscale, shift_dir, shift_rtol,
+                        interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+                        interp_method, interp_clip, plot_theme, grid_colorscale,
+                        slice_indices):
+    """KoSens abundance-ratio contour figures for extra ratio rows."""
+    theme = _parse_plot_theme(plot_theme)
+    if not idents:
+        return []
+    if not _grid:
+        return [placeholder_fig('Load a grid directory', theme=theme)] * len(idents)
+    colorscale = _parse_grid_colorscale(grid_colorscale)
+    icfg = _interp_config(interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+                          interp_method, interp_clip)
+    per_ident = len(slice_indices) == len(idents)
+    groups = {}
+    for i, ident in enumerate(idents):
+        sl_idx = slice_indices[i] if per_ident else _slice_index_for_plane(
+            ident['plane'], slice_indices)
+        groups.setdefault((ident['plane'], sl_idx), []).append((i, ident))
+
+    figs = [None] * len(idents)
+    for (plane_id, sl_idx), items in groups.items():
+        plane = _plane_by_slot(plane_id)
+        if not plane.get('active'):
+            pfig = placeholder_fig(theme=theme)
+            for i, _ident in items:
+                figs[i] = pfig
+            continue
+        species = []
+        for _i, ident in items:
+            num, den = _ratio_pair_parts(ident['pair'])
+            species.extend([num, den])
+        qtys = [f'species:{s}' for s in dict.fromkeys(species) if s]
+        slice_token = _slice_token_from_index(plane, sl_idx)
+        grids = build_slice_grids_for_quantities(
+            plane, slice_token, qtys, interp_config=icfg)
+        ov_grids = {}
+        if _overlay:
+            ov_grids = build_slice_grids_for_quantities(
+                plane, slice_token, qtys, interp_config=icfg, overlay=True)
+        for i, ident in items:
+            num, den = _ratio_pair_parts(ident['pair'])
+            label = f'X({num})/X({den})'
+            grid = _divided_slice_grid(grids.get(f'species:{num}'),
+                                       grids.get(f'species:{den}'))
+            ov = _divided_slice_grid(ov_grids.get(f'species:{num}'),
+                                     ov_grids.get(f'species:{den}')) if ov_grids else None
+            figs[i] = fig_contour_plane(
+                plane, sl_idx, label, zscale or 'log',
+                shift_rtol=_parse_shift_rtol(shift_rtol),
+                shift_scan_direction=_parse_shift_scan_direction(shift_dir),
+                interp_config=icfg, colorscale=colorscale, theme=theme,
+                slice_grid=grid, overlay_grid=ov, show_lines=False,
+            )
+    return figs
+
+
+def _int_ratio_figures(idents, idef, zscale, shift_dir, shift_rtol,
+                       interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+                       interp_method, interp_clip, plot_theme, grid_colorscale,
+                       slider_values, slice_indices, species_value, transition_value):
+    """KoSens line-intensity ratio contour figures."""
+    theme = _parse_plot_theme(plot_theme)
+    if not idents:
+        return []
+    if not _grid or not _simline:
+        p = placeholder_fig('Load grids and a SIMLINE directory', theme=theme)
+        return [p] * len(idents)
+    colorscale = _parse_grid_colorscale(grid_colorscale)
+    icfg = _interp_config(interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+                          interp_method, interp_clip)
+    lookup = _selected_line_lookup(species_value, transition_value, idef)
+    per_ident = len(slice_indices) == len(idents)
+    groups = {}
+    for i, ident in enumerate(idents):
+        sl_idx = slice_indices[i] if per_ident else _slice_index_for_plane(
+            ident['plane'], slice_indices)
+        groups.setdefault((ident['plane'], sl_idx), []).append((i, ident))
+
+    figs = [None] * len(idents)
+    for (plane_id, sl_idx), items in groups.items():
+        plane = _plane_by_slot(plane_id)
+        if not plane.get('active'):
+            pfig = placeholder_fig(theme=theme)
+            for i, _ident in items:
+                figs[i] = pfig
+            continue
+        needed = {}
+        for _i, ident in items:
+            num, den = _ratio_pair_parts(ident['pair'])
+            for key in (num, den):
+                combo = lookup.get(key)
+                if combo:
+                    needed[key] = combo
+        line_grids = {}
+        ov_line_grids = {}
+        for key, (sp, tidx) in needed.items():
+            line_grids[key] = build_intensity_slice_grid(
+                plane, _slice_token_from_index(plane, sl_idx),
+                sp, idef or SIMLINE_DEFAULT_IDEF, tidx,
+                interp_config=icfg, slider_values=slider_values)
+            if _simline_overlay:
+                ov_line_grids[key] = build_intensity_slice_grid(
+                    plane, _slice_token_from_index(plane, sl_idx),
+                    sp, idef or SIMLINE_DEFAULT_IDEF, tidx, overlay=True,
+                    interp_config=icfg, slider_values=slider_values)
+        for i, ident in items:
+            num, den = _ratio_pair_parts(ident['pair'])
+            label = f'{num}/{den}'
+            grid = _divided_slice_grid(line_grids.get(num), line_grids.get(den))
+            ov = _divided_slice_grid(ov_line_grids.get(num), ov_line_grids.get(den)
+                                     ) if ov_line_grids else None
+            figs[i] = fig_contour_plane(
+                plane, sl_idx, label, zscale or 'log',
+                shift_rtol=_parse_shift_rtol(shift_rtol),
+                shift_scan_direction=_parse_shift_scan_direction(shift_dir),
+                interp_config=icfg, colorscale=colorscale, theme=theme,
+                slice_grid=grid, overlay_grid=ov, show_lines=False,
+            )
+    return figs
 
 
 def _slider_wrap_styles():
@@ -7006,14 +8133,6 @@ def _interleave_slice_tab_cfgs(slice_cfg, n_tabs=6):
     return out
 
 
-def _species_dropdown_cfg(species, species_idx):
-    sp_opts = [{'label': s, 'value': s} for s in species]
-    defaults = [s for s in DEFAULT_CUSTOM if s in species_idx][:3]
-    cq_opts = _contour_quantity_options(species)
-    cq_val = _default_contour_quantity(species_idx)
-    return sp_opts, defaults, cq_opts, cq_val, list(cq_opts), cq_val
-
-
 _grid_sync_outputs = [Output('grid-loaded', 'data', allow_duplicate=True)]
 for d in range(N_PARAMS):
     _grid_sync_outputs += [
@@ -7059,7 +8178,7 @@ def _empty_grid_sync(loaded=False):
     hidden, _ = _slider_wrap_styles()
     empty = _empty_param_slider_ui(hidden)
     empty_slice = _empty_slice_slider_ui()
-    empty_dropdowns = [[], [], [], None, [], None]
+    empty_dropdowns = [[], [], [], [], [], None]
     return ([loaded] + empty + _interleave_slice_tab_cfgs(empty_slice)
             + empty_dropdowns)
 
@@ -7105,7 +8224,7 @@ def handle_load(n_clicks, directory, recursive):
         err = html.Span(f'\u2717  {exc}', style={'color': '#d62728', 'fontWeight': '600'})
         empty = _empty_param_slider_ui(hidden)
         return ([err, False] + empty + empty_slice * 6
-                + [[], [], [], None, [], None])
+                + [[], [], [], [], [], None])
 
     slider_cfg, slice_cfg, _ = _ui_slider_config(grid['axis_tokens'])
     sp_opts, defaults, cq_opts, cq_val, ie_cq_opts, ie_cq_val = _species_dropdown_cfg(
@@ -7131,15 +8250,19 @@ def handle_load(n_clicks, directory, recursive):
             + [sp_opts, defaults, cq_opts, cq_val, ie_cq_opts, ie_cq_val])
 
 
-@app.callback(
+app.clientside_callback(
+    """
+    function(tab, loaded) {
+        if (!loaded || tab === 'load') {
+            return {'display': 'none'};
+        }
+        return {'display': 'block'};
+    }
+    """,
     Output('controls-wrap', 'style'),
     Input('main-tabs', 'value'),
     Input('grid-loaded', 'data'),
 )
-def show_controls(tab, loaded):
-    if not loaded or tab == 'load':
-        return {'display': 'none'}
-    return {'display': 'block'}
 
 
 @app.callback(
@@ -7576,6 +8699,7 @@ def seed_spaghetti_contours_from_lines(selected, current_text):
      Input('plot-theme', 'value'),
      Input('grid-colorscale', 'value')]
     + _slice_slider_inputs,
+    prevent_initial_call=True,
 )
 def update_contour_plots(quantity, zscale, _overlay_state, shift_dir, shift_rtol,
                          interp_ny, interp_nx, interp_x_lim, interp_y_lim,
@@ -7598,6 +8722,235 @@ def update_contour_plots(quantity, zscale, _overlay_state, shift_dir, shift_rtol
 
 
 @app.callback(
+    Output('contour-quantity', 'value', allow_duplicate=True),
+    Input('btn-contour-all-species', 'n_clicks'),
+    State('contour-quantity', 'options'),
+    State('contour-quantity', 'value'),
+    prevent_initial_call=True,
+)
+def add_all_contour_species(_n, options, current):
+    species_vals = [o['value'] for o in (options or [])
+                    if str(o.get('value', '')).startswith('species:')]
+    if not species_vals:
+        raise PreventUpdate
+    kept = [v for v in _as_str_list(current) if not str(v).startswith('species:')]
+    return kept + species_vals
+
+
+@app.callback(
+    Output('grid-contour-extra-rows', 'children'),
+    Input('contour-quantity', 'value'),
+    Input('overlay-state', 'data'),
+    Input('grid-loaded', 'data'),
+    Input('simline-state', 'data'),
+    State('contour-zscale', 'value'),
+    State('shift-scan-direction', 'value'),
+    State('shift-match-rtol', 'value'),
+    State('interp-ny', 'value'),
+    State('interp-nx', 'value'),
+    State('interp-x-lim', 'value'),
+    State('interp-y-lim', 'value'),
+    State('interp-method', 'value'),
+    State('interp-clip', 'value'),
+    State('plot-theme', 'value'),
+    State('grid-colorscale', 'value'),
+    *[State(f'slice-slider-{p["id"]}', 'value') for p in SLICE_PLANES],
+    State({'role': 'grid-extra-slider', 'qty': ALL, 'plane': ALL}, 'id'),
+    State({'role': 'grid-extra-slider', 'qty': ALL, 'plane': ALL}, 'value'),
+)
+def build_grid_contour_extra_rows(quantities, _overlay_state, _loaded, _simline_state,
+                                  zscale, shift_dir, shift_rtol,
+                                  interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+                                  interp_method, interp_clip, plot_theme, grid_colorscale,
+                                  *rest):
+    n_planes = len(SLICE_PLANES)
+    slice_indices = list(rest[:n_planes])
+    saved = _saved_extra_slices(rest[n_planes], rest[n_planes + 1] if len(rest) > n_planes + 1 else [])
+    extras = _as_str_list(quantities)[1:]
+    if not extras:
+        return []
+    full_width = bool(_overlay)
+    plane_ids = _active_slice_plane_ids()
+    seed = _slice_seed_by_plane(slice_indices)
+    rows = []
+    for qty in extras:
+        idents = [
+            {'role': 'grid-contour-extra', 'qty': qty, 'plane': pid}
+            for pid in plane_ids
+        ]
+        sl_idxs = [_extra_panel_slice_idx(ident, seed, saved) for ident in idents]
+        figs = _grid_contour_extra_figures(
+            idents, zscale, shift_dir, shift_rtol,
+            interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+            interp_method, interp_clip, plot_theme, grid_colorscale,
+            sl_idxs,
+        )
+        rows.append(html.Div([
+            _extra_slice_caption(_plain_quantity_caption(qty)),
+            _extra_slice_graph_row(
+                idents, full_width=full_width, figures=figs, slice_indices=sl_idxs,
+            ),
+        ]))
+    return rows
+
+
+@app.callback(
+    Output({'role': 'grid-contour-extra', 'qty': MATCH, 'plane': MATCH}, 'figure'),
+    Output({'role': 'grid-extra-label', 'qty': MATCH, 'plane': MATCH}, 'children'),
+    Output({'role': 'grid-extra-label', 'qty': MATCH, 'plane': MATCH}, 'style'),
+    Output({'role': 'grid-extra-fixed', 'qty': MATCH, 'plane': MATCH}, 'children'),
+    Input({'role': 'grid-extra-slider', 'qty': MATCH, 'plane': MATCH}, 'value'),
+    Input('contour-zscale', 'value'),
+    Input('overlay-state', 'data'),
+    Input('shift-scan-direction', 'value'),
+    Input('shift-match-rtol', 'value'),
+    Input('interp-ny', 'value'),
+    Input('interp-nx', 'value'),
+    Input('interp-x-lim', 'value'),
+    Input('interp-y-lim', 'value'),
+    Input('interp-method', 'value'),
+    Input('interp-clip', 'value'),
+    Input('plot-theme', 'value'),
+    Input('grid-colorscale', 'value'),
+    prevent_initial_call=True,
+)
+def update_one_grid_contour_extra(slice_idx, zscale, _overlay_state, shift_dir,
+                                  shift_rtol, interp_ny, interp_nx, interp_x_lim,
+                                  interp_y_lim, interp_method, interp_clip, plot_theme,
+                                  grid_colorscale):
+    ident = _match_output_id()
+    figs = _grid_contour_extra_figures(
+        [ident], zscale, shift_dir, shift_rtol,
+        interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+        interp_method, interp_clip, plot_theme, grid_colorscale,
+        [slice_idx],
+    )
+    plane = _plane_by_slot(ident['plane'])
+    fixed, val, style = _slice_axis_ui(plane, slice_idx)
+    return figs[0], val, style, fixed
+
+
+@app.callback(
+    Output('grid-ratio-selector', 'options'),
+    Output('grid-ratio-selector', 'value'),
+    Output('grid-ratio-hint', 'children'),
+    Input('contour-quantity', 'value'),
+    State('grid-ratio-selector', 'value'),
+)
+def update_grid_ratio_selector(quantities, current):
+    return _grid_ratio_dropdown(quantities, current)
+
+
+@app.callback(
+    Output('grid-ratio-selector', 'value', allow_duplicate=True),
+    Input('btn-grid-all-ratios', 'n_clicks'),
+    State('grid-ratio-selector', 'options'),
+    prevent_initial_call=True,
+)
+def add_all_grid_ratios(_n, options):
+    vals = [o['value'] for o in (options or [])]
+    if not vals:
+        raise PreventUpdate
+    return vals
+
+
+@app.callback(
+    Output('grid-ratio-rows', 'children'),
+    Input('grid-ratio-selector', 'value'),
+    Input('overlay-state', 'data'),
+    Input('grid-loaded', 'data'),
+    Input('simline-state', 'data'),
+    State('contour-zscale', 'value'),
+    State('shift-scan-direction', 'value'),
+    State('shift-match-rtol', 'value'),
+    State('interp-ny', 'value'),
+    State('interp-nx', 'value'),
+    State('interp-x-lim', 'value'),
+    State('interp-y-lim', 'value'),
+    State('interp-method', 'value'),
+    State('interp-clip', 'value'),
+    State('plot-theme', 'value'),
+    State('grid-colorscale', 'value'),
+    *[State(f'slice-slider-{p["id"]}', 'value') for p in SLICE_PLANES],
+    State({'role': 'grid-ratio-slider', 'pair': ALL, 'plane': ALL}, 'id'),
+    State({'role': 'grid-ratio-slider', 'pair': ALL, 'plane': ALL}, 'value'),
+)
+def build_grid_ratio_rows(pairs, _overlay_state, _loaded, _simline_state,
+                          zscale, shift_dir, shift_rtol,
+                          interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+                          interp_method, interp_clip, plot_theme, grid_colorscale,
+                          *rest):
+    selected = _as_str_list(pairs)
+    if not selected:
+        return []
+    n_planes = len(SLICE_PLANES)
+    slice_indices = list(rest[:n_planes])
+    saved = _saved_extra_slices(rest[n_planes], rest[n_planes + 1] if len(rest) > n_planes + 1 else [])
+    full_width = bool(_overlay)
+    plane_ids = _active_slice_plane_ids()
+    seed = _slice_seed_by_plane(slice_indices)
+    rows = []
+    for pair in selected:
+        idents = [
+            {'role': 'grid-ratio', 'pair': pair, 'plane': pid}
+            for pid in plane_ids
+        ]
+        sl_idxs = [_extra_panel_slice_idx(ident, seed, saved) for ident in idents]
+        figs = _grid_ratio_figures(
+            idents, zscale, shift_dir, shift_rtol,
+            interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+            interp_method, interp_clip, plot_theme, grid_colorscale,
+            sl_idxs,
+        )
+        rows.append(html.Div([
+            _extra_slice_caption(_grid_ratio_caption(pair)),
+            _extra_slice_graph_row(
+                idents, full_width=full_width, figures=figs, slice_indices=sl_idxs,
+                slider_role='grid-ratio-slider',
+                label_role='grid-ratio-label',
+                fixed_role='grid-ratio-fixed',
+            ),
+        ]))
+    return rows
+
+
+@app.callback(
+    Output({'role': 'grid-ratio', 'pair': MATCH, 'plane': MATCH}, 'figure'),
+    Output({'role': 'grid-ratio-label', 'pair': MATCH, 'plane': MATCH}, 'children'),
+    Output({'role': 'grid-ratio-label', 'pair': MATCH, 'plane': MATCH}, 'style'),
+    Output({'role': 'grid-ratio-fixed', 'pair': MATCH, 'plane': MATCH}, 'children'),
+    Input({'role': 'grid-ratio-slider', 'pair': MATCH, 'plane': MATCH}, 'value'),
+    Input('contour-zscale', 'value'),
+    Input('overlay-state', 'data'),
+    Input('shift-scan-direction', 'value'),
+    Input('shift-match-rtol', 'value'),
+    Input('interp-ny', 'value'),
+    Input('interp-nx', 'value'),
+    Input('interp-x-lim', 'value'),
+    Input('interp-y-lim', 'value'),
+    Input('interp-method', 'value'),
+    Input('interp-clip', 'value'),
+    Input('plot-theme', 'value'),
+    Input('grid-colorscale', 'value'),
+    prevent_initial_call=True,
+)
+def update_one_grid_ratio(slice_idx, zscale, _overlay_state, shift_dir,
+                          shift_rtol, interp_ny, interp_nx, interp_x_lim,
+                          interp_y_lim, interp_method, interp_clip, plot_theme,
+                          grid_colorscale):
+    ident = _match_output_id()
+    figs = _grid_ratio_figures(
+        [ident], zscale, shift_dir, shift_rtol,
+        interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+        interp_method, interp_clip, plot_theme, grid_colorscale,
+        [slice_idx],
+    )
+    plane = _plane_by_slot(ident['plane'])
+    fixed, val, style = _slice_axis_ui(plane, slice_idx)
+    return figs[0], val, style, fixed
+
+
+@app.callback(
     _rgb_outputs,
     [Input('grid-rgb-sp0', 'value'),
      Input('grid-rgb-sp1', 'value'),
@@ -7615,6 +8968,7 @@ def update_contour_plots(quantity, zscale, _overlay_state, shift_dir, shift_rtol
      Input('plot-theme', 'value'),
      Input('grid-loaded', 'data')]
     + _rgb_slice_slider_inputs,
+    prevent_initial_call=True,
 )
 def update_grid_rgb_plots(sp0, sp1, sp2, cf0, cf1, cf2, transitions,
                           interp_ny, interp_nx, interp_x_lim, interp_y_lim,
@@ -7788,7 +9142,7 @@ def handle_simline(n_load, n_clear, directory, recursive, state,
         clear_simline_only_grid()
         grid_sync = _empty_grid_sync(loaded=False) if was_simline_only else no_grid_sync
         return ([html.Span('SIMLINE directory cleared.', style={'color': '#888'}),
-                 state + 1, [], None, [], None, [], None]
+                 state + 1, [], [], [], None, [], None]
                 + grid_sync)
 
     try:
@@ -7796,7 +9150,7 @@ def handle_simline(n_load, n_clear, directory, recursive, state,
     except Exception as exc:
         return ([html.Span(f'\u2717  {exc}',
                            style={'color': '#d62728', 'fontWeight': '600'}),
-                state + 1, [], None, [], None, [], None]
+                state + 1, [], [], [], None, [], None]
                 + no_grid_sync)
 
     bootstrapped = bootstrap_grid_from_simline()
@@ -7805,11 +9159,13 @@ def handle_simline(n_load, n_clear, directory, recursive, state,
                  if s in sl['species']]
     rest = sorted(s for s in sl['species'] if s not in preferred)
     opts = [{'label': s, 'value': s} for s in preferred + rest]
-    value = cur_species if cur_species in sl['species'] else \
-        (SIMLINE_DEFAULT_SPECIES if SIMLINE_DEFAULT_SPECIES in sl['species']
-         else (sl['species'][0] if sl['species'] else None))
-    ie_value = cur_ie_species if cur_ie_species in sl['species'] else value
-    sp_value = cur_sp_species if cur_sp_species in sl['species'] else value
+    default_sp = (SIMLINE_DEFAULT_SPECIES if SIMLINE_DEFAULT_SPECIES in sl['species']
+                  else (sl['species'][0] if sl['species'] else None))
+    kept_species = [s for s in _as_str_list(cur_species) if s in sl['species']]
+    value = kept_species or ([default_sp] if default_sp else [])
+    ie_default = value[0] if value else None
+    ie_value = cur_ie_species if cur_ie_species in sl['species'] else ie_default
+    sp_value = cur_sp_species if cur_sp_species in sl['species'] else ie_default
 
     note = f'  ({sl["n_skipped"]} skipped)' if sl['n_skipped'] else ''
     pv_note = ''
@@ -7851,11 +9207,13 @@ def handle_simline(n_load, n_clear, directory, recursive, state,
 )
 def update_int_transition(species, ie_species, idef, ie_idef, _state, cur_trans, cur_ie_trans):
     if not _simline:
-        return [], None, [], None
-    opts = _simline_transition_options(species, idef or SIMLINE_DEFAULT_IDEF) if species else []
+        return [], [], [], None
+    primary = _first_str(species)
+    opts = _simline_transition_options(primary, idef or SIMLINE_DEFAULT_IDEF) if primary else []
     dd_opts = [{'label': o['label'], 'value': o['value']} for o in opts]
-    valid = {o['value'] for o in opts}
-    value = cur_trans if cur_trans in valid else _default_simline_transition(species, idef)
+    valid = {str(o['value']) for o in opts}
+    kept = [t for t in _as_str_list(cur_trans) if t in valid]
+    value = kept or ([_default_simline_transition(primary, idef)] if opts else [])
 
     ie_opts = _simline_transition_options(
         ie_species, ie_idef or SIMLINE_DEFAULT_IDEF) if ie_species else []
@@ -7915,6 +9273,7 @@ def update_sp_transition(*args_in):
        Input('obs-fit', 'value'),
        Input('simline-state', 'data'),
        Input('plot-theme', 'value')],
+    prevent_initial_call=True,
 )
 def update_sp_spectrum(*args_in):
     values = list(args_in[:N_PARAMS])
@@ -7946,6 +9305,7 @@ def update_sp_spectrum(*args_in):
        Input('sp-quantity', 'value'),
        Input('simline-state', 'data'),
        Input('plot-theme', 'value')],
+    prevent_initial_call=True,
 )
 def update_sp_pv(*args_in):
     values = list(args_in[:N_PARAMS])
@@ -8055,6 +9415,7 @@ def update_ie_slice_labels(*args_in):
      Input('ie-interp-clip', 'value')]
     + _slider_value_inputs
     + _ie_slice_slider_inputs,
+    prevent_initial_call=True,
 )
 def update_ie_panels(*args_in):
     n_sl = N_PARAMS
@@ -8187,6 +9548,7 @@ def update_ie_panels(*args_in):
      Input('grid-colorscale', 'value')]
     + _slider_value_inputs
     + _int_slice_slider_inputs,
+    prevent_initial_call=True,
 )
 def update_intensity_contours(*args_in):
     n_sl = N_PARAMS
@@ -8201,7 +9563,7 @@ def update_intensity_contours(*args_in):
      plot_theme, grid_colorscale) = args_in[:n_fixed]
     theme = _parse_plot_theme(plot_theme)
     colorscale = _parse_grid_colorscale(grid_colorscale)
-    if not _grid or not _simline or not species or transition is None:
+    if not _grid or not _simline or not _as_str_list(species) or not _as_str_list(transition):
         p = placeholder_fig('Load grids and a SIMLINE directory', theme=theme)
         return (p,) * len(SLICE_PLANES)
     icfg = _interp_config(interp_ny, interp_nx, interp_x_lim, interp_y_lim,
@@ -8220,7 +9582,284 @@ def update_intensity_contours(*args_in):
 
 
 @app.callback(
-    list(_int_spag_outputs) + [Output('int-spaghetti-status', 'children')],
+    Output('int-species', 'value', allow_duplicate=True),
+    Input('btn-int-all-species', 'n_clicks'),
+    State('int-species', 'options'),
+    prevent_initial_call=True,
+)
+def add_all_int_species(_n, options):
+    vals = [o['value'] for o in (options or [])]
+    if not vals:
+        raise PreventUpdate
+    return vals
+
+
+@app.callback(
+    Output('int-transition', 'value', allow_duplicate=True),
+    Input('btn-int-all-transitions', 'n_clicks'),
+    State('int-transition', 'options'),
+    prevent_initial_call=True,
+)
+def add_all_int_transitions(_n, options):
+    vals = [o['value'] for o in (options or [])]
+    if not vals:
+        raise PreventUpdate
+    return vals
+
+
+@app.callback(
+    Output('int-contour-extra-rows', 'children'),
+    Input('int-species', 'value'),
+    Input('int-transition', 'value'),
+    Input('int-idef', 'value'),
+    Input('simline-state', 'data'),
+    Input('simline-overlay-state', 'data'),
+    Input('grid-loaded', 'data'),
+    State('int-zscale', 'value'),
+    State('int-shift-scan-direction', 'value'),
+    State('int-shift-match-rtol', 'value'),
+    State('int-interp-ny', 'value'),
+    State('int-interp-nx', 'value'),
+    State('int-interp-x-lim', 'value'),
+    State('int-interp-y-lim', 'value'),
+    State('int-interp-method', 'value'),
+    State('int-interp-clip', 'value'),
+    State('int-obs-boundary', 'value'),
+    State('int-extra-contours', 'value'),
+    State('int-extra-contour-color', 'value'),
+    State('plot-theme', 'value'),
+    State('grid-colorscale', 'value'),
+    *[State(f'slider-{d}', 'value') for d in range(N_PARAMS)],
+    *[State(f'int-slice-slider-{p["id"]}', 'value') for p in SLICE_PLANES],
+    State({'role': 'int-extra-slider', 'sp': ALL, 'tidx': ALL, 'plane': ALL}, 'id'),
+    State({'role': 'int-extra-slider', 'sp': ALL, 'tidx': ALL, 'plane': ALL}, 'value'),
+)
+def build_int_contour_extra_rows(species, transition, idef, _state, _ov_state, _loaded,
+                                 zscale, shift_dir, shift_rtol,
+                                 interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+                                 interp_method, interp_clip, obs_boundary, extra_contours,
+                                 extra_contour_color, plot_theme, grid_colorscale,
+                                 *rest):
+    combos = _intensity_map_combos(species, transition, idef)[1:]
+    if not combos:
+        return []
+    n_sl = N_PARAMS
+    n_planes = len(SLICE_PLANES)
+    slider_values = list(rest[:n_sl])
+    slice_indices = list(rest[n_sl:n_sl + n_planes])
+    saved = _saved_extra_slices(rest[n_sl + n_planes], rest[n_sl + n_planes + 1])
+    full_width = bool(_simline_overlay)
+    plane_ids = _active_slice_plane_ids()
+    seed = _slice_seed_by_plane(slice_indices)
+    rows = []
+    for sp, tidx in combos:
+        idents = [
+            {'role': 'int-contour-extra', 'sp': sp, 'tidx': str(tidx),
+             'plane': pid}
+            for pid in plane_ids
+        ]
+        sl_idxs = [_extra_panel_slice_idx(ident, seed, saved) for ident in idents]
+        figs = _int_contour_extra_figures(
+            idents, idef, zscale, shift_dir, shift_rtol,
+            interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+            interp_method, interp_clip, obs_boundary, extra_contours,
+            extra_contour_color, plot_theme, grid_colorscale,
+            slider_values, sl_idxs,
+        )
+        rows.append(html.Div([
+            _extra_slice_caption(_intensity_combo_caption(sp, tidx, idef)),
+            _extra_slice_graph_row(
+                idents, full_width=full_width, figures=figs, slice_indices=sl_idxs,
+                slider_role='int-extra-slider',
+                label_role='int-extra-label',
+                fixed_role='int-extra-fixed',
+            ),
+        ]))
+    return rows
+
+
+@app.callback(
+    Output({'role': 'int-contour-extra', 'sp': MATCH, 'tidx': MATCH, 'plane': MATCH}, 'figure'),
+    Output({'role': 'int-extra-label', 'sp': MATCH, 'tidx': MATCH, 'plane': MATCH}, 'children'),
+    Output({'role': 'int-extra-label', 'sp': MATCH, 'tidx': MATCH, 'plane': MATCH}, 'style'),
+    Output({'role': 'int-extra-fixed', 'sp': MATCH, 'tidx': MATCH, 'plane': MATCH}, 'children'),
+    Input({'role': 'int-extra-slider', 'sp': MATCH, 'tidx': MATCH, 'plane': MATCH}, 'value'),
+    Input('int-idef', 'value'),
+    Input('int-zscale', 'value'),
+    Input('simline-state', 'data'),
+    Input('simline-overlay-state', 'data'),
+    Input('int-shift-scan-direction', 'value'),
+    Input('int-shift-match-rtol', 'value'),
+    Input('int-interp-ny', 'value'),
+    Input('int-interp-nx', 'value'),
+    Input('int-interp-x-lim', 'value'),
+    Input('int-interp-y-lim', 'value'),
+    Input('int-interp-method', 'value'),
+    Input('int-interp-clip', 'value'),
+    Input('int-obs-boundary', 'value'),
+    Input('int-extra-contours', 'value'),
+    Input('int-extra-contour-color', 'value'),
+    Input('plot-theme', 'value'),
+    Input('grid-colorscale', 'value'),
+    *_slider_value_inputs,
+    prevent_initial_call=True,
+)
+def update_one_int_contour_extra(slice_idx, idef, zscale, _state, _ov_state,
+                                 shift_dir, shift_rtol, interp_ny, interp_nx,
+                                 interp_x_lim, interp_y_lim, interp_method, interp_clip,
+                                 obs_boundary, extra_contours, extra_contour_color,
+                                 plot_theme, grid_colorscale, *slider_values):
+    ident = _match_output_id()
+    figs = _int_contour_extra_figures(
+        [ident], idef, zscale, shift_dir, shift_rtol,
+        interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+        interp_method, interp_clip, obs_boundary, extra_contours,
+        extra_contour_color, plot_theme, grid_colorscale,
+        list(slider_values), [slice_idx],
+    )
+    plane = _plane_by_slot(ident['plane'])
+    fixed, val, style = _slice_axis_ui(plane, slice_idx)
+    return figs[0], val, style, fixed
+
+
+@app.callback(
+    Output('int-ratio-selector', 'options'),
+    Output('int-ratio-selector', 'value'),
+    Output('int-ratio-hint', 'children'),
+    Input('int-species', 'value'),
+    Input('int-transition', 'value'),
+    Input('int-idef', 'value'),
+    State('int-ratio-selector', 'value'),
+)
+def update_int_ratio_selector(species, transition, idef, current):
+    return _int_ratio_dropdown(species, transition, idef, current)
+
+
+@app.callback(
+    Output('int-ratio-selector', 'value', allow_duplicate=True),
+    Input('btn-int-all-ratios', 'n_clicks'),
+    State('int-ratio-selector', 'options'),
+    prevent_initial_call=True,
+)
+def add_all_int_ratios(_n, options):
+    vals = [o['value'] for o in (options or [])]
+    if not vals:
+        raise PreventUpdate
+    return vals
+
+
+@app.callback(
+    Output('int-ratio-rows', 'children'),
+    Input('int-ratio-selector', 'value'),
+    Input('simline-state', 'data'),
+    Input('simline-overlay-state', 'data'),
+    Input('grid-loaded', 'data'),
+    State('int-idef', 'value'),
+    State('int-species', 'value'),
+    State('int-transition', 'value'),
+    State('int-zscale', 'value'),
+    State('int-shift-scan-direction', 'value'),
+    State('int-shift-match-rtol', 'value'),
+    State('int-interp-ny', 'value'),
+    State('int-interp-nx', 'value'),
+    State('int-interp-x-lim', 'value'),
+    State('int-interp-y-lim', 'value'),
+    State('int-interp-method', 'value'),
+    State('int-interp-clip', 'value'),
+    State('plot-theme', 'value'),
+    State('grid-colorscale', 'value'),
+    *[State(f'slider-{d}', 'value') for d in range(N_PARAMS)],
+    *[State(f'int-slice-slider-{p["id"]}', 'value') for p in SLICE_PLANES],
+    State({'role': 'int-ratio-slider', 'pair': ALL, 'plane': ALL}, 'id'),
+    State({'role': 'int-ratio-slider', 'pair': ALL, 'plane': ALL}, 'value'),
+)
+def build_int_ratio_rows(pairs, _state, _ov_state, _loaded,
+                         idef, species, transition, zscale, shift_dir, shift_rtol,
+                         interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+                         interp_method, interp_clip, plot_theme, grid_colorscale,
+                         *rest):
+    selected = _as_str_list(pairs)
+    if not selected:
+        return []
+    n_sl = N_PARAMS
+    n_planes = len(SLICE_PLANES)
+    slider_values = list(rest[:n_sl])
+    slice_indices = list(rest[n_sl:n_sl + n_planes])
+    saved = _saved_extra_slices(rest[n_sl + n_planes], rest[n_sl + n_planes + 1])
+    full_width = bool(_simline_overlay)
+    plane_ids = _active_slice_plane_ids()
+    seed = _slice_seed_by_plane(slice_indices)
+    rows = []
+    for pair in selected:
+        idents = [
+            {'role': 'int-ratio', 'pair': pair, 'plane': pid}
+            for pid in plane_ids
+        ]
+        sl_idxs = [_extra_panel_slice_idx(ident, seed, saved) for ident in idents]
+        figs = _int_ratio_figures(
+            idents, idef, zscale, shift_dir, shift_rtol,
+            interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+            interp_method, interp_clip, plot_theme, grid_colorscale,
+            slider_values, sl_idxs, species, transition,
+        )
+        rows.append(html.Div([
+            _extra_slice_caption(_int_ratio_caption(pair)),
+            _extra_slice_graph_row(
+                idents, full_width=full_width, figures=figs, slice_indices=sl_idxs,
+                slider_role='int-ratio-slider',
+                label_role='int-ratio-label',
+                fixed_role='int-ratio-fixed',
+            ),
+        ]))
+    return rows
+
+
+@app.callback(
+    Output({'role': 'int-ratio', 'pair': MATCH, 'plane': MATCH}, 'figure'),
+    Output({'role': 'int-ratio-label', 'pair': MATCH, 'plane': MATCH}, 'children'),
+    Output({'role': 'int-ratio-label', 'pair': MATCH, 'plane': MATCH}, 'style'),
+    Output({'role': 'int-ratio-fixed', 'pair': MATCH, 'plane': MATCH}, 'children'),
+    Input({'role': 'int-ratio-slider', 'pair': MATCH, 'plane': MATCH}, 'value'),
+    Input('int-idef', 'value'),
+    Input('int-zscale', 'value'),
+    Input('simline-state', 'data'),
+    Input('simline-overlay-state', 'data'),
+    Input('int-shift-scan-direction', 'value'),
+    Input('int-shift-match-rtol', 'value'),
+    Input('int-interp-ny', 'value'),
+    Input('int-interp-nx', 'value'),
+    Input('int-interp-x-lim', 'value'),
+    Input('int-interp-y-lim', 'value'),
+    Input('int-interp-method', 'value'),
+    Input('int-interp-clip', 'value'),
+    Input('plot-theme', 'value'),
+    Input('grid-colorscale', 'value'),
+    *_slider_value_inputs,
+    State('int-species', 'value'),
+    State('int-transition', 'value'),
+    prevent_initial_call=True,
+)
+def update_one_int_ratio(slice_idx, idef, zscale, _state, _ov_state,
+                         shift_dir, shift_rtol, interp_ny, interp_nx,
+                         interp_x_lim, interp_y_lim, interp_method, interp_clip,
+                         plot_theme, grid_colorscale, *rest):
+    slider_values = list(rest[:N_PARAMS])
+    species = rest[N_PARAMS] if len(rest) > N_PARAMS else None
+    transition = rest[N_PARAMS + 1] if len(rest) > N_PARAMS + 1 else None
+    ident = _match_output_id()
+    figs = _int_ratio_figures(
+        [ident], idef, zscale, shift_dir, shift_rtol,
+        interp_ny, interp_nx, interp_x_lim, interp_y_lim,
+        interp_method, interp_clip, plot_theme, grid_colorscale,
+        slider_values, [slice_idx], species, transition,
+    )
+    plane = _plane_by_slot(ident['plane'])
+    fixed, val, style = _slice_axis_ui(plane, slice_idx)
+    return figs[0], val, style, fixed
+
+
+@app.callback(
+    list(_int_spag_outputs) + list(_int_spag_chi2_outputs) + [Output('int-spaghetti-status', 'children')],
     [Input('int-spaghetti-contours', 'value'),
      Input('int-spaghetti-options', 'value'),
      Input('int-idef', 'value'),
@@ -8235,6 +9874,7 @@ def update_intensity_contours(*args_in):
      Input('plot-theme', 'value')]
     + _slider_value_inputs
     + _int_spag_slice_slider_inputs,
+    prevent_initial_call=True,
 )
 def update_spaghetti_plots(*args_in):
     n_sl = N_PARAMS
@@ -8247,20 +9887,21 @@ def update_spaghetti_plots(*args_in):
      interp_method, interp_clip, plot_theme) = args_in[:n_fixed]
     theme = _parse_plot_theme(plot_theme)
     options = options or []
+    n_planes = len(SLICE_PLANES)
     if not _grid or not _simline:
         p = placeholder_fig('Load grids and a SIMLINE directory', theme=theme)
-        return (p,) * len(SLICE_PLANES) + (
+        return (p,) * n_planes + (p,) * n_planes + (
             _spaghetti_status_children(None, theme=theme),
         )
     icfg = _interp_config(interp_ny, interp_nx, interp_x_lim, interp_y_lim,
                           interp_method, interp_clip)
-    figs, chi2_info = make_spaghetti_plots(
+    spaghetti_figs, chi2_figs, chi2_info = make_spaghetti_plots(
         contour_text, idef or SIMLINE_DEFAULT_IDEF, slice_indices,
         interp_config=icfg, theme=theme, slider_values=slider_values,
         show_error_bands=('bands' in options),
         mark_closest=('chi2' in options),
     )
-    return tuple(figs) + (_spaghetti_status_children(chi2_info, theme=theme),)
+    return tuple(spaghetti_figs) + tuple(chi2_figs) + (_spaghetti_status_children(chi2_info, theme=theme),)
 
 
 @app.callback(
@@ -8284,6 +9925,7 @@ def update_spaghetti_plots(*args_in):
      Input('plot-theme', 'value')]
     + _slider_value_inputs
     + _int_rgb_slice_slider_inputs,
+    prevent_initial_call=True,
 )
 def update_intensity_rgb_plots(*args_in):
     n_sl = N_PARAMS
@@ -8316,6 +9958,7 @@ def update_intensity_rgb_plots(*args_in):
        Input('simline-state', 'data'),
        Input('grid-loaded', 'data'),
        Input('plot-theme', 'value')],
+    prevent_initial_call=True,
 )
 def update_intensity_spectrum(*args_in):
     n_int = len(_int_slice_slider_inputs)
@@ -8342,6 +9985,7 @@ def update_intensity_spectrum(*args_in):
        Input('species-selector', 'value'),
        Input('overlay-state', 'data'),
        Input('plot-theme', 'value')],
+    prevent_initial_call=True,
 )
 def update_profile_plots(*args_in):
     values = list(args_in[:N_PARAMS])
@@ -8363,6 +10007,7 @@ def update_profile_plots(*args_in):
        Input('av-range', 'value'),
        Input('overlay-state', 'data'),
        Input('plot-theme', 'value')],
+    prevent_initial_call=True,
 )
 def update_thermal_plots(*args_in):
     values = list(args_in[:N_PARAMS])
@@ -8396,6 +10041,7 @@ def update_thermal_plots(*args_in):
        Input('react-partner-label-size', 'value'),
        Input('react-net-highlight', 'data'),
        Input('react-net-hidden', 'data')],
+    prevent_initial_call=True,
 )
 def update_reaction_plots(*args_in):
     values = list(args_in[:N_PARAMS])
@@ -8798,6 +10444,7 @@ def manage_cr_atten_profiles(n_add, n_add_ov, n_clear, *args_in):
     Input('cr-atten-options', 'value'),
     Input('cr-atten-stop-rate', 'value'),
     Input('plot-theme', 'value'),
+    prevent_initial_call=True,
 )
 def update_cr_atten_plot(profiles, active, x_axis, options, stop_rate, plot_theme):
     opts = options or []

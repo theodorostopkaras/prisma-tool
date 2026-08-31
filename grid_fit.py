@@ -581,7 +581,11 @@ def fig_fits_map(
     fig = go.Figure(go.Heatmap(
         x=x_coords, y=y_coords, z=zplot,
         colorscale=colorscale,
-        colorbar=dict(title=dict(text=colorbar_title or title)),
+        colorbar=dict(
+            title=dict(text=colorbar_title or title),
+            x=1.01, xanchor='left', xpad=4, thickness=14, len=0.92,
+            outlinewidth=0,
+        ),
         hovertemplate=hover,
     ))
     plot_height = int(max(520, min(780, 420 * sky_ratio)))
@@ -591,7 +595,7 @@ def fig_fits_map(
                    font=ps.title_font(t['title'])),
         paper_bgcolor=t['paper_bg'],
         plot_bgcolor=t['plot_bg'],
-        margin=dict(l=60, r=20, t=48, b=54),
+        margin=dict(l=60, r=52, t=48, b=54),
         autosize=True,
         height=plot_height,
         font=dict(color=t['font']),
@@ -786,7 +790,11 @@ def fig_chi2_pixel_map(
     fig = go.Figure(go.Heatmap(
         x=x, y=y, z=arr,
         colorscale=colorscale,
-        colorbar=dict(title=dict(text=cbar)),
+        colorbar=dict(
+            title=dict(text=cbar),
+            x=1.01, xanchor='left', xpad=4, thickness=14, len=0.92,
+            outlinewidth=0,
+        ),
         hovertemplate='row=%{y}<br>col=%{x}<br>χ²=%{z:.4g}<extra></extra>',
     ))
     if chi2_pixel is not None:
@@ -803,7 +811,7 @@ def fig_chi2_pixel_map(
         title=dict(text=title, x=0.02, xanchor='left', font=ps.title_font(t['title'])),
         paper_bgcolor=t['paper_bg'],
         plot_bgcolor=t['plot_bg'],
-        margin=dict(l=60, r=20, t=48, b=54),
+        margin=dict(l=60, r=52, t=48, b=54),
         autosize=True,
         height=int(max(520, min(780, 420 * ny / max(nx, 1)))),
         font=dict(color=t['font']),
@@ -872,7 +880,8 @@ def fig_chi2_corner(
         reversescale=reverse_colorscale,
         zmin=0, zmax=vmax,
         contours=dict(start=0, end=vmax, size=vmax / 50, coloring='fill'),
-        colorbar=dict(title='Δχ²', len=0.55, y=0.25),
+        colorbar=dict(title='Δχ²', len=0.55, y=0.25, x=0.755, xanchor='left',
+                      xpad=2, thickness=12, outlinewidth=0),
         hovertemplate='log₁₀ x=%{x:.2f}<br>log₁₀ y=%{y:.2f}<br>Δχ²=%{z:.3f}<extra></extra>',
         showscale=True,
     ), row=2, col=1)

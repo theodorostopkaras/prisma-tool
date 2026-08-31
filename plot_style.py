@@ -4,7 +4,7 @@ Change these values to rescale titles, axes, ticks, colorbars, and legends
 across the app (profiles, grids, intensities, RGB, χ², map fits, …).
 """
 
-PLOT_FONT_FAMILY = 'Arial, sans-serif'
+PLOT_FONT_FAMILY = "'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', sans-serif"
 
 # Axis titles (x / y labels)
 PLOT_AXIS_FONT_SIZE = 14

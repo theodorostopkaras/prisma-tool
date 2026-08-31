@@ -76,7 +76,7 @@ OBS_ROW_OPTIONS = [
 ]
 DEFAULT_OBS_V_LOW = -20.0
 DEFAULT_OBS_V_HIGH = 20.0
-DEFAULT_DIR = '/home/teotopkaras/Desktop/Projects/Models/new_teo_grid/pdrgrid_hdf5'
+DEFAULT_DIR = ''
 
 
 parser = argparse.ArgumentParser(description="PRISMA - PDR Results Interactive Simulation Mapping & Analysis")
@@ -183,11 +183,12 @@ DEFAULT_CONTOUR_PANEL_W = 520
 # Domains leave a right strip for the colorbar; figure size is derived so the
 # plotted box is exactly COMPACT_PLOT_BOX × COMPACT_PLOT_BOX pixels.
 COMPACT_PLOT_BOX = 400
-_COMPACT_FIG_MARGIN = dict(l=64, r=90, t=52, b=58)
+_COMPACT_FIG_MARGIN = dict(l=64, r=56, t=52, b=58)
 _COMPACT_XDOMAIN = [0.0, 0.84]   # ~16% reserved for colorbar
 _COMPACT_YDOMAIN = [0.0, 1.0]    # full paper height → square with x-domain span
 _COMPACT_XSPAN = _COMPACT_XDOMAIN[1] - _COMPACT_XDOMAIN[0]
 _COMPACT_YSPAN = _COMPACT_YDOMAIN[1] - _COMPACT_YDOMAIN[0]
+_COMPACT_CBAR_X = _COMPACT_XDOMAIN[1] + 0.015  # chi²-style: just right of the plot
 COMPACT_FIG_WIDTH = int(round(
     _COMPACT_FIG_MARGIN['l'] + COMPACT_PLOT_BOX / _COMPACT_XSPAN
     + _COMPACT_FIG_MARGIN['r']
@@ -239,43 +240,43 @@ DEFAULT_PLOT_THEME = 'light'
 PLOT_THEMES = {
     'light': dict(
         paper_bg='#ffffff',
-        plot_bg='#f8f9fa',
-        grid='#e0e0e0',
-        axis_line='#bbbbbb',
-        title='#333333',
-        font='#333333',
-        muted='#666666',
-        heading='#1a1a2e',
-        legend_bg='rgba(255,255,255,0.85)',
-        legend_border='#cccccc',
-        placeholder='#aaaaaa',
-        placeholder_plot='#f4f4f4',
+        plot_bg='#ffffff',
+        grid='#e8edf3',
+        axis_line='#cbd5e1',
+        title='#0f172a',
+        font='#1e293b',
+        muted='#64748b',
+        heading='#0f172a',
+        legend_bg='rgba(255,255,255,0.92)',
+        legend_border='#e2e8f0',
+        placeholder='#94a3b8',
+        placeholder_plot='#f1f4f8',
         contour_line='rgba(255,255,255,0.85)',
         vline='rgba(60,60,60,0.45)',
-        controls_bg='#f0f4ff',
-        page_bg='#ffffff',
-        card_bg='#f5f7ff',
-        card_border='#99aabb',
+        controls_bg='#ffffff',
+        page_bg='#f1f4f8',
+        card_bg='#ffffff',
+        card_border='#e2e8f0',
         input_bg='#ffffff',
-        input_border='#bbbbcc',
-        tab_border='#ddddee',
-        tab_bg='#fafbff',
-        tab_sel_bg='#f5f7ff',
-        accent='#1f77b4',
+        input_border='#cbd5e1',
+        tab_border='#e2e8f0',
+        tab_bg='#ffffff',
+        tab_sel_bg='#eff6ff',
+        accent='#2563eb',
     ),
     'dark': dict(
-        paper_bg='#1a1a2e',
-        plot_bg='#16213e',
-        grid='#2a3a5c',
-        axis_line='#4a5a7a',
-        title='#e8eaf0',
-        font='#e0e0e0',
-        muted='#9aa3b2',
-        heading='#e8eaf0',
-        legend_bg='rgba(26,26,46,0.92)',
-        legend_border='#4a5a7a',
-        placeholder='#888888',
-        placeholder_plot='#121528',
+        paper_bg='#1e293b',
+        plot_bg='#0f172a',
+        grid='#334155',
+        axis_line='#475569',
+        title='#f1f5f9',
+        font='#e2e8f0',
+        muted='#94a3b8',
+        heading='#f1f5f9',
+        legend_bg='rgba(30,41,59,0.94)',
+        legend_border='#475569',
+        placeholder='#94a3b8',
+        placeholder_plot='#151b24',
         contour_line='rgba(255,255,255,0.35)',
         vline='rgba(220,220,230,0.45)',
         controls_bg='#1e293b',
@@ -285,16 +286,17 @@ PLOT_THEMES = {
         input_bg='#0f172a',
         input_border='#475569',
         tab_border='#334155',
-        tab_bg='#121528',
+        tab_bg='#151b24',
         tab_sel_bg='#1e293b',
         accent='#3b82f6',
     ),
 }
+UI_FONT = "'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', sans-serif"
 DEFAULT_ERROR_DECIMATION = 2
 DEFAULT_ERROR_REL_THRESHOLD = 0.01
 ERROR_METRIC_OPTIONS = [
-    {'label': ' Relative (%)', 'value': 'relative'},
-    {'label': ' Absolute', 'value': 'absolute'},
+    {'label': html.Span('Relative (%)', className='seg-opt'), 'value': 'relative'},
+    {'label': html.Span('Absolute', className='seg-opt'), 'value': 'absolute'},
 ]
 ERROR_PANEL_CMAP = 'RdYlGn_r'
 
@@ -389,6 +391,7 @@ _MAP_FIT_ERRORS_EXAMPLE = (
 _grid = {}            # main grid (populated on load)
 _overlay = {}         # optional second grid (e.g. attenuated), overplotted
 _chem = {}            # optional chemistry (reaction-rate) grid
+_chem_overlay = {}    # optional overlay chemistry grid (comparison)
 _simline = {}         # optional SIMLINE (.smli) intensity grid
 _simline_overlay = {} # optional attenuated SIMLINE grid (intensity comparison)
 _fit_results = {}     # last map-fit output (parameter maps + paths)
@@ -419,6 +422,16 @@ def order_axis_tokens_physically(axis_tokens):
     """Return axis_tokens with each axis ordered by ascending physical value."""
     return {p['key']: _sorted_axis_tokens(p['key'], axis_tokens.get(p['key']) or [])
             for p in PARAM_DEFS}
+
+
+def _tokens_for_path(store, path):
+    """Token tuple that maps to ``path`` in a scanned chemistry/HDF5 store."""
+    if not store or not path:
+        return None
+    for tok, p in (store.get('files') or {}).items():
+        if p == path:
+            return tuple(tok)
+    return None
 
 
 def _varying_param_keys(axis_tokens):
@@ -752,6 +765,47 @@ def _species_name_from_density_label(label, key=''):
     return text or None
 
 
+def _add_isotope_caret(name):
+    """KoSens ``add_isotope_caret``: insert ``^`` before isotope mass numbers.
+
+    ``c18o`` → ``c^18o`` so the HDF5 key is ``cd_c^18o``; leading digits such as
+    ``13co`` stay as-is (``cd_13co``).
+    """
+    text = str(name or '')
+    parts = []
+    last = 0
+    for match in re.finditer(r'\d+', text):
+        start, end = match.span()
+        number = match.group()
+        parts.append(text[last:start])
+        if start > 0 and (
+            (len(number) == 3)
+            or (len(number) == 2 and int(number) >= 6)
+            or (len(number) == 1 and int(number) >= 6)
+        ):
+            if len(number) == 3:
+                parts.append(number[0] + '^' + number[1:])
+            else:
+                parts.append('^' + number)
+        else:
+            parts.append(number)
+        last = end
+    parts.append(text[last:])
+    return ''.join(parts)
+
+
+def tot_col_dens_hdf5_key(species):
+    """KoSens ``dens_names_translation`` key for total column density.
+
+    Metadata field ``cd_<name>`` in ``Integrated quantities/Column densities``
+    (e.g. CO → ``cd_co``, C+ → ``cd_cp``, C18O → ``cd_c^18o``).
+    """
+    name = str(species or '').lower().replace('-', '_').replace('+', 'p').replace('^', '')
+    if name in ('e', 'e-', 'electr'):
+        name = 'electr'
+    return 'cd_' + _add_isotope_caret(name)
+
+
 def _species_from_density_metadata(md):
     """Species names ordered by Densities column index (older KOSMA-τ HDF5)."""
     by_idx = {}
@@ -929,6 +983,7 @@ def scan_directory(directory, recursive=False):
         n_from_hdf5=n_from_hdf5,
         phys_by_path=phys_by_path,
         simline_only=False,
+        chem_only=False,
         has_hdf5=True,
     )
     configure_slice_planes(axis_tokens)
@@ -1048,10 +1103,12 @@ def scan_chem(directory, recursive=False):
     for tokens, path in files.items():
         by_non_atten.setdefault(tokens[:N_PARAMS - 1], path)
     _reaction_cache = {}
+    clear_chem_overlay()
     _chem = dict(
         directory=source,
         files=files,
         by_non_atten=by_non_atten,
+        axis_tokens=axis_tokens,
         species=species,
         labels=labels,
         n_files=len(files),
@@ -1062,9 +1119,98 @@ def scan_chem(directory, recursive=False):
     return _chem
 
 
+def _chem_phys_signature(phys):
+    """Rounded (n_H, M, chi, Z, zeta) tuple for cross-grid chemistry matching."""
+    if not phys:
+        return None
+    sig = []
+    for key in ('density', 'mass', 'fuv', 'metal', 'crir'):
+        val = phys.get(key)
+        if val is None:
+            return None
+        try:
+            sig.append(round(float(val), 6))
+        except (TypeError, ValueError):
+            return None
+    return tuple(sig)
+
+
+def _chem_path_for_phys(store, phys):
+    """Chemistry file whose embedded physical parameters match ``phys``."""
+    sig = _chem_phys_signature(phys)
+    if sig is None or not store:
+        return None
+    for path in set((store.get('files') or {}).values()):
+        pphys = (store.get('phys_by_path') or {}).get(path)
+        if _chem_phys_signature(pphys) == sig:
+            return path
+    return None
+
+
+def _build_chem_overlay_map(primary, overlay):
+    """Map each primary chemistry token tuple to the best overlay HDF5 path."""
+    if not primary or not overlay:
+        return {}
+    by_phys = {}
+    for opath in set((overlay.get('files') or {}).values()):
+        sig = _chem_phys_signature((overlay.get('phys_by_path') or {}).get(opath))
+        if sig is not None:
+            by_phys.setdefault(sig, []).append(opath)
+    mapping = {}
+    for ptok, ppath in (primary.get('files') or {}).items():
+        path = _chem_path_for_store(overlay, ptok, allow_by_non_atten=True)
+        psig = _chem_phys_signature((primary.get('phys_by_path') or {}).get(ppath))
+        if psig is not None and psig in by_phys:
+            candidates = [p for p in by_phys[psig] if not _same_data_path(p, ppath)]
+            path = candidates[0] if candidates else by_phys[psig][0]
+        mapping[tuple(ptok)] = path
+    return mapping
+
+
+def _refresh_chem_overlay_map():
+    """Rebuild primary-token -> overlay-path map after chemistry loads."""
+    if not _chem or not _chem_overlay:
+        return
+    _chem_overlay['for_primary'] = _build_chem_overlay_map(_chem, _chem_overlay)
+
+
 def clear_chem():
     global _chem, _reaction_cache
     _chem = {}
+    _reaction_cache = {}
+    clear_chem_overlay()
+
+
+def scan_chem_overlay(directory, recursive=False):
+    """Scan a second chemistry grid to be overplotted (e.g. attenuated models)."""
+    global _chem_overlay, _reaction_cache
+    source, files, axis_tokens, skipped, n_from_hdf5, phys_by_path = _scan_files(
+        directory, recursive)
+    species, labels = build_chem_structure(next(iter(files.values())))
+    by_non_atten = {}
+    for tokens, path in files.items():
+        by_non_atten.setdefault(tokens[:N_PARAMS - 1], path)
+    _reaction_cache = {}
+    _chem_overlay = dict(
+        directory=source,
+        files=files,
+        by_non_atten=by_non_atten,
+        axis_tokens=axis_tokens,
+        species=species,
+        labels=labels,
+        n_files=len(files),
+        n_skipped=skipped,
+        n_from_hdf5=n_from_hdf5,
+        phys_by_path=phys_by_path,
+        for_primary={},
+    )
+    _refresh_chem_overlay_map()
+    return _chem_overlay
+
+
+def clear_chem_overlay():
+    global _chem_overlay, _reaction_cache
+    _chem_overlay = {}
     _reaction_cache = {}
 
 
@@ -1274,7 +1420,56 @@ def clear_simline_overlay():
 
 
 def _grid_has_hdf5():
-    return bool(_grid and _grid.get('files'))
+    """True when the main grid comes from an HDF5 structure scan (not chemistry/SIMLINE)."""
+    return bool(_grid and _grid.get('has_hdf5'))
+
+
+def _grid_is_virtual():
+    """True when parameter axes come from SIMLINE or chemistry, not an HDF5 grid."""
+    return bool(_grid and (_grid.get('simline_only') or _grid.get('chem_only')))
+
+
+def bootstrap_grid_from_chem():
+    """When no HDF5 grid is loaded, build a virtual parameter index from chemistry.
+
+    Same pattern as ``bootstrap_grid_from_simline``: ``_grid`` holds only
+    ``axis_tokens`` for the sliders; chemistry HDF5 paths live in ``_chem``.
+    Overlay chemistry stays in ``_chem_overlay`` (matched like HDF5 overlays).
+    """
+    global _grid
+    if not _chem or not _chem.get('files'):
+        return False
+    if _grid_has_hdf5():
+        return False
+    if _grid and not _grid.get('chem_only'):
+        return False
+
+    axis_tokens = order_axis_tokens_physically(dict(_chem['axis_tokens']))
+    species = list(_chem.get('species', []))
+    _grid = dict(
+        directory=_chem['directory'],
+        files={},
+        axis_tokens=axis_tokens,
+        species=species,
+        species_idx={s: i for i, s in enumerate(species)},
+        n_files=len(_chem['files']),
+        n_skipped=_chem.get('n_skipped', 0),
+        n_from_hdf5=_chem.get('n_from_hdf5', 0),
+        phys_by_path=dict(_chem.get('phys_by_path') or {}),
+        chem_only=True,
+        simline_only=False,
+        has_hdf5=False,
+    )
+    configure_slice_planes(axis_tokens)
+    return True
+
+
+def clear_chem_only_grid():
+    """Drop the virtual parameter index bootstrapped from chemistry only."""
+    global _grid, _SLICE_PLANES_ACTIVE
+    if _grid and _grid.get('chem_only') and not _grid_has_hdf5():
+        _grid = {}
+        _SLICE_PLANES_ACTIVE = None
 
 
 def bootstrap_grid_from_simline():
@@ -1282,7 +1477,7 @@ def bootstrap_grid_from_simline():
     global _grid
     if not _simline or not _simline.get('files'):
         return False
-    if _grid_has_hdf5():
+    if _grid_has_hdf5() or _grid:
         return False
 
     token_tuples = sorted({
@@ -1311,6 +1506,7 @@ def bootstrap_grid_from_simline():
         n_from_hdf5=0,
         phys_by_path={},
         simline_only=True,
+        chem_only=False,
         has_hdf5=False,
         token_cores=token_cores,
         filename_token_count=_simline.get('filename_token_count', gn.N_GRID_PARAMS),
@@ -1351,6 +1547,27 @@ def _simline_sample_path(tok_tuple):
         if file_key_stored[0] == file_key:
             return path
     return None
+
+
+def _chem_sample_path(tok_tuple):
+    """Chemistry HDF5 path for a parameter token tuple (chemistry-only mode)."""
+    return _chem_path_for_store(_chem, tok_tuple)
+
+
+def _chem_path_for_store(store, tokens, *, allow_by_non_atten=False):
+    """Resolve a chemistry HDF5 path from a token tuple.
+
+    Primary chemistry uses exact matches only (like ``current_file`` on the HDF5
+    grid).  Overlay chemistry also falls back to the non-attenuation key
+    (like ``overlay_file``).
+    """
+    if not store or tokens is None:
+        return None
+    t = tuple(tokens)
+    path = (store.get('files') or {}).get(t)
+    if path or not allow_by_non_atten:
+        return path
+    return (store.get('by_non_atten') or {}).get(t[:N_PARAMS - 1])
 
 
 def smli_file(tokens, species, idef, overlay=False):
@@ -1580,14 +1797,70 @@ def run_map_fit_job(maps_json, errors_json, output_dir, idef,
 
 
 def chem_file(values):
-    """Find the chem-grid file matching the current slider selection."""
+    """Find the primary chemistry HDF5 for the current slider selection."""
     if not _chem:
         return None
     tokens = _tokens_from_values(values)
     if tokens is None:
         return None
-    return _chem['files'].get(tokens) \
-        or _chem['by_non_atten'].get(tokens[:N_PARAMS - 1])
+    path = _chem_path_for_store(_chem, tokens)
+    if path or not _grid_has_hdf5():
+        return path
+    struct = current_file(values)
+    if not struct:
+        return None
+    phys = (_grid.get('phys_by_path') or {}).get(struct)
+    return _chem_path_for_phys(_chem, phys)
+
+
+def chem_overlay_file(values):
+    """Find the overlay chemistry file matching the current slider selection."""
+    if not _chem_overlay or not _chem_overlay.get('files'):
+        return None
+    primary = chem_file(values)
+    if not primary:
+        return None
+    ptok = _tokens_for_path(_chem, primary)
+    if ptok is None:
+        tokens = _tokens_from_values(values)
+        ptok = tuple(tokens) if tokens else None
+    path = None
+    if ptok is not None:
+        path = (_chem_overlay.get('for_primary') or {}).get(ptok)
+    if not path and ptok is not None:
+        path = _chem_path_for_store(_chem_overlay, ptok, allow_by_non_atten=True)
+    if not path:
+        struct = current_file(values) if _grid_has_hdf5() else None
+        if struct:
+            phys = (_grid.get('phys_by_path') or {}).get(struct)
+            path = _chem_path_for_phys(_chem_overlay, phys)
+        if not path:
+            pphys = (_chem.get('phys_by_path') or {}).get(primary)
+            path = _chem_path_for_phys(_chem_overlay, pphys)
+    if path and _same_data_path(path, primary):
+        return None
+    return path
+
+
+def _chem_labels(species, mode):
+    """Reaction labels from the primary or overlay chemistry store."""
+    for store in (_chem, _chem_overlay):
+        labels = (store or {}).get('labels', {}).get(species, {}).get(mode, [])
+        if labels:
+            return labels
+    return []
+
+
+def _chem_labels_for_file(filepath, species, mode):
+    """Reaction labels for a specific chemistry HDF5 path."""
+    for store in (_chem, _chem_overlay):
+        if not store:
+            continue
+        paths = set((store.get('files') or {}).values())
+        paths.update((store.get('by_non_atten') or {}).values())
+        if filepath in paths:
+            return store.get('labels', {}).get(species, {}).get(mode, [])
+    return _chem_labels(species, mode)
 
 
 # --- Profile reading ----------------------------------------------------------
@@ -1864,6 +2137,43 @@ def integrated_rel_abundance(model, species):
     return m_sp / m_total
 
 
+def _total_column_density_from_hf(hf, species):
+    """Scalar N(species) [cm⁻²] from KoSens ``cd_*`` integrated column densities."""
+    key = tot_col_dens_hdf5_key(species)
+    if key not in _field_map:
+        return np.nan
+    path, idx = _field_map[key]
+    try:
+        arr = np.asarray(hf[path][:], dtype=float)
+    except (KeyError, TypeError, OSError, ValueError):
+        return np.nan
+    arr = np.squeeze(arr)
+    try:
+        idx = int(idx)
+    except (TypeError, ValueError):
+        return np.nan
+    if arr.ndim == 0:
+        return float(arr)
+    if arr.ndim == 1:
+        if 0 <= idx < arr.size:
+            val = float(arr[idx])
+            return val if np.isfinite(val) else np.nan
+        return np.nan
+    if arr.ndim >= 2 and 0 <= idx < arr.shape[-1]:
+        val = float(np.ravel(arr[..., idx])[0])
+        return val if np.isfinite(val) else np.nan
+    return np.nan
+
+
+def total_column_density(filepath, species):
+    """Total column density N(species) from one model HDF5 file."""
+    try:
+        with h5py.File(filepath, 'r') as hf:
+            return _total_column_density_from_hf(hf, species)
+    except OSError:
+        return np.nan
+
+
 def column_averaged_tgas(model):
     """n_H-weighted column-averaged gas temperature (KoSens LOS convention).
 
@@ -1943,7 +2253,7 @@ def get_reaction_data(filepath, species, mode):
             av = np.asarray(hf[CHEM_POS][:], dtype=float)[:, 0]
     except (KeyError, OSError, IndexError):
         return None
-    labels = _chem.get('labels', {}).get(species, {}).get(mode, [])
+    labels = _chem_labels_for_file(filepath, species, mode)
     # Pad/truncate labels to match matrix columns.
     if len(labels) < matrix.shape[1]:
         labels = list(labels) + [f'reaction {i}' for i in range(len(labels), matrix.shape[1])]
@@ -2052,7 +2362,7 @@ def _phys_lookup(filepath, key):
     """Actual HDF5 value for ``key`` if this file was tagged from metadata."""
     if not filepath:
         return None
-    for store in (_grid, _overlay, _chem):
+    for store in (_grid, _overlay, _chem, _chem_overlay):
         phys = (store or {}).get('phys_by_path', {}).get(filepath)
         if phys and phys.get(key) is not None:
             return phys[key]
@@ -2072,6 +2382,56 @@ def _path_for_param_token(key, token, store=None):
     return None
 
 
+def _chem_model_path(values):
+    """Chemistry HDF5 path for the current slider selection."""
+    return chem_file(values) or chem_overlay_file(values)
+
+
+def get_chem_model(filepath):
+    """Minimal depth model from a chemistry HDF5 (A_V axis; structure when present)."""
+    if not filepath:
+        return None
+    if filepath in _profile_cache:
+        return _profile_cache[filepath]
+    try:
+        with h5py.File(filepath, 'r') as hf:
+            av = np.asarray(hf[CHEM_POS][:], dtype=float)[:, 0]
+            model = dict(av=av)
+            fmap = _hdf5_wanted_field_map(hf, {'protdens', 'radius', 'distance'})
+            if 'protdens' in fmap:
+                nH = _hdf5_column_floats(hf, *fmap['protdens'])
+                if nH is not None:
+                    model['nH'] = nH
+            radius_key = 'radius' if 'radius' in fmap else (
+                'distance' if 'distance' in fmap else None)
+            if radius_key:
+                radius = _hdf5_column_floats(hf, *fmap[radius_key])
+                if radius is not None and radius.size:
+                    rad = np.asarray(radius, dtype=float)
+                    if np.nanmax(rad) > 1e15:
+                        rad = rad / PC_TO_CM
+                    model['radius'] = rad
+            dens = _read_optional(hf, DENS_PATH)
+            if dens is not None:
+                model['dens'] = dens
+            rel = _read_optional(hf, RELDENS_PATH)
+            if rel is not None:
+                model['rel'] = rel
+    except (OSError, KeyError, IndexError):
+        return None
+    _profile_cache[filepath] = model
+    return model
+
+
+def _same_data_path(path_a, path_b):
+    if not path_a or not path_b:
+        return False
+    try:
+        return os.path.samefile(path_a, path_b)
+    except (OSError, ValueError):
+        return os.path.normpath(path_a) == os.path.normpath(path_b)
+
+
 def _physical_param_value(key, token, filepath=None, tokens=None):
     """Prefer the HDF5 number; fall back to decoding the grid token."""
     path = filepath
@@ -2084,6 +2444,10 @@ def _physical_param_value(key, token, filepath=None, tokens=None):
         return float(value)
     if path is None:
         path = _path_for_param_token(key, token)
+        if path is None and _chem:
+            path = _path_for_param_token(key, token, store=_chem)
+        if path is None and _chem_overlay:
+            path = _path_for_param_token(key, token, store=_chem_overlay)
         value = _phys_lookup(path, key)
         if value is not None:
             return float(value)
@@ -2575,7 +2939,7 @@ def _reaction_contribution_table(order, labels, stats, mode, ranking_metric):
 
 def fig_reactions(filepath, species, mode, xscale, yscale, top_n, model=None,
                   ranking_metric=DEFAULT_REACT_RANKING, theme='light',
-                  av_range=DEFAULT_AV_RANGE):
+                  av_range=DEFAULT_AV_RANGE, overlay_filepath=None):
     """Top-N formation or destruction reactions for a species (vs A_V)."""
     ranking_metric = _parse_react_ranking(ranking_metric)
     av_range = _parse_av_range(av_range)
@@ -2627,8 +2991,7 @@ def fig_reactions(filepath, species, mode, xscale, yscale, top_n, model=None,
         )
         fig.add_trace(go.Scatter(
             x=xv, y=y_plot, mode='lines',
-            line=dict(color=COLORS[k % len(COLORS)], width=1.9,
-                      dash=_DASH_CYCLE[(k // len(COLORS)) % len(_DASH_CYCLE)]),
+            line=dict(color=COLORS[k % len(COLORS)], width=1.9, dash='solid'),
             name=legend,
             legendrank=k + 1,
             hovertemplate=hover,
@@ -2648,6 +3011,50 @@ def fig_reactions(filepath, species, mode, xscale, yscale, top_n, model=None,
             f'{total_name}<br>A_V=%{{x:.3g}}<br>rate=%{{y:.3g}}<extra></extra>'
         ),
     ))
+
+    if overlay_filepath and not _same_data_path(overlay_filepath, filepath):
+        odata = get_reaction_data(overlay_filepath, species, mode)
+        if odata is not None:
+            oxv, _, _, _ = _xvals(dict(av=odata['av']), 'Av', xscale, av_range=av_range)
+            x_ok_o = np.isfinite(oxv)
+            omatrix = odata['matrix']
+            olabels = odata['labels']
+            for k, j in enumerate(order):
+                if j >= omatrix.shape[1]:
+                    continue
+                y = np.abs(omatrix[:, j].astype(float))
+                if yscale == 'log':
+                    y = np.where(y > 0, y, np.nan)
+                y_plot = np.where(x_ok_o, y, np.nan)
+                displayed_ys.append(y_plot)
+                lab = olabels[j] if j < len(olabels) else f'reaction {j}'
+                legend = _reaction_legend_label(lab, {}, ranking_metric) + ' \u00B7 att'
+                fig.add_trace(go.Scatter(
+                    x=oxv, y=y_plot, mode='lines',
+                    line=dict(color=COLORS[k % len(COLORS)], width=1.5, dash='dash'),
+                    opacity=0.5,
+                    name=legend,
+                    legendrank=k + 1,
+                    hovertemplate=(
+                        f'{lab}<br>A_V=%{{x:.3g}}<br>rate=%{{y:.3g}}<extra></extra>'
+                    ),
+                ))
+            y_ototal = np.sum(np.abs(omatrix), axis=1).astype(float)
+            if yscale == 'log':
+                y_ototal = np.where(y_ototal > 0, y_ototal, np.nan)
+            y_ototal = np.where(x_ok_o, y_ototal, np.nan)
+            displayed_ys.append(y_ototal)
+            fig.add_trace(go.Scatter(
+                x=oxv, y=y_ototal, mode='lines',
+                line=dict(color='black', width=2.0, dash='dash'),
+                opacity=0.5,
+                name=f'{total_name} \u00B7 att',
+                legendrank=0,
+                hovertemplate=(
+                    f'{total_name}<br>A_V=%{{x:.3g}}<br>rate=%{{y:.3g}}<extra></extra>'
+                ),
+            ))
+
     yr = _reaction_y_range(displayed_ys, yscale)
     _apply_layout(fig, title, 'A<sub>V</sub> (mag)', xt, xr, _REACT_YLABEL, yscale, theme=theme,
                   uirevision_extra=av_range)
@@ -2698,15 +3105,20 @@ def make_reaction_plots(values, species, xscale, yscale, top_n,
         p = placeholder_fig('Load a chemistry grid and pick a species', theme=theme)
         return (p, empty, p, empty, net_placeholder, net_status)
     chem_path = chem_file(values)
-    struct_path = current_file(values)
-    model = get_model(struct_path) if struct_path else None
+    chem_overlay_path = chem_overlay_file(values)
+    if chem_overlay_path and _same_data_path(chem_overlay_path, chem_path):
+        chem_overlay_path = None
+    struct_path = current_file(values) if _grid_has_hdf5() else None
+    model = get_model(struct_path) if struct_path else get_chem_model(chem_path)
     if chem_path:
         fig_f, stats_f, order_f = fig_reactions(
             chem_path, species, 'formation', xscale, yscale, top_n, model=model,
-            ranking_metric=ranking_metric, theme=theme, av_range=av_range)
+            ranking_metric=ranking_metric, theme=theme, av_range=av_range,
+            overlay_filepath=chem_overlay_path)
         fig_d, stats_d, order_d = fig_reactions(
             chem_path, species, 'destruction', xscale, yscale, top_n, model=model,
-            ranking_metric=ranking_metric, theme=theme, av_range=av_range)
+            ranking_metric=ranking_metric, theme=theme, av_range=av_range,
+            overlay_filepath=chem_overlay_path)
         labels_f = (get_reaction_data(chem_path, species, 'formation') or {}).get('labels', [])
         labels_d = (get_reaction_data(chem_path, species, 'destruction') or {}).get('labels', [])
         tbl_f = _reaction_contribution_table(
@@ -2817,6 +3229,9 @@ def _quantity_label(quantity):
     if quantity.startswith('species:'):
         sp = quantity.split(':', 1)[1]
         return f'X<sub>{format_species_html(sp)}</sub>'
+    if quantity.startswith('cdens:'):
+        sp = quantity.split(':', 1)[1]
+        return f'N({format_species_html(sp)}) (cm<sup>-2</sup>)'
     if quantity.startswith('X(') and ')/X(' in quantity:
         try:
             left, right = quantity.split(')/X(', 1)
@@ -2849,22 +3264,25 @@ def get_grid_scalar(filepath, quantity):
     if cache_key in _scalar_cache:
         return _scalar_cache[cache_key]
     try:
-        model = get_model(filepath)
-        if quantity == 'tgas':
-            val = float(np.asarray(model['tgas'], float)[0])
-        elif quantity == 'tgas_col':
-            val = column_averaged_tgas(model)
-        elif quantity == 'tdust':
-            val = float(np.asarray(model['tdust'], float)[0])
-        elif quantity == 'nh':
-            val = float(np.asarray(model['nH'], float)[0])
-        elif quantity == 'xe':
-            val = electron_fraction_edge(model)
-        elif quantity.startswith('species:'):
-            sp = quantity.split(':', 1)[1]
-            val = integrated_rel_abundance(model, sp)
+        if str(quantity).startswith('cdens:'):
+            val = total_column_density(filepath, quantity.split(':', 1)[1])
         else:
-            val = np.nan
+            model = get_model(filepath)
+            if quantity == 'tgas':
+                val = float(np.asarray(model['tgas'], float)[0])
+            elif quantity == 'tgas_col':
+                val = column_averaged_tgas(model)
+            elif quantity == 'tdust':
+                val = float(np.asarray(model['tdust'], float)[0])
+            elif quantity == 'nh':
+                val = float(np.asarray(model['nH'], float)[0])
+            elif quantity == 'xe':
+                val = electron_fraction_edge(model)
+            elif quantity.startswith('species:'):
+                sp = quantity.split(':', 1)[1]
+                val = integrated_rel_abundance(model, sp)
+            else:
+                val = np.nan
     except (IndexError, TypeError, ValueError):
         val = np.nan
     _scalar_cache[cache_key] = val
@@ -2907,8 +3325,8 @@ def _contour_data_aspect(x_plot, y_plot):
     return _plot_coord_span(y_plot) / _plot_coord_span(x_plot)
 
 
-def _contour_colorbar(title, theme='light', zscale='log'):
-    """Fixed colorbar geometry; tick formatting matches log vs linear Z."""
+def _contour_colorbar(title, theme='light', zscale='log', compact=True):
+    """Colorbar geometry; compact grids sit next to the plot like the χ² maps."""
     t = _theme_colors(theme)
     # Log mode plots log10(Z), so plain decimal ticks.  Linear mode often spans
     # many decades → scientific exponents on the colorbar.
@@ -2916,17 +3334,55 @@ def _contour_colorbar(title, theme='light', zscale='log'):
         tick_kw = dict(exponentformat='none', showexponent='none')
     else:
         tick_kw = dict(exponentformat='e', showexponent='all')
+    if compact:
+        pos_kw = dict(
+            len=_COMPACT_YSPAN,
+            lenmode='fraction',
+            thickness=16,
+            x=_COMPACT_CBAR_X,
+            xanchor='left',
+            xpad=2,
+            y=0.5,
+            yanchor='middle',
+        )
+    else:
+        pos_kw = dict(
+            len=0.82,
+            thickness=14,
+            x=1.02,
+            xanchor='left',
+            xpad=4,
+            y=0.5,
+            yanchor='middle',
+        )
     return dict(
         title=dict(text=title, font=ps.cbar_title_font(t['font'])),
         tickfont=ps.cbar_tick_font(t['font']),
-        len=0.82,
-        thickness=14,
-        x=1.02,
-        xpad=2,
-        y=0.5,
-        yanchor='middle',
+        outlinewidth=0,
+        **pos_kw,
+        **tick_kw,
+    )
+
+
+def _subplot_colorbar(title, x, theme='light', zscale='log', **extra):
+    """Colorbar tucked against one panel in a 1×3 subplot row."""
+    t = _theme_colors(theme)
+    if zscale == 'log':
+        tick_kw = dict(exponentformat='none', showexponent='none')
+    else:
+        tick_kw = dict(exponentformat='e', showexponent='all')
+    return dict(
+        title=dict(text=title, font=ps.cbar_title_font(t['font'])),
+        tickfont=ps.cbar_tick_font(t['font']),
+        len=0.88,
+        thickness=12,
+        x=x,
+        xanchor='left',
+        xpad=4,
+        xref='paper',
         outlinewidth=0,
         **tick_kw,
+        **extra,
     )
 
 
@@ -3037,7 +3493,7 @@ def _apply_square_contour_layout(fig, x_plot, y_plot, xdef, ydef, title,
         width=fig_w,
         height=fig_h,
         autosize=False,
-        margin=dict(l=60, r=80, t=52, b=54),
+        margin=dict(l=60, r=56, t=52, b=54),
         font=ps.layout_font(t['font']),
         uirevision=uirev,
         xaxis=dict(
@@ -3635,7 +4091,7 @@ def fig_spaghetti_plane(plane, slice_idx, contour_entries, idef,
         legend=dict(
             orientation='v',
             yanchor='top', y=1.0,
-            xanchor='left', x=_COMPACT_XDOMAIN[1] + 0.015,
+            xanchor='left', x=_COMPACT_CBAR_X,
             bgcolor=t['legend_bg'],
             bordercolor=t['legend_border'],
             borderwidth=1,
@@ -3683,18 +4139,6 @@ def fig_spaghetti_plane(plane, slice_idx, contour_entries, idef,
             chi2_fig, x_plot, y_plot, xdef, ydef, chi2_title,
             fixed_size=True, theme=theme, zscale='linear',
         )
-        # Pin the colorbar to the reserved strip, matching the heatmap height.
-        cbar = chi2_fig.data[0].colorbar
-        cbar.x = _COMPACT_XDOMAIN[1] + 0.015
-        cbar.xanchor = 'left'
-        cbar.xpad = 2
-        cbar.len = _COMPACT_YSPAN
-        cbar.lenmode = 'fraction'
-        cbar.y = 0.5
-        cbar.yanchor = 'middle'
-        cbar.thickness = 16
-        cbar.title.font.size = ps.PLOT_CBAR_FONT_SIZE
-        cbar.tickfont.size = ps.PLOT_CBAR_TICK_FONT_SIZE
         chi2_fig.update_layout(showlegend=False)
     
     return fig, chi2_fig, chi2_info
@@ -3775,7 +4219,7 @@ def _multi_panel_layout_kw(theme='light', height=420):
         autosize=True,
         width=None,
         height=height,
-        margin=dict(l=58, r=88, t=64, b=50),
+        margin=dict(l=58, r=56, t=64, b=50),
         font=ps.layout_font(t['font']),
     )
 
@@ -3979,9 +4423,6 @@ def fig_interpolation_comparison(result, xdef, ydef, *, title, zscale, color_map
         contour_kw['contours'] = dict(coloring='heatmap', showlines=False,
                                       labelfont=dict(color='white', size=9))
         contour_kw['line']['width'] = 0
-    cbar_tick = dict(exponentformat='none' if zscale == 'log' else 'e',
-                     showexponent='none' if zscale == 'log' else 'all',
-                     tickfont=ps.cbar_tick_font(t['font']))
     flux_z = {}
     if z0a is not None and z1a is not None:
         flux_z = dict(zmin=min(z0a, z1a), zmax=max(z0b, z1b), zauto=False)
@@ -3995,24 +4436,20 @@ def fig_interpolation_comparison(result, xdef, ydef, *, title, zscale, color_map
     fig = make_subplots(
         rows=1, cols=3,
         subplot_titles=['Original (native grid)', 'Interpolated (resampled)', err_title],
-        horizontal_spacing=0.07,
+        horizontal_spacing=0.05,
         column_widths=[1, 1, 1],
     )
     fig.add_trace(go.Contour(
         x=x_plot_n, y=y_plot_n, z=z0, colorscale=cmap,
-        colorbar=dict(title=dict(text=flux_cbar, font=ps.cbar_title_font(t['font'])),
-                      len=0.88, thickness=12, x=0.28, xref='paper', **cbar_tick),
+        colorbar=_subplot_colorbar(flux_cbar, 0.308, theme, zscale),
         **flux_z, **contour_kw), row=1, col=1)
     fig.add_trace(go.Contour(
         x=x_plot_f, y=y_plot_f, z=z1, colorscale=cmap,
-        colorbar=dict(title=dict(text=flux_cbar, font=ps.cbar_title_font(t['font'])),
-                      len=0.88, thickness=12, x=0.635, xref='paper', **cbar_tick),
+        colorbar=_subplot_colorbar(flux_cbar, 0.658, theme, zscale),
         **flux_z, **contour_kw), row=1, col=2)
     fig.add_trace(go.Contour(
         x=x_plot_n, y=y_plot_n, z=err, colorscale=ERROR_PANEL_CMAP,
-        colorbar=dict(title=dict(text=err_cbar, font=ps.cbar_title_font(t['font'])),
-                      len=0.88, thickness=12, x=1.01, xref='paper',
-                      tickfont=ps.cbar_tick_font(t['font'])),
+        colorbar=_subplot_colorbar(err_cbar, 1.006, theme, zscale='linear'),
         connectgaps=False,
         hovertemplate='x=%{x:.3g}<br>y=%{y:.3g}<br>z=%{z:.3g}<extra></extra>',
     ), row=1, col=3)
@@ -4230,9 +4667,6 @@ def fig_triple_atten_grid(plane, slice_title, Z_ref, Z_atten, x_phys, y_phys,
     contour_kw = _contour_trace_kw(theme, show_lines=True)
     contour_kw['contours']['labelfont'] = dict(color='white', size=9)
     contour_kw['line']['width'] = 0.6
-    cbar_tick = dict(exponentformat='none' if zscale == 'log' else 'e',
-                     showexponent='none' if zscale == 'log' else 'all',
-                     tickfont=ps.cbar_tick_font(t['font']))
 
     panel = 380
     fig = make_subplots(
@@ -4242,7 +4676,7 @@ def fig_triple_atten_grid(plane, slice_title, Z_ref, Z_atten, x_phys, y_phys,
             'Overlay grid (attenuated)',
             'Horizontal x-shift (dex)',
         ],
-        horizontal_spacing=0.07,
+        horizontal_spacing=0.05,
         column_widths=[1, 1, 1],
     )
     shift_trace_kw = dict(
@@ -4254,19 +4688,16 @@ def fig_triple_atten_grid(plane, slice_title, Z_ref, Z_atten, x_phys, y_phys,
         flux_z = dict(zmin=min(z0min, z1min), zmax=max(z0max, z1max), zauto=False)
     fig.add_trace(go.Contour(
         x=x_plot, y=y_plot, z=p0, colorscale=cmap,
-        colorbar=dict(title=dict(text=cbar_ref, font=ps.cbar_title_font(t['font'])),
-                      len=0.88, thickness=12, x=0.30, xref='paper', **cbar_tick),
+        colorbar=_subplot_colorbar(cbar_ref, 0.308, theme, zscale),
         **flux_z, **contour_kw), row=1, col=1)
     fig.add_trace(go.Contour(
         x=x_plot, y=y_plot, z=p1, colorscale=cmap,
-        colorbar=dict(title=dict(text=cbar_ref, font=ps.cbar_title_font(t['font'])),
-                      len=0.88, thickness=12, x=0.635, xref='paper', **cbar_tick),
+        colorbar=_subplot_colorbar(cbar_ref, 0.658, theme, zscale),
         **flux_z, **contour_kw), row=1, col=2)
     fig.add_trace(go.Contour(
         x=x_plot, y=y_plot, z=shift, colorscale=shift_cmap,
-        colorbar=dict(title=dict(text=_shift_panel_colorbar_title(xdef),
-                                 font=ps.cbar_title_font(t['font'])),
-                      len=0.88, thickness=12, x=1.01, xref='paper'),
+        colorbar=_subplot_colorbar(_shift_panel_colorbar_title(xdef), 1.006, theme,
+                                   zscale='linear'),
         **shift_trace_kw, **contour_kw), row=1, col=3)
 
     axis_kw = _subplot_axis_kw(theme)
@@ -4379,8 +4810,10 @@ def build_slice_grids_for_quantities(plane, slice_token, quantities, interp_conf
     Zs = {q: np.full((ny, nx), np.nan) for q in quantities}
 
     species_qtys = [q for q in quantities if str(q).startswith('species:')]
-    other_qtys = [q for q in quantities if q not in species_qtys]
+    cdens_qtys = [q for q in quantities if str(q).startswith('cdens:')]
+    other_qtys = [q for q in quantities if q not in species_qtys and q not in cdens_qtys]
     species_names = [q.split(':', 1)[1] for q in species_qtys]
+    cdens_names = [q.split(':', 1)[1] for q in cdens_qtys]
 
     ixk, iyk, isk = _PARAM_IDX[xk], _PARAM_IDX[yk], _PARAM_IDX[sk]
     base_tokens = [_middle_token(p['key']) for p in PARAM_DEFS]
@@ -4402,6 +4835,15 @@ def build_slice_grids_for_quantities(plane, slice_token, quantities, interp_conf
                     val = xs[sp]
                     Zs[q][iy, ix] = val
                     _scalar_cache[(path, q)] = val
+            if cdens_qtys:
+                try:
+                    with h5py.File(path, 'r') as hf:
+                        for q, sp in zip(cdens_qtys, cdens_names):
+                            val = _total_column_density_from_hf(hf, sp)
+                            Zs[q][iy, ix] = val
+                            _scalar_cache[(path, q)] = val
+                except OSError:
+                    pass
             for q in other_qtys:
                 Zs[q][iy, ix] = get_grid_scalar(path, q)
 
@@ -5483,7 +5925,8 @@ def fig_simline_pv(values, species, transition, pos_min, pos_max, zscale,
     heat_kw = dict(
         x=positions, y=velocities, z=zplot,
         colorscale=colorscale or 'Inferno',
-        colorbar=_contour_colorbar(z_label, theme=theme, zscale=cbar_zscale),
+        colorbar=_contour_colorbar(z_label, theme=theme, zscale=cbar_zscale,
+                                   compact=False),
         hovertemplate=(
             'offset = %{x:.3f}"<br>v = %{y:.3g} km/s'
             f'<br>{z_hover}<extra></extra>'
@@ -5749,6 +6192,8 @@ def make_profile_plots(values, xvar, xscale, yscale, custom_species, theme='ligh
     if model is None:
         if _grid and _grid.get('simline_only'):
             bad = placeholder_fig('Depth profiles require an HDF5 grid directory', theme=theme)
+        elif _grid and _grid.get('chem_only'):
+            bad = placeholder_fig('Depth profiles require an HDF5 model grid', theme=theme)
         elif not _grid:
             bad = placeholder_fig(theme=theme)
         else:
@@ -5774,6 +6219,8 @@ def make_thermal_plots(values, xvar, xscale, yscale, theme='light',
     if model is None:
         if _grid and _grid.get('simline_only'):
             bad = placeholder_fig('Heating/cooling profiles require an HDF5 grid directory', theme=theme)
+        elif _grid and _grid.get('chem_only'):
+            bad = placeholder_fig('Heating/cooling profiles require an HDF5 model grid', theme=theme)
         elif not _grid:
             bad = placeholder_fig(theme=theme)
         else:
@@ -5797,43 +6244,87 @@ app = dash.Dash(
 server = app.server
 
 _RADIO = dict(labelStyle={'display': 'block', 'marginBottom': '3px', 'fontSize': '13px'})
+_SEG = dict(
+    className='seg-control',
+    inputClassName='seg-input',
+    labelClassName='seg-btn',
+    labelStyle={'display': 'inline-flex', 'margin': '0'},
+)
+_SEG_STACK = dict(
+    className='seg-control seg-stack',
+    inputClassName='seg-input',
+    labelClassName='seg-btn',
+    labelStyle={'display': 'inline-flex', 'margin': '0'},
+)
 
-_SCALE_OPTIONS = [{'label': ' log', 'value': 'log'},
-                  {'label': ' linear', 'value': 'linear'}]
-
-_AV_RANGE_OPTIONS = [
-    {'label': ' full HDF5', 'value': 'full'},
-    {'label': f' floor \u2265 {AV_FLOOR:g}', 'value': 'floor'},
+_SCALE_OPTIONS = [
+    {'label': html.Span('log', className='seg-opt'), 'value': 'log'},
+    {'label': html.Span('linear', className='seg-opt'), 'value': 'linear'},
 ]
 
-_XVAR_OPTIONS = [{'label': ' A\u1D65 (mag)', 'value': 'Av'},
-                 {'label': ' n_H (cm\u207B\u00B3)', 'value': 'nH'}]
+_AV_RANGE_OPTIONS = [
+    {'label': html.Span('full HDF5', className='seg-opt'), 'value': 'full'},
+    {'label': html.Span(f'floor ≥ {AV_FLOOR:g}', className='seg-opt'), 'value': 'floor'},
+]
+
+_XVAR_OPTIONS = [
+    {'label': html.Span('Aᵥ (mag)', className='seg-opt'), 'value': 'Av'},
+    {'label': html.Span('n_H (cm⁻³)', className='seg-opt'), 'value': 'nH'},
+]
 
 _CTRL_LABEL = {'fontWeight': '600', 'fontSize': '13px', 'display': 'block', 'marginBottom': '5px'}
-_ALL_BTN_STYLE = {
-    'padding': '7px 12px', 'backgroundColor': '#1f77b4', 'color': 'white',
-    'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
-    'fontSize': '12px', 'fontWeight': '600', 'whiteSpace': 'nowrap',
-    'marginTop': '22px',
-}
+_ALL_BTN_STYLE = {'marginTop': '22px'}
 _CTRL_BOX = {'flex': '1', 'minWidth': '110px', 'marginRight': '18px'}
-_GRAPH_CFG = {'toImageButtonOptions': {'format': 'png', 'scale': 2}}
+_GRAPH_CFG = {
+    'toImageButtonOptions': {'format': 'png', 'scale': 2},
+    'displaylogo': False,
+    'modeBarButtonsToRemove': [
+        'lasso2d', 'select2d', 'autoScale2d', 'hoverClosestCartesian',
+        'hoverCompareCartesian', 'toggleSpikelines',
+    ],
+}
 _SLICE_GRAPH_CFG = {**_GRAPH_CFG, 'responsive': False}
-_TAB_STYLE = {'padding': '10px 18px', 'fontWeight': '600', 'fontSize': '13px'}
-_TAB_SEL = {'borderTop': '3px solid #1f77b4', 'padding': '10px 18px',
-            'fontWeight': '700', 'fontSize': '13px', 'backgroundColor': '#f5f7ff'}
-_NESTED_TAB_STYLE = {'padding': '8px 14px', 'fontWeight': '600', 'fontSize': '12px'}
-_NESTED_TAB_SEL = {'borderTop': '3px solid #1f77b4', 'padding': '8px 14px',
-                   'fontWeight': '700', 'fontSize': '12px', 'backgroundColor': '#f5f7ff'}
-_PAGE_INTRO = {'margin': '0 0 12px', 'fontSize': '13px', 'opacity': 0.88}
+_TAB_STYLE = {}
+_TAB_SEL = {}
+_NESTED_TAB_STYLE = {}
+_NESTED_TAB_SEL = {}
+_PAGE_INTRO = {'margin': '0 0 14px', 'fontSize': '13px', 'lineHeight': '1.5',
+               'color': 'inherit', 'opacity': 0.88}
 _PANEL_ROW = {
     'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
     'padding': '12px 18px', 'marginBottom': '12px',
 }
 _INPUT_STYLE = {
-    'padding': '7px 9px', 'fontSize': '13px',
-    'border': '1px solid #bbc', 'borderRadius': '6px',
+    'padding': '8px 10px', 'fontSize': '13px',
 }
+
+
+def _advanced_details(summary, *children):
+    """Collapsible card for advanced / secondary controls."""
+    return html.Details(
+        [html.Summary(summary),
+         html.Div(list(children), className='kosma-details-body')],
+        className='kosma-details',
+        open=False,
+    )
+
+
+def _load_card(title, subtitle, body, *, accent='blue'):
+    """Neutral load-page card with a coloured left accent."""
+    accent_cls = {
+        'blue': '',
+        'green': ' accent-green',
+        'purple': ' accent-purple',
+        'overlay': ' accent-overlay',
+    }.get(accent, '')
+    return html.Div([
+        html.Div([
+            html.Span(title, className='load-card-title'),
+            html.Span(f' — {subtitle}', className='load-card-sub') if subtitle else None,
+        ], className='load-card-head'),
+        body,
+    ], className=f'load-card{accent_cls}')
+
 
 
 def _slider_block(d):
@@ -5876,7 +6367,7 @@ def _shift_control_row(prefix=''):
                       className='kosma-muted',
                       style={'fontSize': '11px', 'marginLeft': '8px'}),
         ], style={'flex': '1.2', 'minWidth': '200px'}),
-    ], className='kosma-panel kosma-panel-dashed', style=_PANEL_ROW)
+    ], className='kosma-panel', style=_PANEL_ROW)
 
 
 def _int_contour_overlay_row():
@@ -5919,7 +6410,7 @@ def _int_contour_overlay_row():
                       style={'fontSize': '11px', 'marginTop': '4px',
                              'display': 'block'}),
         ], style={'flex': '1.2', 'minWidth': '180px'}),
-    ], className='kosma-panel kosma-panel-dashed', style=_PANEL_ROW)
+    ], className='kosma-panel', style=_PANEL_ROW)
 
 
 def _rgb_channel_dropdowns(prefix, placeholder):
@@ -6096,25 +6587,24 @@ def _spaghetti_controls():
         ),
         # Chi2 surface plots (below spaghetti)
         html.Details([
-            html.Summary('\u03c7\u00b2 surface plots (click to expand)',
-                         style={'fontSize': '13px', 'fontWeight': '600', 'cursor': 'pointer',
-                                'padding': '8px 0', 'color': '#1f77b4'}),
-            html.P('The \u03c7\u00b2 = \u03a3((Z - obs)/\u03c3)\u00b2 surface for each slice plane. '
-                   'Lower values (darker) indicate better fit. The star marks the minimum.',
-                   style={**_PAGE_INTRO, 'marginTop': '6px', 'marginBottom': '10px'}),
-            html.Div(
-                [html.Div([
-                    dcc.Graph(id=f'plot-int-spag-chi2-{p["id"]}', figure=placeholder_fig(),
-                              config=_SLICE_GRAPH_CFG, style=_SLICE_GRAPH_STYLE),
-                ], id=f'int-spag-chi2-panel-{p["id"]}', style=_SLICE_PANEL_ROW)
-                 for p in SLICE_PLANES],
-                id='int-spag-chi2-panels-wrap',
-                style={**_SLICE_PANELS_ROW_STYLE, 'flexWrap': 'nowrap',
-                       'overflowX': 'auto'},
-            ),
-        ], open=False, style={'marginTop': '12px', 'padding': '8px 0',
-                              'backgroundColor': 'rgba(31, 119, 180, 0.05)',
-                              'borderRadius': '8px', 'border': '1px solid rgba(31, 119, 180, 0.15)'}),
+            html.Summary('χ² surface plots'),
+            html.Div([
+                html.P('The χ² = Σ((Z − obs)/σ)² surface for each slice plane. '
+                       'Lower values (darker) indicate better fit. The star marks the minimum.',
+                       style={**_PAGE_INTRO, 'marginTop': '6px', 'marginBottom': '10px',
+                              'padding': '0 16px'}),
+                html.Div(
+                    [html.Div([
+                        dcc.Graph(id=f'plot-int-spag-chi2-{p["id"]}', figure=placeholder_fig(),
+                                  config=_SLICE_GRAPH_CFG, style=_SLICE_GRAPH_STYLE),
+                    ], id=f'int-spag-chi2-panel-{p["id"]}', style=_SLICE_PANEL_ROW)
+                     for p in SLICE_PLANES],
+                    id='int-spag-chi2-panels-wrap',
+                    style={**_SLICE_PANELS_ROW_STYLE, 'flexWrap': 'nowrap',
+                           'overflowX': 'auto', 'padding': '0 8px 12px'},
+                ),
+            ], className='kosma-details-body'),
+        ], className='kosma-details', open=False),
     ])
 
 
@@ -6166,7 +6656,7 @@ def _interp_control_row(prefix=''):
                                                 'value': 'clip'}],
                           value=[], style={'fontSize': '13px'}),
         ], style={'flex': '1', 'minWidth': '160px'}),
-    ], className='kosma-panel kosma-panel-dashed', style=_PANEL_ROW)
+    ], className='kosma-panel', style=_PANEL_ROW)
 
 
 def _interp_error_control_row():
@@ -6184,7 +6674,7 @@ def _interp_error_control_row():
         html.Div([
             html.Label('Error metric', style=_CTRL_LABEL),
             dcc.RadioItems(id='ie-error-metric', options=ERROR_METRIC_OPTIONS,
-                           value=ERROR_METRIC_OPTIONS[0]['value'], **_RADIO),
+                           value=ERROR_METRIC_OPTIONS[0]['value'], **_SEG),
         ], style={'flex': '1.2', 'minWidth': '200px', 'marginRight': '18px'}),
         html.Div([
             html.Label('Relative threshold', style=_CTRL_LABEL),
@@ -6198,7 +6688,7 @@ def _interp_error_control_row():
         html.Div([
             html.Label('Flux / abundance scale', style=_CTRL_LABEL),
             dcc.RadioItems(id='ie-flux-scale', options=_SCALE_OPTIONS,
-                           value='log', **_RADIO),
+                           value='log', **_SEG),
         ], style={**_CTRL_BOX, 'marginRight': '18px'}),
         html.Div([
             html.Label('Contour lines', style=_CTRL_LABEL),
@@ -6207,7 +6697,7 @@ def _interp_error_control_row():
                                     'value': 'contours'}],
                           value=['contours'], style={'fontSize': '13px'}),
         ], style={'flex': '1.4', 'minWidth': '220px'}),
-    ], className='kosma-panel kosma-panel-dashed', style=_PANEL_ROW)
+    ], className='kosma-panel', style=_PANEL_ROW)
 
 
 _SLICE_GRAPH_STYLE_COMPACT = {
@@ -6319,37 +6809,38 @@ def _ie_plane_section(slot_id):
 app.layout = html.Div(
     id='app-root',
     className='theme-light',
-    style={'fontFamily': 'Arial, sans-serif', 'maxWidth': APP_MAX_WIDTH,
-           'margin': '0 auto', 'padding': '14px 28px', 'backgroundColor': '#fff',
-           'color': '#333', 'minHeight': '100vh'},
+    style={'fontFamily': UI_FONT, 'maxWidth': APP_MAX_WIDTH,
+           'margin': '0 auto', 'padding': '12px 24px 28px', 'backgroundColor': '#f1f4f8',
+           'color': '#1e293b', 'minHeight': '100vh'},
     children=[
 
-    # Header + site-wide theme toggle (top-right)
-    html.Div(id='app-header', children=[
+    # Header + compact theme toggle
+    html.Div(id='app-header', className='app-header', children=[
         html.Img(src='/assets/prisma_logo.png', id='app-logo', className='app-logo',
-                 style={'width': '72px', 'height': '72px', 'marginRight': '16px',
-                        'borderRadius': '12px', 'flexShrink': '0'}),
+                 alt='PRISMA'),
         html.Div(id='app-brand', className='app-brand', children=[
-            html.Span('PDR Results Interactive Simulation Mapping & Analysis', className='app-brand-kicker'),
             html.H1([
                 html.Span('PRISMA', className='app-brand-name'),
             ], id='app-title', className='app-brand-title'),
             html.P(
-                'Browse photodissociation-region (PDR) model grids from KOSMA-\u03C4 / KoSens3D: '
-                'depth profiles, heating & cooling, chemistry, and SIMLINE line intensities '
-                'across density, FUV, cosmic-ray rate, and related parameters.',
+                'PDR Results Interactive Simulation Mapping & Analysis — '
+                'KOSMA-τ / KoSens3D model grids.',
                 id='app-subtitle',
                 className='app-brand-lead',
             ),
-            html.P(
-                'Load an HDF5 model directory and/or a SIMLINE output folder, then use the tabs '
-                'to explore profiles, 2-D grid slices, spectra, and map fits.',
-                id='app-blurb',
-                className='app-brand-blurb',
-            ),
+            html.Details(className='app-about', children=[
+                html.Summary('About'),
+                html.P(
+                    'Browse photodissociation-region (PDR) model grids: depth profiles, '
+                    'heating & cooling, chemistry, and SIMLINE line intensities across '
+                    'density, FUV, cosmic-ray rate, and related parameters. Load an HDF5 '
+                    'model directory and/or a SIMLINE output folder, then use the tabs '
+                    'to explore profiles, 2-D grid slices, spectra, and map fits.',
+                    id='app-blurb',
+                ),
+            ]),
         ]),
-        html.Div(id='theme-toggle-wrap', className='theme-sticker', children=[
-            html.Span('Theme', className='theme-sticker-caption'),
+        html.Div(id='theme-toggle-wrap', className='theme-toggle', children=[
             dcc.RadioItems(
                 id='plot-theme',
                 options=PLOT_THEME_OPTIONS,
@@ -6360,10 +6851,7 @@ app.layout = html.Div(
                 labelStyle={'display': 'inline-flex', 'margin': '0'},
             ),
         ]),
-    ], style={'display': 'flex', 'alignItems': 'flex-start',
-              'justifyContent': 'space-between', 'gap': '16px',
-              'borderBottom': '2px solid #1f77b4',
-              'paddingBottom': '14px', 'marginBottom': '14px'}),
+    ]),
 
     dcc.Store(id='grid-loaded', data=False),
 
@@ -6373,7 +6861,7 @@ app.layout = html.Div(
                  id='controls-sliders-wrap',
                  className='kosma-panel',
                  style={'display': 'flex', 'flexWrap': 'wrap', 'alignItems': 'flex-start',
-                        'padding': '14px 18px', 'marginTop': '4px'}),
+                        'padding': '12px 16px', 'marginTop': '4px'}),
 
         html.Div([
             html.Div([
@@ -6384,41 +6872,49 @@ app.layout = html.Div(
             ], style={'flex': '1.2', 'minWidth': '140px', 'marginRight': '18px'}),
             html.Div([
                 html.Label('X-axis', style=_CTRL_LABEL),
-                dcc.RadioItems(id='xvar-choice', options=_XVAR_OPTIONS, value='Av', **_RADIO),
+                dcc.RadioItems(id='xvar-choice', options=_XVAR_OPTIONS, value='Av', **_SEG),
             ], style=_CTRL_BOX),
             html.Div([
                 html.Label('X scale', style=_CTRL_LABEL),
-                dcc.RadioItems(id='xscale', options=_SCALE_OPTIONS, value='log', **_RADIO),
+                dcc.RadioItems(id='xscale', options=_SCALE_OPTIONS, value='log', **_SEG),
             ], style=_CTRL_BOX),
             html.Div([
                 html.Label('Y scale', style=_CTRL_LABEL),
-                dcc.RadioItems(id='yscale', options=_SCALE_OPTIONS, value='log', **_RADIO),
+                dcc.RadioItems(id='yscale', options=_SCALE_OPTIONS, value='log', **_SEG),
             ], style=_CTRL_BOX),
             html.Div([
-                html.Label('A\u1D65 range', style=_CTRL_LABEL),
+                html.Label('Aᵥ range', style=_CTRL_LABEL),
                 dcc.RadioItems(id='av-range', options=_AV_RANGE_OPTIONS,
-                               value=DEFAULT_AV_RANGE, **_RADIO),
+                               value=DEFAULT_AV_RANGE, **_SEG),
             ], style={**_CTRL_BOX, 'marginRight': '0'}),
         ], id='controls-axis-wrap',
            className='kosma-panel',
            style={'display': 'flex', 'alignItems': 'flex-start',
-                  'padding': '10px 18px', 'marginTop': '8px'}),
+                  'padding': '10px 16px', 'marginTop': '8px'}),
 
         html.Div(id='model-info', className='kosma-panel', style={
             'display': 'flex', 'flexWrap': 'wrap', 'gap': '8px', 'alignItems': 'center',
-            'padding': '7px 16px',
+            'padding': '7px 14px',
             'marginTop': '8px', 'marginBottom': '4px', 'fontSize': '13px'}),
+    ]),
+
+    html.Div(className='nav-groups', children=[
+        html.Span('Data'),
+        html.Span('Local profiles'),
+        html.Span('Grids & chemistry'),
+        html.Span('Lines & fits'),
     ]),
 
     dcc.Tabs(
         id='main-tabs',
         value='load',
-        style={'marginTop': '10px'},
-        colors={'border': '#dde', 'primary': '#1f77b4', 'background': '#fafbff'},
+        className='prisma-tabs',
+        style={'marginTop': '0'},
+        colors={'border': '#e2e8f0', 'primary': '#2563eb', 'background': '#ffffff'},
         children=[
 
         # --- Page 1: grid loaders -------------------------------------------
-        dcc.Tab(label='Load grids', value='load', style=_TAB_STYLE, selected_style=_TAB_SEL,
+        dcc.Tab(label='Load', value='load', style=_TAB_STYLE, selected_style=_TAB_SEL,
                 children=[
             html.Div(style={'paddingTop': '14px'}, children=[
                 html.P('Load model grids and SIMLINE directories to explore PDR models. '
@@ -6426,219 +6922,199 @@ app.layout = html.Div(
                        'dashed lines for comparison (e.g. attenuated vs. unattenuated models).',
                        style=_PAGE_INTRO),
 
-                # ═══════════════════════════════════════════════════════════════════
-                # PRIMARY GRIDS SECTION
-                # ═══════════════════════════════════════════════════════════════════
-                html.Div([
-                    html.H3([
-                        html.Span('\u2605 ', style={'color': '#1f77b4', 'marginRight': '6px'}),
-                        'Primary Model Grids'
-                    ], className='load-section-title',
-                       style={'margin': '0 0 6px', 'fontSize': '16px', 'fontWeight': '700',
-                              'color': '#1a2a4a', 'borderBottom': '2px solid #1f77b4',
-                              'paddingBottom': '8px'}),
-                    html.P('Main HDF5 grid and SIMLINE output that define the parameter space. '
-                           'These grids populate the sliders and drive all visualizations.',
-                           style={'fontSize': '12px', 'color': '#666', 'margin': '0 0 14px',
-                                  'lineHeight': '1.5'}),
-
-                    # Main HDF5 Grid
+                html.Div(className='load-grid', children=[
+                    # Primary
                     html.Div([
-                        html.Div([
-                            html.Span('\u25A0', style={'color': '#1f77b4', 'marginRight': '8px',
-                                                       'fontSize': '10px'}),
-                            html.Span('HDF5 Model Grid', style={'fontWeight': '700', 'fontSize': '13px'}),
-                            html.Span(' \u2014 depth profiles, abundances, heating/cooling',
-                                      style={'color': '#666', 'fontSize': '12px', 'marginLeft': '6px'}),
-                        ], style={'marginBottom': '8px'}),
-                        html.Div([
-                            dcc.Input(id='dir-input', type='text', value=args.dir,
-                                      placeholder='/path/to/pdrgrid_hdf5  or  /path/to/model.hdf5',
-                                      style={'flex': '1', 'padding': '8px 10px', 'fontSize': '13px',
-                                             'border': '1px solid #bbc', 'borderRadius': '6px',
-                                             'marginRight': '10px'}),
-                            dcc.Checklist(id='recursive-check',
-                                          options=[{'label': ' recursive', 'value': 'rec'}],
-                                          value=['rec'] if args.recursive else [],
-                                          style={'fontSize': '13px', 'marginRight': '10px',
-                                                 'whiteSpace': 'nowrap', 'alignSelf': 'center'}),
-                            html.Button('Load grid', id='btn-load', n_clicks=0,
-                                        style={'padding': '8px 22px', 'backgroundColor': '#1f77b4',
-                                               'color': 'white', 'border': 'none', 'borderRadius': '6px',
-                                               'cursor': 'pointer', 'fontSize': '13px', 'fontWeight': '600'}),
-                        ], style={'display': 'flex', 'alignItems': 'stretch'}),
-                        html.Div(id='load-status',
-                                 style={'marginTop': '7px', 'fontSize': '13px', 'minHeight': '18px'}),
-                    ], style={'padding': '12px 16px', 'backgroundColor': 'rgba(31, 119, 180, 0.06)',
-                              'borderRadius': '8px', 'border': '1px solid rgba(31, 119, 180, 0.2)',
-                              'marginBottom': '12px'}),
+                        html.H3([
+                            html.Span(className='accent-bar'),
+                            'Primary grids',
+                        ], className='load-section-title'),
+                        html.P(
+                            'Main HDF5 grid and SIMLINE output that define the parameter space. '
+                            'These populate the sliders and drive visualizations.',
+                            className='load-section-desc',
+                        ),
+                        _load_card(
+                            'HDF5 model grid',
+                            'depth profiles, abundances, heating/cooling',
+                            html.Div([
+                                html.Div([
+                                    dcc.Input(
+                                        id='dir-input', type='text', value=args.dir,
+                                        placeholder='/path/to/pdrgrid_hdf5  or  /path/to/model.hdf5',
+                                        className='kosma-input',
+                                    ),
+                                    dcc.Checklist(
+                                        id='recursive-check',
+                                        options=[{'label': ' recursive', 'value': 'rec'}],
+                                        value=['rec'] if args.recursive else [],
+                                        style={'fontSize': '13px', 'whiteSpace': 'nowrap',
+                                               'alignSelf': 'center'},
+                                    ),
+                                    html.Button('Load grid', id='btn-load', n_clicks=0,
+                                                className='btn btn-primary'),
+                                ], className='load-card-row'),
+                                html.Div(id='load-status', className='load-status'),
+                            ]),
+                            accent='blue',
+                        ),
+                        _load_card(
+                            'Chemistry grid',
+                            'reaction rates (can load standalone or with HDF5)',
+                            html.Div([
+                                html.Div([
+                                    dcc.Input(
+                                        id='chem-dir-input', type='text', value='',
+                                        placeholder='/path/to/chemistrygrid  or  /path/to/chem_model.hdf5',
+                                        className='kosma-input',
+                                    ),
+                                    dcc.Checklist(
+                                        id='chem-recursive-check',
+                                        options=[{'label': ' recursive', 'value': 'rec'}],
+                                        value=[],
+                                        style={'fontSize': '13px', 'whiteSpace': 'nowrap',
+                                               'alignSelf': 'center'},
+                                    ),
+                                    html.Button('Load chemistry', id='btn-load-chem', n_clicks=0,
+                                                className='btn btn-success'),
+                                    html.Button('Clear', id='btn-clear-chem', n_clicks=0,
+                                                className='btn btn-ghost'),
+                                ], className='load-card-row'),
+                                html.Div(id='chem-status', className='load-status'),
+                            ]),
+                            accent='green',
+                        ),
+                        dcc.Store(id='chem-state', data=0),
+                        _load_card(
+                            'SIMLINE directory',
+                            'line intensities & spectra (can load standalone)',
+                            html.Div([
+                                html.Div([
+                                    dcc.Input(
+                                        id='simline-dir-input', type='text', value='',
+                                        placeholder='/path/to/simlineoutput',
+                                        className='kosma-input',
+                                    ),
+                                    dcc.Checklist(
+                                        id='simline-recursive-check',
+                                        options=[{'label': ' recursive', 'value': 'rec'}],
+                                        value=[],
+                                        style={'fontSize': '13px', 'whiteSpace': 'nowrap',
+                                               'alignSelf': 'center'},
+                                    ),
+                                    html.Button('Load SIMLINE', id='btn-load-simline', n_clicks=0,
+                                                className='btn btn-purple'),
+                                    html.Button('Clear', id='btn-clear-simline', n_clicks=0,
+                                                className='btn btn-ghost'),
+                                ], className='load-card-row'),
+                                html.Div(id='simline-status', className='load-status'),
+                            ]),
+                            accent='purple',
+                        ),
+                        dcc.Store(id='simline-state', data=0),
+                    ], className='kosma-panel load-section'),
 
-                    # Chemistry Grid
+                    # Overlay
                     html.Div([
-                        html.Div([
-                            html.Span('\u25A0', style={'color': '#2ca02c', 'marginRight': '8px',
-                                                       'fontSize': '10px'}),
-                            html.Span('Chemistry Grid', style={'fontWeight': '700', 'fontSize': '13px'}),
-                            html.Span(' \u2014 reaction rates (enables Chemistry tab)',
-                                      style={'color': '#666', 'fontSize': '12px', 'marginLeft': '6px'}),
-                        ], style={'marginBottom': '8px'}),
-                        html.Div([
-                            dcc.Input(id='chem-dir-input', type='text', value='',
-                                      placeholder='/path/to/chemistrygrid  or  /path/to/chem_model.hdf5',
-                                      style={'flex': '1', 'padding': '8px 10px', 'fontSize': '13px',
-                                             'border': '1px solid #b9c5b0', 'borderRadius': '6px',
-                                             'marginRight': '10px'}),
-                            dcc.Checklist(id='chem-recursive-check',
-                                          options=[{'label': ' recursive', 'value': 'rec'}], value=[],
-                                          style={'fontSize': '13px', 'marginRight': '10px',
-                                                 'whiteSpace': 'nowrap', 'alignSelf': 'center'}),
-                            html.Button('Load chemistry', id='btn-load-chem', n_clicks=0,
-                                        style={'padding': '8px 18px', 'backgroundColor': '#2ca02c',
-                                               'color': 'white', 'border': 'none', 'borderRadius': '6px',
-                                               'cursor': 'pointer', 'fontSize': '13px', 'fontWeight': '600',
-                                               'marginRight': '8px'}),
-                            html.Button('Clear', id='btn-clear-chem', n_clicks=0,
-                                        style={'padding': '8px 16px', 'backgroundColor': '#eee',
-                                               'color': '#555', 'border': '1px solid #ccc',
-                                               'borderRadius': '6px', 'cursor': 'pointer', 'fontSize': '13px'}),
-                        ], style={'display': 'flex', 'alignItems': 'stretch'}),
-                        html.Div(id='chem-status',
-                                 style={'marginTop': '6px', 'fontSize': '13px', 'minHeight': '16px'}),
-                    ], style={'padding': '12px 16px', 'backgroundColor': 'rgba(44, 160, 44, 0.06)',
-                              'borderRadius': '8px', 'border': '1px solid rgba(44, 160, 44, 0.2)',
-                              'marginBottom': '12px'}),
-                    dcc.Store(id='chem-state', data=0),
-
-                    # SIMLINE Directory
-                    html.Div([
-                        html.Div([
-                            html.Span('\u25A0', style={'color': '#9467bd', 'marginRight': '8px',
-                                                       'fontSize': '10px'}),
-                            html.Span('SIMLINE Directory', style={'fontWeight': '700', 'fontSize': '13px'}),
-                            html.Span(' \u2014 line intensities & spectra (can load standalone)',
-                                      style={'color': '#666', 'fontSize': '12px', 'marginLeft': '6px'}),
-                        ], style={'marginBottom': '8px'}),
-                        html.Div([
-                            dcc.Input(id='simline-dir-input', type='text', value='',
-                                      placeholder='/path/to/simlineoutput',
-                                      style={'flex': '1', 'padding': '8px 10px', 'fontSize': '13px',
-                                             'border': '1px solid #b8c4d8', 'borderRadius': '6px',
-                                             'marginRight': '10px'}),
-                            dcc.Checklist(id='simline-recursive-check',
-                                          options=[{'label': ' recursive', 'value': 'rec'}], value=[],
-                                          style={'fontSize': '13px', 'marginRight': '10px',
-                                                 'whiteSpace': 'nowrap', 'alignSelf': 'center'}),
-                            html.Button('Load SIMLINE', id='btn-load-simline', n_clicks=0,
-                                        style={'padding': '8px 18px', 'backgroundColor': '#9467bd',
-                                               'color': 'white', 'border': 'none', 'borderRadius': '6px',
-                                               'cursor': 'pointer', 'fontSize': '13px', 'fontWeight': '600',
-                                               'marginRight': '8px'}),
-                            html.Button('Clear', id='btn-clear-simline', n_clicks=0,
-                                        style={'padding': '8px 16px', 'backgroundColor': '#eee',
-                                               'color': '#555', 'border': '1px solid #ccc',
-                                               'borderRadius': '6px', 'cursor': 'pointer', 'fontSize': '13px'}),
-                        ], style={'display': 'flex', 'alignItems': 'stretch'}),
-                        html.Div(id='simline-status',
-                                 style={'marginTop': '6px', 'fontSize': '13px', 'minHeight': '16px'}),
-                    ], style={'padding': '12px 16px', 'backgroundColor': 'rgba(148, 103, 189, 0.06)',
-                              'borderRadius': '8px', 'border': '1px solid rgba(148, 103, 189, 0.2)'}),
-                    dcc.Store(id='simline-state', data=0),
-
-                ], className='kosma-panel',
-                   style={'padding': '18px 20px', 'marginBottom': '20px'}),
-
-                # ═══════════════════════════════════════════════════════════════════
-                # OVERLAY GRIDS SECTION
-                # ═══════════════════════════════════════════════════════════════════
-                html.Div([
-                    html.H3([
-                        html.Span('\u25CB ', style={'color': '#8c564b', 'marginRight': '6px'}),
-                        'Overlay Grids',
-                        html.Span(' (comparison)', style={'fontWeight': '400', 'fontSize': '13px',
-                                                          'color': '#888', 'marginLeft': '8px'}),
-                    ], className='load-section-title',
-                       style={'margin': '0 0 6px', 'fontSize': '16px', 'fontWeight': '700',
-                              'color': '#5a3a2a', 'borderBottom': '2px solid #8c564b',
-                              'paddingBottom': '8px'}),
-                    html.P('Secondary grids for comparison (e.g. attenuated CRIR models). '
-                           'Overlays appear as dashed lines on profile plots and enable '
-                           'triple-panel views on intensity grids.',
-                           style={'fontSize': '12px', 'color': '#666', 'margin': '0 0 14px',
-                                  'lineHeight': '1.5'}),
-
-                    # Overlay HDF5 Grid
-                    html.Div([
-                        html.Div([
-                            html.Span('\u25CB', style={'color': '#8c564b', 'marginRight': '8px',
-                                                       'fontSize': '10px'}),
-                            html.Span('Overlay HDF5 Grid', style={'fontWeight': '700', 'fontSize': '13px'}),
-                            html.Span(' \u2014 dashed lines on profiles',
-                                      style={'color': '#666', 'fontSize': '12px', 'marginLeft': '6px'}),
-                        ], style={'marginBottom': '8px'}),
-                        html.Div([
-                            dcc.Input(id='overlay-dir-input', type='text', value='',
-                                      placeholder='/path/to/attenuated_grid_hdf5  or  /path/to/model.hdf5',
-                                      style={'flex': '1', 'padding': '8px 10px', 'fontSize': '13px',
-                                             'border': '1px solid #cbb', 'borderRadius': '6px',
-                                             'marginRight': '10px'}),
-                            dcc.Checklist(id='overlay-recursive-check',
-                                          options=[{'label': ' recursive', 'value': 'rec'}], value=[],
-                                          style={'fontSize': '13px', 'marginRight': '10px',
-                                                 'whiteSpace': 'nowrap', 'alignSelf': 'center'}),
-                            html.Button('Load overlay', id='btn-load-overlay', n_clicks=0,
-                                        style={'padding': '8px 18px', 'backgroundColor': '#8c564b',
-                                               'color': 'white', 'border': 'none', 'borderRadius': '6px',
-                                               'cursor': 'pointer', 'fontSize': '13px', 'fontWeight': '600',
-                                               'marginRight': '8px'}),
-                            html.Button('Clear', id='btn-clear-overlay', n_clicks=0,
-                                        style={'padding': '8px 16px', 'backgroundColor': '#eee',
-                                               'color': '#555', 'border': '1px solid #ccc',
-                                               'borderRadius': '6px', 'cursor': 'pointer', 'fontSize': '13px'}),
-                        ], style={'display': 'flex', 'alignItems': 'stretch'}),
-                        html.Div(id='overlay-status',
-                                 style={'marginTop': '6px', 'fontSize': '13px', 'minHeight': '16px'}),
-                    ], style={'padding': '12px 16px', 'backgroundColor': 'rgba(140, 86, 75, 0.06)',
-                              'borderRadius': '8px', 'border': '1px solid rgba(140, 86, 75, 0.2)',
-                              'marginBottom': '12px'}),
-                    dcc.Store(id='overlay-state', data=0),
-
-                    # Overlay SIMLINE Directory
-                    html.Div([
-                        html.Div([
-                            html.Span('\u25CB', style={'color': '#8c564b', 'marginRight': '8px',
-                                                       'fontSize': '10px'}),
-                            html.Span('Overlay SIMLINE Directory', style={'fontWeight': '700', 'fontSize': '13px'}),
-                            html.Span(' \u2014 triple-panel shift on Intensities tab',
-                                      style={'color': '#666', 'fontSize': '12px', 'marginLeft': '6px'}),
-                        ], style={'marginBottom': '8px'}),
-                        html.Div([
-                            dcc.Input(id='simline-overlay-dir-input', type='text', value='',
-                                      placeholder='/path/to/attenuated/simlineoutput',
-                                      style={'flex': '1', 'padding': '8px 10px', 'fontSize': '13px',
-                                             'border': '1px solid #cbb', 'borderRadius': '6px',
-                                             'marginRight': '10px'}),
-                            dcc.Checklist(id='simline-overlay-recursive-check',
-                                          options=[{'label': ' recursive', 'value': 'rec'}], value=[],
-                                          style={'fontSize': '13px', 'marginRight': '10px',
-                                                 'whiteSpace': 'nowrap', 'alignSelf': 'center'}),
-                            html.Button('Load overlay SIMLINE', id='btn-load-simline-overlay', n_clicks=0,
-                                        style={'padding': '8px 18px', 'backgroundColor': '#8c564b',
-                                               'color': 'white', 'border': 'none', 'borderRadius': '6px',
-                                               'cursor': 'pointer', 'fontSize': '13px', 'fontWeight': '600',
-                                               'marginRight': '8px'}),
-                            html.Button('Clear', id='btn-clear-simline-overlay', n_clicks=0,
-                                        style={'padding': '8px 16px', 'backgroundColor': '#eee',
-                                               'color': '#555', 'border': '1px solid #ccc',
-                                               'borderRadius': '6px', 'cursor': 'pointer', 'fontSize': '13px'}),
-                        ], style={'display': 'flex', 'alignItems': 'stretch'}),
-                        html.Div(id='simline-overlay-status',
-                                 style={'marginTop': '6px', 'fontSize': '13px', 'minHeight': '16px'}),
-                    ], style={'padding': '12px 16px', 'backgroundColor': 'rgba(140, 86, 75, 0.06)',
-                              'borderRadius': '8px', 'border': '1px solid rgba(140, 86, 75, 0.2)'}),
-                    dcc.Store(id='simline-overlay-state', data=0),
-
-                ], className='kosma-panel',
-                   style={'padding': '18px 20px'}),
+                        html.H3([
+                            html.Span(className='accent-bar overlay'),
+                            'Overlay grids',
+                            html.Span(' (comparison)', className='kosma-muted',
+                                      style={'fontWeight': '400', 'fontSize': '13px',
+                                             'marginLeft': '6px', 'letterSpacing': '0',
+                                             'textTransform': 'none'}),
+                        ], className='load-section-title'),
+                        html.P(
+                            'Secondary grids for comparison (e.g. attenuated CRIR models). '
+                            'Overlays appear as dashed lines on profiles, reaction rates on the '
+                            'Chemistry tab, and enable triple-panel intensity views.',
+                            className='load-section-desc',
+                        ),
+                        _load_card(
+                            'Overlay HDF5 grid',
+                            'dashed lines on profiles',
+                            html.Div([
+                                html.Div([
+                                    dcc.Input(
+                                        id='overlay-dir-input', type='text', value='',
+                                        placeholder='/path/to/attenuated_grid_hdf5  or  /path/to/model.hdf5',
+                                        className='kosma-input',
+                                    ),
+                                    dcc.Checklist(
+                                        id='overlay-recursive-check',
+                                        options=[{'label': ' recursive', 'value': 'rec'}],
+                                        value=[],
+                                        style={'fontSize': '13px', 'whiteSpace': 'nowrap',
+                                               'alignSelf': 'center'},
+                                    ),
+                                    html.Button('Load overlay', id='btn-load-overlay', n_clicks=0,
+                                                className='btn btn-overlay'),
+                                    html.Button('Clear', id='btn-clear-overlay', n_clicks=0,
+                                                className='btn btn-ghost'),
+                                ], className='load-card-row'),
+                                html.Div(id='overlay-status', className='load-status'),
+                            ]),
+                            accent='overlay',
+                        ),
+                        dcc.Store(id='overlay-state', data=0),
+                        _load_card(
+                            'Overlay chemistry grid',
+                            'dashed reaction rates on Chemistry tab',
+                            html.Div([
+                                html.Div([
+                                    dcc.Input(
+                                        id='chem-overlay-dir-input', type='text', value='',
+                                        placeholder='/path/to/attenuated_chemistrygrid  or  /path/to/chem_model.hdf5',
+                                        className='kosma-input',
+                                    ),
+                                    dcc.Checklist(
+                                        id='chem-overlay-recursive-check',
+                                        options=[{'label': ' recursive', 'value': 'rec'}],
+                                        value=[],
+                                        style={'fontSize': '13px', 'whiteSpace': 'nowrap',
+                                               'alignSelf': 'center'},
+                                    ),
+                                    html.Button('Load overlay chemistry',
+                                                id='btn-load-chem-overlay', n_clicks=0,
+                                                className='btn btn-overlay'),
+                                    html.Button('Clear', id='btn-clear-chem-overlay',
+                                                n_clicks=0, className='btn btn-ghost'),
+                                ], className='load-card-row'),
+                                html.Div(id='chem-overlay-status', className='load-status'),
+                            ]),
+                            accent='overlay',
+                        ),
+                        dcc.Store(id='chem-overlay-state', data=0),
+                        _load_card(
+                            'Overlay SIMLINE',
+                            'triple-panel shift on Intensities tab',
+                            html.Div([
+                                html.Div([
+                                    dcc.Input(
+                                        id='simline-overlay-dir-input', type='text', value='',
+                                        placeholder='/path/to/attenuated/simlineoutput',
+                                        className='kosma-input',
+                                    ),
+                                    dcc.Checklist(
+                                        id='simline-overlay-recursive-check',
+                                        options=[{'label': ' recursive', 'value': 'rec'}],
+                                        value=[],
+                                        style={'fontSize': '13px', 'whiteSpace': 'nowrap',
+                                               'alignSelf': 'center'},
+                                    ),
+                                    html.Button('Load overlay SIMLINE',
+                                                id='btn-load-simline-overlay', n_clicks=0,
+                                                className='btn btn-overlay'),
+                                    html.Button('Clear', id='btn-clear-simline-overlay',
+                                                n_clicks=0, className='btn btn-ghost'),
+                                ], className='load-card-row'),
+                                html.Div(id='simline-overlay-status', className='load-status'),
+                            ]),
+                            accent='overlay',
+                        ),
+                        dcc.Store(id='simline-overlay-state', data=0),
+                    ], className='kosma-panel load-section'),
+                ]),
 
                 dcc.Store(id='cr-atten-profiles', data=[]),
             ]),
@@ -6658,7 +7134,7 @@ app.layout = html.Div(
         ]),
 
         # --- Page 3: abundance profiles -------------------------------------
-        dcc.Tab(label='Abundance profiles', value='profiles', style=_TAB_STYLE,
+        dcc.Tab(label='Profiles', value='profiles', style=_TAB_STYLE,
                 selected_style=_TAB_SEL, children=[
             html.Div(style={'paddingTop': '10px'}, children=[
                 html.P('Gas and dust temperatures plus H/H\u2082, C\u207A/C/CO and custom '
@@ -6696,7 +7172,7 @@ app.layout = html.Div(
         ]),
 
         # --- Page 3: heating & cooling --------------------------------------
-        dcc.Tab(label='Heating & cooling', value='thermal', style=_TAB_STYLE,
+        dcc.Tab(label='Thermal', value='thermal', style=_TAB_STYLE,
                 selected_style=_TAB_SEL, children=[
             html.Div(style={'paddingTop': '10px'}, children=[
                 html.P('Thermal balance and per-component heating and cooling rates vs depth.',
@@ -6718,39 +7194,54 @@ app.layout = html.Div(
         ]),
 
         # --- Page 4: 2-D grid slices --------------------------------------
-        dcc.Tab(label='Grid slices', value='grids', style=_TAB_STYLE, selected_style=_TAB_SEL,
+        dcc.Tab(label='Grids', value='grids', style=_TAB_STYLE, selected_style=_TAB_SEL,
                 children=[
             html.Div(style={'paddingTop': '10px'}, children=[
-                html.P('Contour maps over the full model grid. Select several quantities '
-                       '(abundances and/or diagnostics) or use Add all species — the first '
-                       'selection fills the three main panels, and each extra species gets '
-                       'its own row of slice maps. Without an overlay grid the three slice '
-                       'planes appear side by side as square panels. Grids are resampled in '
-                       'log parameter space (KoSens-style) before plotting. With an overlay '
-                       'loaded, each plane expands to three sub-plots (reference, overlay, '
-                       'x-shift) stacked vertically.',
+                html.P('Contour maps over the full model grid. Use the abundance box, the '
+                       'column-density box, or both — the first selection fills the three '
+                       'main panels, and every extra quantity gets its own row of slice maps. '
+                       'Add all species / Add all column densities fill each box. Without an '
+                       'overlay grid the three slice planes appear side by side as square '
+                       'panels. Grids are resampled in log parameter space (KoSens-style) '
+                       'before plotting. With an overlay loaded, each plane expands to three '
+                       'sub-plots (reference, overlay, x-shift) stacked vertically.',
                        style=_PAGE_INTRO),
                 html.Div([
                     html.Div([
-                        html.Label('Contoured quantity', style=_CTRL_LABEL),
-                        dcc.Dropdown(id='contour-quantity', options=[], value=[],
-                                     multi=True,
-                                     placeholder='Load a grid\u2026 then pick one or more quantities',
-                                     style={'fontSize': '13px'}),
-                    ], style={'flex': '2', 'minWidth': '260px', 'marginRight': '12px'}),
-                    html.Button('Add all species', id='btn-contour-all-species', n_clicks=0,
-                                style=_ALL_BTN_STYLE),
+                        html.Div([
+                            html.Label('Abundance / diagnostics', style=_CTRL_LABEL),
+                            dcc.Dropdown(id='contour-quantity', options=[], value=[],
+                                         multi=True,
+                                         placeholder='Load a grid\u2026 then pick X(species) or a diagnostic',
+                                         style={'fontSize': '13px'}),
+                        ], style={'flex': '2', 'minWidth': '260px', 'marginRight': '12px'}),
+                        html.Button('Add all species', id='btn-contour-all-species', n_clicks=0,
+                                    className='btn btn-primary btn-sm', style=_ALL_BTN_STYLE),
+                        html.Div([
+                            html.Label('Contour Z scale', style=_CTRL_LABEL),
+                            dcc.RadioItems(id='contour-zscale', options=_SCALE_OPTIONS,
+                                           value='log', **_SEG),
+                        ], style={**_CTRL_BOX, 'marginLeft': '18px', 'marginRight': '0'}),
+                    ], style={'display': 'flex', 'alignItems': 'flex-start',
+                              'flexWrap': 'wrap', 'width': '100%',
+                              'marginBottom': '10px'}),
                     html.Div([
-                        html.Label('Contour Z scale', style=_CTRL_LABEL),
-                        dcc.RadioItems(id='contour-zscale', options=_SCALE_OPTIONS,
-                                       value='log', **_RADIO),
-                    ], style={**_CTRL_BOX, 'marginLeft': '18px', 'marginRight': '0'}),
+                        html.Div([
+                            html.Label('Column density N (cm\u207B\u00B2)', style=_CTRL_LABEL),
+                            dcc.Dropdown(id='contour-cdens', options=[], value=[],
+                                         multi=True,
+                                         placeholder='Optional \u2014 pick N(species) to show alongside or instead of abundances',
+                                         style={'fontSize': '13px'}),
+                        ], style={'flex': '2', 'minWidth': '260px', 'marginRight': '12px'}),
+                        html.Button('Add all column densities', id='btn-contour-all-cdens', n_clicks=0,
+                                    title='HDF5 Integrated quantities/Column densities (KoSens cd_*)',
+                                    className='btn btn-success btn-sm', style=_ALL_BTN_STYLE),
+                    ], style={'display': 'flex', 'alignItems': 'flex-start',
+                              'flexWrap': 'wrap', 'width': '100%'}),
                 ], className='kosma-panel',
-                style={'display': 'flex', 'alignItems': 'flex-start',
-                       'flexWrap': 'wrap',
-                       'padding': '12px 18px', 'marginBottom': '12px'}),
-                _interp_control_row(prefix=''),
-                _shift_control_row(prefix=''),
+                style={'padding': '12px 18px', 'marginBottom': '12px'}),
+                _advanced_details('Interpolation & resampling', _interp_control_row(prefix='')),
+                _advanced_details('Attenuation x-shift matching', _shift_control_row(prefix='')),
                 dcc.Tabs(id='grid-subtabs', value='grid-maps',
                          style={'marginTop': '4px'}, children=[
                     dcc.Tab(label='Maps', value='grid-maps',
@@ -6782,7 +7273,7 @@ app.layout = html.Div(
                                              style={'fontSize': '13px'}),
                             ], style={'flex': '2', 'minWidth': '260px', 'marginRight': '12px'}),
                             html.Button('Add all ratios', id='btn-grid-all-ratios', n_clicks=0,
-                                        style=_ALL_BTN_STYLE),
+                                        className='btn btn-primary btn-sm', style=_ALL_BTN_STYLE),
                         ], className='kosma-panel',
                            style={'display': 'flex', 'alignItems': 'flex-start',
                                   'flexWrap': 'wrap',
@@ -6802,7 +7293,11 @@ app.layout = html.Div(
                 children=[
             html.Div(style={'paddingTop': '10px'}, children=[
                 html.P('Top formation and destruction reactions for a selected species '
-                       '(requires a chemistry grid on the Load tab). Choose how reactions '
+                       '(load a chemistry grid on the Load tab — standalone or with an HDF5 '
+                       'structure grid; an optional overlay chemistry grid adds dashed '
+                       'comparison curves). In chemistry-only mode the sliders index the '
+                       'chemistry filenames; load an HDF5 grid for depth profiles and '
+                       'abundance colormaps. Choose how reactions '
                        'are ranked: fractional contribution to the total rate, or '
                        'mass-weighted rate (KoSens ``top_reactions_plot`` metrics). '
                        'Below, separate formation and destruction networks show all '
@@ -6905,20 +7400,14 @@ app.layout = html.Div(
                         html.Label('\u00a0', style=_CTRL_LABEL),
                         html.Button('Hide selected', id='btn-react-net-hide', n_clicks=0,
                                     title='Click a species box, then hide it from the figure',
-                                    style={'padding': '7px 12px', 'fontSize': '13px',
-                                           'border': '1px solid #bbc', 'borderRadius': '6px',
-                                           'backgroundColor': '#f7f7f7', 'cursor': 'pointer',
-                                           'marginRight': '8px'}),
+                                    className='btn btn-ghost btn-sm',
+                                    style={'marginRight': '8px'}),
                         html.Button('Show all', id='btn-react-net-show-all', n_clicks=0,
                                     title='Restore every hidden species',
-                                    style={'padding': '7px 12px', 'fontSize': '13px',
-                                           'border': '1px solid #bbc', 'borderRadius': '6px',
-                                           'backgroundColor': '#f7f7f7', 'cursor': 'pointer',
-                                           'marginRight': '8px'}),
+                                    className='btn btn-ghost btn-sm',
+                                    style={'marginRight': '8px'}),
                         html.Button('Clear highlight', id='btn-react-net-clear', n_clicks=0,
-                                    style={'padding': '7px 12px', 'fontSize': '13px',
-                                           'border': '1px solid #bbc', 'borderRadius': '6px',
-                                           'backgroundColor': '#f7f7f7', 'cursor': 'pointer'}),
+                                    className='btn btn-ghost btn-sm'),
                     ], style={'alignSelf': 'flex-end'}),
                 ], style={'display': 'flex', 'alignItems': 'flex-end',
                           'flexWrap': 'wrap', 'marginBottom': '8px'}),
@@ -6961,7 +7450,7 @@ app.layout = html.Div(
                                      style={'fontSize': '13px'}),
                     ], style={'flex': '1.2', 'minWidth': '160px', 'marginRight': '8px'}),
                     html.Button('Add all species', id='btn-int-all-species', n_clicks=0,
-                                style=_ALL_BTN_STYLE),
+                                className='btn btn-primary btn-sm', style=_ALL_BTN_STYLE),
                     html.Div([
                         html.Label('Transition (for grid maps)', style=_CTRL_LABEL),
                         dcc.Dropdown(id='int-transition', options=[], value=[],
@@ -6971,19 +7460,19 @@ app.layout = html.Div(
                     ], style={'flex': '1.4', 'minWidth': '180px', 'marginLeft': '12px',
                               'marginRight': '8px'}),
                     html.Button('Add all transitions', id='btn-int-all-transitions', n_clicks=0,
-                                style=_ALL_BTN_STYLE),
+                                className='btn btn-primary btn-sm', style=_ALL_BTN_STYLE),
                     html.Div([
                         html.Label('Contour Z scale', style=_CTRL_LABEL),
                         dcc.RadioItems(id='int-zscale', options=_SCALE_OPTIONS,
-                                       value='log', **_RADIO),
+                                       value='log', **_SEG),
                     ], style={**_CTRL_BOX, 'marginRight': '0'}),
                 ], className='kosma-panel',
                 style={'display': 'flex', 'alignItems': 'flex-start',
                        'flexWrap': 'wrap',
                        'padding': '12px 18px', 'marginBottom': '12px'}),
-                _interp_control_row(prefix='int-'),
-                _shift_control_row(prefix='int-'),
-                _int_contour_overlay_row(),
+                _advanced_details('Interpolation & resampling', _interp_control_row(prefix='int-')),
+                _advanced_details('Attenuation x-shift matching', _shift_control_row(prefix='int-')),
+                _advanced_details('Contour overlays', _int_contour_overlay_row()),
                 dcc.Tabs(id='int-subtabs', value='int-maps',
                          style={'marginTop': '4px'}, children=[
                     dcc.Tab(label='Maps', value='int-maps',
@@ -7022,6 +7511,7 @@ app.layout = html.Div(
                                              style={'fontSize': '13px'}),
                             ], style={'flex': '2', 'minWidth': '260px', 'marginRight': '12px'}),
                             html.Button('Add all ratios', id='btn-int-all-ratios', n_clicks=0,
+                                        className='btn btn-primary btn-sm',
                                         style=_ALL_BTN_STYLE),
                         ], className='kosma-panel',
                            style={'display': 'flex', 'alignItems': 'flex-start',
@@ -7164,7 +7654,7 @@ app.layout = html.Div(
         ]),
 
         # --- Page 8: interpolation error check --------------------------------
-        dcc.Tab(label='Interpolation error', value='interperror', style=_TAB_STYLE,
+        dcc.Tab(label='Interpolation', value='interperror', style=_TAB_STYLE,
                 selected_style=_TAB_SEL, children=[
             html.Div(style={'paddingTop': '10px'}, children=[
                 html.P('Compare native model grids with KoSens-style resampling and '
@@ -7202,7 +7692,7 @@ app.layout = html.Div(
                 style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
                        'padding': '12px 18px'}),
                 _interp_control_row(prefix='ie-'),
-                _interp_error_control_row(),
+                _advanced_details('Error metric & display', _interp_error_control_row()),
                 html.Div([_ie_plane_section(p['id']) for p in SLICE_PLANES],
                          id='ie-panels-wrap', style=_SLICE_PANELS_COL_STYLE),
             ]),
@@ -7247,22 +7737,13 @@ app.layout = html.Div(
                           'borderRadius': '8px', 'marginBottom': '10px'}),
                 html.Div([
                     html.Button('Add current model', id='cr-atten-add', n_clicks=0,
-                                style={'padding': '8px 16px', 'marginRight': '8px',
-                                       'backgroundColor': '#1f77b4', 'color': 'white',
-                                       'border': 'none', 'borderRadius': '6px',
-                                       'cursor': 'pointer', 'fontSize': '13px',
-                                       'fontWeight': '600'}),
+                                className='btn btn-primary',
+                                style={'marginRight': '8px'}),
                     html.Button('Add all overlay matches', id='cr-atten-add-overlay', n_clicks=0,
-                                style={'padding': '8px 16px', 'marginRight': '8px',
-                                       'backgroundColor': '#8c564b', 'color': 'white',
-                                       'border': 'none', 'borderRadius': '6px',
-                                       'cursor': 'pointer', 'fontSize': '13px',
-                                       'fontWeight': '600'}),
+                                className='btn btn-overlay',
+                                style={'marginRight': '8px'}),
                     html.Button('Clear profiles', id='cr-atten-clear', n_clicks=0,
-                                style={'padding': '8px 16px', 'backgroundColor': '#eee',
-                                       'color': '#555', 'border': '1px solid #ccc',
-                                       'borderRadius': '6px', 'cursor': 'pointer',
-                                       'fontSize': '13px'}),
+                                className='btn btn-ghost'),
                 ], style={'padding': '0 18px 10px'}),
                 html.Div([
                     html.Label('Profiles to plot', style=_CTRL_LABEL),
@@ -7383,10 +7864,7 @@ app.layout = html.Div(
                     ], style={'flex': '2', 'minWidth': '260px', 'marginRight': '18px'}),
                     html.Div([
                         html.Button('Run map fit', id='btn-run-map-fit', n_clicks=0,
-                                    style={'padding': '10px 22px', 'fontSize': '14px',
-                                           'fontWeight': '600', 'backgroundColor': '#2ca02c',
-                                           'color': 'white', 'border': 'none',
-                                           'borderRadius': '6px', 'cursor': 'pointer'}),
+                                    className='btn btn-success'),
                     ], style={'flex': '0', 'alignSelf': 'flex-end'}),
                 ], className='kosma-panel',
                 style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
@@ -7603,6 +8081,16 @@ def _contour_quantity_options(species):
     return opts
 
 
+def _contour_cdens_options(species):
+    return [{'label': f'N({s})', 'value': f'cdens:{s}'}
+            for s in species if tot_col_dens_hdf5_key(s) in _field_map]
+
+
+def _combined_contour_quantities(abund, cdens):
+    """Abundance/diagnostic selection, then column densities (both may be empty)."""
+    return _as_str_list(abund) + _as_str_list(cdens)
+
+
 def _default_contour_quantity(species_idx):
     if 'CO' in species_idx:
         return CONTOUR_DEFAULT_QUANTITY
@@ -7616,7 +8104,9 @@ def _species_dropdown_cfg(species, species_idx):
     defaults = [s for s in DEFAULT_CUSTOM if s in species_idx][:3]
     cq_opts = _contour_quantity_options(species)
     cq_val = _default_contour_quantity(species_idx)
-    return sp_opts, defaults, cq_opts, [cq_val] if cq_val else [], list(cq_opts), cq_val
+    cd_opts = _contour_cdens_options(species)
+    return (sp_opts, defaults, cq_opts, [cq_val] if cq_val else [],
+            cd_opts, [], list(cq_opts), cq_val)
 
 
 def _active_slice_plane_ids():
@@ -7826,6 +8316,8 @@ def _extra_slice_graph_row(idents, full_width=False, figures=None, slice_indices
 def _plain_quantity_caption(quantity):
     if str(quantity).startswith('species:'):
         return f'X({quantity.split(":", 1)[1]})'
+    if str(quantity).startswith('cdens:'):
+        return f'N({quantity.split(":", 1)[1]})'
     for key, label in CONTOUR_DIAGNOSTICS:
         if key == quantity:
             return (label.replace('<sub>', '').replace('</sub>', '')
@@ -8168,6 +8660,8 @@ _grid_sync_outputs += [
     Output('species-selector', 'value', allow_duplicate=True),
     Output('contour-quantity', 'options', allow_duplicate=True),
     Output('contour-quantity', 'value', allow_duplicate=True),
+    Output('contour-cdens', 'options', allow_duplicate=True),
+    Output('contour-cdens', 'value', allow_duplicate=True),
     Output('ie-quantity', 'options', allow_duplicate=True),
     Output('ie-quantity', 'value', allow_duplicate=True),
 ]
@@ -8178,7 +8672,7 @@ def _empty_grid_sync(loaded=False):
     hidden, _ = _slider_wrap_styles()
     empty = _empty_param_slider_ui(hidden)
     empty_slice = _empty_slice_slider_ui()
-    empty_dropdowns = [[], [], [], [], [], None]
+    empty_dropdowns = [[], [], [], [], [], [], [], None]
     return ([loaded] + empty + _interleave_slice_tab_cfgs(empty_slice)
             + empty_dropdowns)
 
@@ -8187,10 +8681,10 @@ def _grid_sync_from_axis_tokens(axis_tokens):
     slider_cfg, slice_cfg, _ = _ui_slider_config(axis_tokens)
     species = _grid.get('species', [])
     species_idx = _grid.get('species_idx', {})
-    sp_opts, defaults, cq_opts, cq_val, ie_cq_opts, ie_cq_val = _species_dropdown_cfg(
+    sp_opts, defaults, cq_opts, cq_val, cd_opts, cd_val, ie_cq_opts, ie_cq_val = _species_dropdown_cfg(
         species, species_idx)
     return ([True] + slider_cfg + _interleave_slice_tab_cfgs(slice_cfg)
-            + [sp_opts, defaults, cq_opts, cq_val, ie_cq_opts, ie_cq_val])
+            + [sp_opts, defaults, cq_opts, cq_val, cd_opts, cd_val, ie_cq_opts, ie_cq_val])
 
 
 @app.callback(
@@ -8207,6 +8701,8 @@ def _grid_sync_from_axis_tokens(axis_tokens):
        Output('species-selector', 'value'),
        Output('contour-quantity', 'options'),
        Output('contour-quantity', 'value'),
+       Output('contour-cdens', 'options'),
+       Output('contour-cdens', 'value'),
        Output('ie-quantity', 'options'),
        Output('ie-quantity', 'value')],
     Input('btn-load', 'n_clicks'),
@@ -8224,10 +8720,10 @@ def handle_load(n_clicks, directory, recursive):
         err = html.Span(f'\u2717  {exc}', style={'color': '#d62728', 'fontWeight': '600'})
         empty = _empty_param_slider_ui(hidden)
         return ([err, False] + empty + empty_slice * 6
-                + [[], [], [], [], [], None])
+                + [[], [], [], [], [], [], [], None])
 
     slider_cfg, slice_cfg, _ = _ui_slider_config(grid['axis_tokens'])
-    sp_opts, defaults, cq_opts, cq_val, ie_cq_opts, ie_cq_val = _species_dropdown_cfg(
+    sp_opts, defaults, cq_opts, cq_val, cd_opts, cd_val, ie_cq_opts, ie_cq_val = _species_dropdown_cfg(
         grid['species'], grid['species_idx'])
 
     cube = ' \u00D7 '.join(
@@ -8240,14 +8736,15 @@ def handle_load(n_clicks, directory, recursive):
     if _model_config_summary and not _model_config_summary.get('error'):
         cfg_note = f'   \u2014   {_model_config_summary["n_configs"]} JSON configs'
     status = html.Span([
-        html.Span('\u2713  Loaded ', style={'color': '#2ca02c', 'fontWeight': '700'}),
-        html.Code(grid['directory']),
-        html.Span(f'   {grid["n_files"]} models   \u2014   grid: {cube}{note}{cfg_note}',
-                  style={'color': '#555', 'marginLeft': '10px'}),
+        html.Span('Loaded', className='status-chip ok'),
+        html.Code(grid['directory'], style={'marginLeft': '8px'}),
+        html.Span(f'  {grid["n_files"]} models  —  grid: {cube}{note}{cfg_note}',
+                  className='kosma-muted',
+                  style={'marginLeft': '10px'}),
     ])
 
     return ([status, True] + slider_cfg + slice_cfg * 6
-            + [sp_opts, defaults, cq_opts, cq_val, ie_cq_opts, ie_cq_val])
+            + [sp_opts, defaults, cq_opts, cq_val, cd_opts, cd_val, ie_cq_opts, ie_cq_val])
 
 
 app.clientside_callback(
@@ -8281,20 +8778,20 @@ def apply_plot_theme(theme, loaded, _simline_state):
     t = _theme_colors(theme)
     name = _parse_plot_theme(theme)
     root = {
-        'fontFamily': 'Arial, sans-serif', 'maxWidth': APP_MAX_WIDTH,
-        'margin': '0 auto', 'padding': '14px 28px',
+        'fontFamily': UI_FONT, 'maxWidth': APP_MAX_WIDTH,
+        'margin': '0 auto', 'padding': '12px 24px 28px',
         'backgroundColor': t['page_bg'], 'color': t['font'],
         'minHeight': '100vh',
     }
     header = {
-        'display': 'flex', 'alignItems': 'flex-start',
+        'display': 'flex', 'alignItems': 'center',
         'justifyContent': 'space-between', 'gap': '16px',
-        'borderBottom': f'2px solid {t["accent"]}',
-        'paddingBottom': '14px', 'marginBottom': '14px',
+        'borderBottom': f'1px solid {t["card_border"]}',
+        'paddingBottom': '14px', 'marginBottom': '12px',
     }
     sliders = {
         'display': 'flex', 'flexWrap': 'wrap', 'alignItems': 'flex-start',
-        'padding': '14px 18px', 'marginTop': '4px',
+        'padding': '12px 16px', 'marginTop': '4px',
         'color': t['font'],
     }
     if loaded and _grid and _grid.get('simline_only'):
@@ -8302,12 +8799,12 @@ def apply_plot_theme(theme, loaded, _simline_state):
     else:
         axis = {
             'display': 'flex', 'alignItems': 'flex-start',
-            'padding': '10px 18px', 'marginTop': '8px',
+            'padding': '10px 16px', 'marginTop': '8px',
             'color': t['font'],
         }
     info = {
         'display': 'flex', 'flexWrap': 'wrap', 'gap': '8px', 'alignItems': 'center',
-        'padding': '7px 16px',
+        'padding': '7px 14px',
         'marginTop': '8px', 'marginBottom': '4px', 'fontSize': '13px', 'color': t['font'],
     }
     tab_colors = {
@@ -8345,8 +8842,14 @@ def update_labels(*values):
 
     labels = []
     info = []
-    filepath = current_file(values)
-    phys = ((_grid.get('phys_by_path') or {}).get(filepath) or {}) if filepath else {}
+    filepath = current_file(values) if _grid_has_hdf5() else None
+    chem_path = chem_file(values) if _chem and not filepath else None
+    phys = {}
+    if filepath:
+        phys = (_grid.get('phys_by_path') or {}).get(filepath) or {}
+    elif chem_path:
+        phys = ((_chem.get('phys_by_path') or {}).get(chem_path)
+                or (_grid.get('phys_by_path') or {}).get(chem_path) or {})
     for d, p in enumerate(PARAM_DEFS):
         tokens = _grid['axis_tokens'][p['key']]
         try:
@@ -8357,7 +8860,7 @@ def update_labels(*values):
         if p['key'] == 'atten':
             disp = _atten_disp(tok)
         else:
-            val = _physical_param_value(p['key'], tok, filepath=filepath)
+            val = _physical_param_value(p['key'], tok, filepath=filepath or chem_path)
             disp = _format_phys_number(val)
         unit = f' {p["unit"]}' if p['unit'] else ''
         labels.append(f'{disp}{unit}')
@@ -8386,6 +8889,13 @@ def update_labels(*values):
             fname = f'{os.path.basename(spath)}  (SIMLINE only — no HDF5)'
         else:
             fname = 'SIMLINE model point (no HDF5)'
+    elif _grid.get('chem_only'):
+        tok = _tokens_from_values(values)
+        cpath = _chem_sample_path(tok)
+        if cpath:
+            fname = f'{os.path.basename(cpath)}  (chemistry only — no HDF5)'
+        else:
+            fname = 'Chemistry model point (no HDF5)'
     else:
         fname = '(no matching file)'
     info.append(html.Span(fname, style={'color': '#999', 'fontSize': '12px'}))
@@ -8686,6 +9196,7 @@ def seed_spaghetti_contours_from_lines(selected, current_text):
 @app.callback(
     _contour_outputs,
     [Input('contour-quantity', 'value'),
+     Input('contour-cdens', 'value'),
      Input('contour-zscale', 'value'),
      Input('overlay-state', 'data'),
      Input('shift-scan-direction', 'value'),
@@ -8701,12 +9212,13 @@ def seed_spaghetti_contours_from_lines(selected, current_text):
     + _slice_slider_inputs,
     prevent_initial_call=True,
 )
-def update_contour_plots(quantity, zscale, _overlay_state, shift_dir, shift_rtol,
+def update_contour_plots(abund, cdens, zscale, _overlay_state, shift_dir, shift_rtol,
                          interp_ny, interp_nx, interp_x_lim, interp_y_lim,
                          interp_method, interp_clip, plot_theme, grid_colorscale,
                          *slice_indices):
     theme = _parse_plot_theme(plot_theme)
     colorscale = _parse_grid_colorscale(grid_colorscale)
+    quantity = _combined_contour_quantities(abund, cdens)
     if not _grid or not quantity:
         p = placeholder_fig('Load a grid and pick a quantity', theme=theme)
         return (p,) * len(SLICE_PLANES)
@@ -8738,8 +9250,22 @@ def add_all_contour_species(_n, options, current):
 
 
 @app.callback(
+    Output('contour-cdens', 'value', allow_duplicate=True),
+    Input('btn-contour-all-cdens', 'n_clicks'),
+    State('contour-cdens', 'options'),
+    prevent_initial_call=True,
+)
+def add_all_contour_cdens(_n, options):
+    vals = [o['value'] for o in (options or [])]
+    if not vals:
+        raise PreventUpdate
+    return vals
+
+
+@app.callback(
     Output('grid-contour-extra-rows', 'children'),
     Input('contour-quantity', 'value'),
+    Input('contour-cdens', 'value'),
     Input('overlay-state', 'data'),
     Input('grid-loaded', 'data'),
     Input('simline-state', 'data'),
@@ -8758,7 +9284,7 @@ def add_all_contour_species(_n, options, current):
     State({'role': 'grid-extra-slider', 'qty': ALL, 'plane': ALL}, 'id'),
     State({'role': 'grid-extra-slider', 'qty': ALL, 'plane': ALL}, 'value'),
 )
-def build_grid_contour_extra_rows(quantities, _overlay_state, _loaded, _simline_state,
+def build_grid_contour_extra_rows(abund, cdens, _overlay_state, _loaded, _simline_state,
                                   zscale, shift_dir, shift_rtol,
                                   interp_ny, interp_nx, interp_x_lim, interp_y_lim,
                                   interp_method, interp_clip, plot_theme, grid_colorscale,
@@ -8766,7 +9292,7 @@ def build_grid_contour_extra_rows(quantities, _overlay_state, _loaded, _simline_
     n_planes = len(SLICE_PLANES)
     slice_indices = list(rest[:n_planes])
     saved = _saved_extra_slices(rest[n_planes], rest[n_planes + 1] if len(rest) > n_planes + 1 else [])
-    extras = _as_str_list(quantities)[1:]
+    extras = _combined_contour_quantities(abund, cdens)[1:]
     if not extras:
         return []
     full_width = bool(_overlay)
@@ -9063,10 +9589,52 @@ def handle_simline_overlay(n_load, n_clear, directory, recursive, state):
 
 
 @app.callback(
-    Output('chem-status', 'children'),
-    Output('chem-state', 'data'),
-    Output('react-species', 'options'),
-    Output('react-species', 'value'),
+    [Output('chem-overlay-status', 'children'),
+     Output('chem-overlay-state', 'data')],
+    Input('btn-load-chem-overlay', 'n_clicks'),
+    Input('btn-clear-chem-overlay', 'n_clicks'),
+    State('chem-overlay-dir-input', 'value'),
+    State('chem-overlay-recursive-check', 'value'),
+    State('chem-overlay-state', 'data'),
+    prevent_initial_call=True,
+)
+def handle_chem_overlay(n_load, n_clear, directory, recursive, state):
+    trigger = dash.callback_context.triggered[0]['prop_id'] if dash.callback_context.triggered else ''
+    state = (state or 0)
+
+    if trigger.startswith('btn-clear-chem-overlay'):
+        clear_chem_overlay()
+        return (html.Span('Overlay chemistry cleared.', style={'color': '#888'}),
+                state + 1)
+
+    if not _chem:
+        return (html.Span('\u2717  Load a main chemistry grid first.',
+                          style={'color': '#d62728', 'fontWeight': '600'}),
+                state)
+
+    try:
+        ch = scan_chem_overlay(directory or '', recursive=bool(recursive))
+    except Exception as exc:
+        return (html.Span(f'\u2717  {exc}',
+                          style={'color': '#d62728', 'fontWeight': '600'}),
+                state + 1)
+
+    note = _scan_status_note(ch.get('n_from_hdf5', 0), ch.get('n_skipped', 0))
+    status = html.Span([
+        html.Span('\u2713  Overlay chemistry ', style={'color': '#8c564b', 'fontWeight': '700'}),
+        html.Code(ch['directory']),
+        html.Span(f'   {ch["n_files"]} models (dashed){note}',
+                  style={'color': '#555', 'marginLeft': '10px'}),
+    ])
+    return (status, state + 1)
+
+
+@app.callback(
+    [Output('chem-status', 'children'),
+     Output('chem-state', 'data'),
+     Output('react-species', 'options'),
+     Output('react-species', 'value')]
+    + _grid_sync_outputs,
     Input('btn-load-chem', 'n_clicks'),
     Input('btn-clear-chem', 'n_clicks'),
     State('chem-dir-input', 'value'),
@@ -9078,18 +9646,23 @@ def handle_simline_overlay(n_load, n_clear, directory, recursive, state):
 def handle_chem(n_load, n_clear, directory, recursive, state, cur_species):
     trigger = dash.callback_context.triggered[0]['prop_id'] if dash.callback_context.triggered else ''
     state = (state or 0)
+    no_grid_sync = [dash.no_update] * _N_GRID_SYNC
 
     if trigger.startswith('btn-clear-chem'):
+        was_chem_only = bool(_grid and _grid.get('chem_only'))
         clear_chem()
+        clear_chem_only_grid()
+        grid_sync = _empty_grid_sync(loaded=False) if was_chem_only else no_grid_sync
         return (html.Span('Chemistry grid cleared.', style={'color': '#888'}),
-                state + 1, [], None)
+                state + 1, [], None) + tuple(grid_sync)
 
     try:
         ch = scan_chem(directory or '', recursive=bool(recursive))
+        bootstrapped = bootstrap_grid_from_chem()
     except Exception as exc:
         return (html.Span(f'\u2717  {exc}',
                           style={'color': '#d62728', 'fontWeight': '600'}),
-                state + 1, [], None)
+                state + 1, [], None) + tuple(no_grid_sync)
 
     species = ch['species']
     # Order: common diagnostics first, then the rest alphabetically.
@@ -9101,13 +9674,29 @@ def handle_chem(n_load, n_clear, directory, recursive, state, cur_species):
         (CHEM_DEFAULT_SPECIES if CHEM_DEFAULT_SPECIES in species else (species[0] if species else None))
 
     note = _scan_status_note(ch.get('n_from_hdf5', 0), ch.get('n_skipped', 0))
+    mode_note = ''
+    if bootstrapped:
+        cube = ' \u00D7 '.join(
+            f'{len(_grid["axis_tokens"][p["key"]])} {p["name"].split()[0]}'
+            for p in PARAM_DEFS if len(_grid['axis_tokens'][p['key']]) > 1
+        ) or 'single model'
+        mode_note = f'   \u2014   grid from filenames: {cube}  (chemistry-only mode)'
+    elif _grid_has_hdf5():
+        mode_note = '   \u2014   using loaded HDF5 grid axes'
+    elif _grid and _grid.get('simline_only'):
+        mode_note = '   \u2014   using SIMLINE grid axes'
+    elif _chem and not bootstrapped and not _grid_has_hdf5():
+        mode_note = ('   \u2014   chemistry loaded (clear SIMLINE or load HDF5 '
+                     'for chemistry-only navigation)')
+    grid_sync = (_grid_sync_from_axis_tokens(_grid['axis_tokens']) if bootstrapped
+                 else no_grid_sync)
     status = html.Span([
         html.Span('\u2713  Chemistry ', style={'color': '#2ca02c', 'fontWeight': '700'}),
         html.Code(ch['directory']),
-        html.Span(f'   {ch["n_files"]} models, {len(species)} species{note}',
+        html.Span(f'   {ch["n_files"]} models, {len(species)} species{note}{mode_note}',
                   style={'color': '#555', 'marginLeft': '10px'}),
     ])
-    return (status, state + 1, opts, value)
+    return (status, state + 1, opts, value) + tuple(grid_sync)
 
 
 @app.callback(
@@ -9369,6 +9958,8 @@ def _ie_quantity_unit(quantity):
         return 'n(e-)/nH'
     if quantity.startswith('species:'):
         return 'rel. abund.'
+    if quantity.startswith('cdens:'):
+        return 'cm^-2'
     return ''
 
 
@@ -10032,6 +10623,7 @@ def update_thermal_plots(*args_in):
        Input('yscale', 'value'),
        Input('av-range', 'value'),
        Input('chem-state', 'data'),
+       Input('chem-overlay-state', 'data'),
        Input('plot-theme', 'value'),
        Input('react-chain-upstream', 'value'),
        Input('react-chain-downstream', 'value'),
@@ -10045,7 +10637,7 @@ def update_thermal_plots(*args_in):
 )
 def update_reaction_plots(*args_in):
     values = list(args_in[:N_PARAMS])
-    (species, top_n, ranking, xscale, yscale, av_range, _chem_state,
+    (species, top_n, ranking, xscale, yscale, av_range, _chem_state, _chem_overlay_state,
      plot_theme, chain_up, chain_down, chain_iso, chain_ice,
      species_pt, partner_pt, net_highlight, net_hidden) = args_in[N_PARAMS:]
     top_n = top_n or CHEM_DEFAULT_NREAC

@@ -51,6 +51,20 @@ import h5py
 import dash
 from dash import dcc, html, Input, Output, State, ALL, MATCH
 from dash.exceptions import PreventUpdate
+
+# Enlarge every dropdown's open menu so more species/options are visible at once
+# (Dash defaults maxHeight to 200px, which only shows a few rows). Applies to all
+# dcc.Dropdown instances across every tab unless a call passes its own maxHeight.
+_DROPDOWN_MENU_MAX_HEIGHT = 360
+_OrigDropdown = dcc.Dropdown
+
+
+def _TallDropdown(*args, **kwargs):
+    kwargs.setdefault('maxHeight', _DROPDOWN_MENU_MAX_HEIGHT)
+    return _OrigDropdown(*args, **kwargs)
+
+
+dcc.Dropdown = _TallDropdown
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -967,6 +981,8 @@ def scan_directory(directory, recursive=False):
 
     _profile_cache = {}
     _scalar_cache = {}
+    _heatcool_crir_cache.clear()
+    _col_dens_profile_cache.clear()
     _field_map = field_map
     _heat_components = heat_comp
     _cool_components = cool_comp
@@ -2234,6 +2250,611 @@ def _rate_column(matrix, idx, yscale):
     return col
 
 
+# ======================================================================
+# KoSens grid-integrated heating / cooling vs CRIR  +  abundance PDF
+# (ports of grid_functions.py plot_*_vs_crir and
+#  universal_plot_functions.plot_abundance_pdf, matplotlib -> Plotly)
+# ======================================================================
+
+_heatcool_crir_cache = {}   # signature -> aggregated heat/cool dict
+_col_dens_profile_cache = {}  # (filepath, species) -> per-depth profile
+
+_GAS_GRAIN_HEAT_LABEL = 'gas-grain (heating)'
+_CRIR_XLABEL = 'log\u2081\u2080(\u03B6) [s\u207B\u00B9]'
+
+# KoSens display names (grid_functions.py heating_names_dict / cooling_names_dict)
+_HEAT_NAME_DICT = {
+    'H2 vib. deexcitation': '\u0393(H\u2082 vib)',
+    'H2 photodissociation': '\u0393(H\u2082 ph)',
+    'H2 formation on grains': '\u0393(H\u2082 grain)',
+    'Cosmic rays': '\u0393(CR)',
+    'Photo-electric effect': '\u0393(PE)',
+    'C ionization': '\u0393(C\u207A)',
+    'Chemical reactions': '\u0393(chem)',
+    'gas-grain': '\u0393(gas-grain)',
+    'coolrate_gas_grain': '\u0393(gas-grain)',
+    _GAS_GRAIN_HEAT_LABEL: '\u0393(gas-grain)',
+}
+_COOL_NAME_DICT = {
+    'O 63mu': '\u039B(O 63)', 'O 44mu': '\u039B(O 44)', 'O 146mu': '\u039B(O 146)',
+    'CO': '\u039B(CO)', 'C+': '\u039B(C\u207A)', 'C 610mu': '\u039B(C 610)',
+    'C 230mu': '\u039B(C 230)', 'C 370mu': '\u039B(C 370)', 'Si+': '\u039B(Si\u207A)',
+    '13CO': '\u039B(\u00B9\u00B3CO)', 'Lyman alpha': '\u039B(Ly\u03B1)', 'H2O': '\u039B(H\u2082O)',
+    'gas-grain': '\u039B(gas-grain)', 'OH': '\u039B(OH)', 'O 6300 Angstrom': '\u039B(O 6300)',
+    'H2 kinetic dissociation': '\u039B(H\u2082 kin)',
+}
+# KoSens explicit colours
+_HEAT_COLORS = {
+    'H2 vib. deexcitation': '#e66101',
+    'H2 photodissociation': '#fdb863',
+    'H2 formation on grains': '#fdd0a2',
+    'Cosmic rays': '#4daf4a',
+    'Photo-electric effect': '#8073ac',
+    'C ionization': '#b2182b',
+    'Chemical reactions': '#ef8a62',
+    'coolrate_gas_grain': 'deeppink',
+    _GAS_GRAIN_HEAT_LABEL: 'deeppink',
+}
+_COOL_COLORS = {
+    'O 63mu': '#008080', 'O 44mu': '#7b68ee', 'O 146mu': '#9a6324',
+    'CO': '#00ced1', 'C+': '#800000', 'C 610mu': '#228b22',
+    'C 230mu': '#808000', 'C 370mu': '#cd853f', 'Si+': '#000075',
+    '13CO': '#696969', 'Lyman alpha': '#ff6347', 'H2O': '#4682b4',
+    'gas-grain': '#bcf60c', 'OH': '#daa520', 'O 6300 Angstrom': '#2e8b57',
+    'H2 kinetic dissociation': '#dc143c',
+}
+_DISTINCT_PALETTE = [
+    '#e6194B', '#3cb44b', '#4363d8', '#f58231', '#911eb4',
+    '#42d4f4', '#f032e6', '#bfef45', '#469990', '#9A6324',
+    '#800000', '#808000', '#000075', '#ffe119', '#ff1493',
+    '#00ced1', '#dcbeff', '#fabed4', '#aaffc3', '#ff8ba7',
+]
+
+
+def _heat_color(label, i=0):
+    return _HEAT_COLORS.get(label) or _DISTINCT_PALETTE[i % len(_DISTINCT_PALETTE)]
+
+
+def _cool_color(label, i=0):
+    return _COOL_COLORS.get(label) or _DISTINCT_PALETTE[i % len(_DISTINCT_PALETTE)]
+
+
+def _is_gas_grain_cooling_label(label):
+    """KoSens ``_is_gas_grain_cooling_label``."""
+    norm = str(label).lower().replace(' ', '').replace('_', '')
+    return 'gasgrain' in norm or norm == 'gas-grain'
+
+
+def _gas_grain_shell_split(rate_combined, tgas, tdust):
+    """Split a (flipped/prepended) gas-grain rate into cooling vs dust->gas heating.
+
+    Port of KoSens ``_gas_grain_shell_split``: T_gas/T_dust < 1 -> dust heats gas.
+    ``tgas`` / ``tdust`` are the raw per-depth profiles (flipped/prepended here).
+    """
+    rate = np.asarray(rate_combined, dtype=float)
+    mag = np.abs(rate)
+    tg = np.asarray(tgas, dtype=float) if tgas is not None else np.zeros(0)
+    td = np.asarray(tdust, dtype=float) if tdust is not None else np.zeros(0)
+    if tg.size and td.size:
+        tg_c = np.insert(tg[::-1], 0, tg[::-1][0])
+        td_c = np.insert(td[::-1], 0, td[::-1][0])
+        n = min(tg_c.size, td_c.size, rate.size)
+        tg_c, td_c = tg_c[:n], td_c[:n]
+        mag_n, rate_n = mag[:n], rate[:n]
+        td_safe = np.where(td_c > 0.0, td_c, np.nan)
+        ratio = tg_c / td_safe
+        dust_heats_gas = np.isfinite(ratio) & (ratio < 1.0)
+        invalid = ~np.isfinite(ratio)
+        cooling = np.where(dust_heats_gas, 0.0, mag_n)
+        heating = np.where(dust_heats_gas, mag_n, 0.0)
+        cooling = np.where(invalid, np.maximum(rate_n, 0.0), cooling)
+        heating = np.where(invalid, np.maximum(-rate_n, 0.0), heating)
+        return cooling, heating
+    return np.maximum(rate, 0.0), np.maximum(-rate, 0.0)
+
+
+def _grid_heat_cool_dataframes(values):
+    """Integrate heating/cooling per model over the (density, CRIR) subgrid.
+
+    FUV / mass / metallicity / attenuation are held at the current slider tokens;
+    density and CRIR vary. Each component is volume-integrated KoSens-style
+    (``4*pi*r^2 * rate * n dr`` with radius flipped, prepended, converted pc->cm),
+    and the gas-grain cooling channel is split into cooling vs dust->gas heating.
+
+    Returns ``dict(n=..., crir=..., heat={label: arr}, cool={label: arr})`` with
+    one entry per model, or ``None`` when unavailable.
+    """
+    if not (_grid and _grid.get('has_hdf5')):
+        return None
+    base = _tokens_from_values(values)
+    if base is None:
+        return None
+    idx_dens = _PARAM_IDX['density']
+    idx_crir = _PARAM_IDX['crir']
+    fixed = tuple((i, base[i]) for i in range(N_PARAMS)
+                  if i not in (idx_dens, idx_crir))
+    if fixed in _heatcool_crir_cache:
+        return _heatcool_crir_cache[fixed]
+
+    dens_def = PARAM_DEFS[idx_dens]
+    crir_def = PARAM_DEFS[idx_crir]
+    n_vals, crir_vals = [], []
+    heat_acc = {lbl: [] for lbl, _ in _heat_components}
+    heat_acc[_GAS_GRAIN_HEAT_LABEL] = []
+    cool_acc = {lbl: [] for lbl, _ in _cool_components}
+
+    for tokens, path in _grid['files'].items():
+        if any(tokens[i] != tok for i, tok in fixed):
+            continue
+        model = get_model(path)
+        if model is None or model.get('heat') is None or model.get('radius') is None:
+            continue
+        radius = np.asarray(model['radius'], dtype=float)
+        nH = np.asarray(model['nH'], dtype=float)
+        if radius.size == 0 or nH.size == 0:
+            continue
+        r_comb = np.insert(radius[::-1], 0, 0.0) * PC_TO_CM
+        d_comb = np.insert(nH[::-1], 0, nH[::-1][0])
+        m = min(r_comb.size, d_comb.size)
+        r_comb, d_comb = r_comb[:m], d_comb[:m]
+        shell = 4.0 * np.pi * r_comb ** 2 * d_comb
+
+        def _integrate(col):
+            c_comb = np.insert(col[::-1], 0, col[::-1][0])
+            k = min(m, c_comb.size)
+            return float(np.trapezoid(shell[:k] * c_comb[:k], r_comb[:k]))
+
+        n_vals.append(float(np.log10(dens_def['decode'](tokens[idx_dens]))))
+        crir_vals.append(float(np.log10(crir_def['decode'](tokens[idx_crir]))))
+
+        heat = np.asarray(model['heat'], dtype=float)
+        for lbl, idx in _heat_components:
+            if idx < heat.shape[1]:
+                heat_acc[lbl].append(_integrate(heat[:, idx]))
+            else:
+                heat_acc[lbl].append(np.nan)
+
+        cool = model.get('cool')
+        cool = np.asarray(cool, dtype=float) if cool is not None else None
+        tgas, tdust = model.get('tgas'), model.get('tdust')
+        gg_heat = np.nan
+        for lbl, idx in _cool_components:
+            if cool is None or idx >= cool.shape[1]:
+                cool_acc[lbl].append(np.nan)
+                continue
+            col = cool[:, idx]
+            if _is_gas_grain_cooling_label(lbl):
+                c_comb = np.insert(col[::-1], 0, col[::-1][0])
+                cool_shell, heat_shell = _gas_grain_shell_split(c_comb, tgas, tdust)
+                k = min(m, cool_shell.size)
+                cool_acc[lbl].append(
+                    float(np.trapezoid(shell[:k] * cool_shell[:k], r_comb[:k])))
+                kh = min(m, heat_shell.size)
+                gg_heat = float(np.trapezoid(shell[:kh] * heat_shell[:kh], r_comb[:kh]))
+            else:
+                cool_acc[lbl].append(_integrate(col))
+        heat_acc[_GAS_GRAIN_HEAT_LABEL].append(gg_heat)
+
+    if not n_vals:
+        return None
+    result = {
+        'n': np.asarray(n_vals, dtype=float),
+        'crir': np.asarray(crir_vals, dtype=float),
+        'heat': {lbl: np.asarray(v, dtype=float) for lbl, v in heat_acc.items()},
+        'cool': {lbl: np.asarray(v, dtype=float) for lbl, v in cool_acc.items()},
+    }
+    gg = result['heat'].get(_GAS_GRAIN_HEAT_LABEL)
+    if gg is None or not np.any(np.isfinite(gg) & (gg != 0.0)):
+        result['heat'].pop(_GAS_GRAIN_HEAT_LABEL, None)
+    _heatcool_crir_cache[fixed] = result
+    return result
+
+
+def _select_density(data, n_val):
+    """Row indices for models at ``log10(n)=n_val``, ordered by ascending CRIR."""
+    idx = np.where(np.isclose(data['n'], n_val))[0]
+    if idx.size == 0:
+        return None, None
+    order = idx[np.argsort(data['crir'][idx])]
+    return order, data['crir'][order]
+
+
+def _apply_crir_layout(fig, theme, height, title='', legends='single'):
+    """Shared theming for the multi-panel CRIR / PDF figures.
+
+    ``legends``: ``'heat_cool'`` draws two separate legends (heating above,
+    cooling below) on the right; ``'single'`` one right-side legend;
+    ``'none'`` hides it. Traces opt in via ``legend='legend'`` / ``'legend2'``.
+    """
+    t = _theme_colors(theme)
+    right = 228 if legends in ('single', 'heat_cool') else 78
+    fig.update_layout(
+        paper_bgcolor=t['paper_bg'], plot_bgcolor=t['plot_bg'],
+        font=ps.layout_font(t['font']), height=height,
+        margin=dict(l=74, r=right, t=98, b=62),
+    )
+    common = dict(bgcolor=t['legend_bg'], borderwidth=1,
+                  bordercolor=t['legend_border'], font=ps.legend_font(t['font']),
+                  orientation='v', itemsizing='constant', itemwidth=36)
+    if legends == 'heat_cool':
+        # Heating grows down from the top, cooling grows up from the bottom
+        # so the two boxes stay separated even with many channels.
+        fig.update_layout(
+            showlegend=True,
+            legend=dict(**common, title_text='<b>Heating</b>',
+                        xref='paper', x=1.02, xanchor='left',
+                        yref='paper', y=1.0, yanchor='top'),
+            legend2=dict(**common, title_text='<b>Cooling</b>',
+                         xref='paper', x=1.02, xanchor='left',
+                         yref='paper', y=0.0, yanchor='bottom'),
+        )
+    elif legends == 'single':
+        fig.update_layout(
+            showlegend=True,
+            legend=dict(**common, xref='paper', x=1.012, xanchor='left',
+                        yref='paper', y=1.0, yanchor='top'),
+        )
+    else:
+        fig.update_layout(showlegend=False)
+    fig.update_xaxes(showgrid=True, gridcolor=t['grid'], zeroline=False,
+                     linecolor=t['axis_line'], mirror=True,
+                     tickfont=ps.tick_font(t['font']))
+    fig.update_yaxes(showgrid=True, gridcolor=t['grid'], zeroline=False,
+                     linecolor=t['axis_line'], mirror=True,
+                     tickfont=ps.tick_font(t['font']))
+    _apply_title_box(fig, title, theme, yshift=34)
+    return fig
+
+
+def _empty_panel_note(fig, row, col, text='No models'):
+    fig.add_annotation(text=text, showarrow=False, xref='x domain', yref='y domain',
+                       x=0.5, y=0.5, row=row, col=col)
+
+
+def fig_heating_contributions_vs_crir(data, densities, threshold=0.01, theme='light'):
+    """Normalized stacked heating (0->+1) / cooling (0->-1) contributions vs CRIR."""
+    dens_list = [float(d) for d in (densities or [])]
+    if not dens_list:
+        return placeholder_fig('Select at least one density', theme=theme)
+    t = _theme_colors(theme)
+    n_cols = len(dens_list)
+    titles = [f'log\u2081\u2080(n) = {d:.1f}' for d in dens_list]
+    fig = make_subplots(rows=1, cols=n_cols, shared_yaxes=True,
+                        subplot_titles=titles, horizontal_spacing=0.05)
+    heat_cols = list(data['heat'].keys())
+    cool_cols = list(data['cool'].keys())
+    seen = set()
+    for ci, n_val in enumerate(dens_list, start=1):
+        order, x = _select_density(data, n_val)
+        if order is None:
+            _empty_panel_note(fig, 1, ci)
+            fig.update_xaxes(title_text=_CRIR_XLABEL, row=1, col=ci)
+            continue
+
+        def _stack(cols, dct, color_fn, name_dict, sign, prefix, legend_id):
+            fig.add_trace(go.Scatter(x=x, y=np.zeros_like(x, dtype=float), mode='lines',
+                          line=dict(width=0), hoverinfo='skip', showlegend=False),
+                          row=1, col=ci)
+            total = np.nansum([dct[c][order] for c in cols], axis=0)
+            total = np.where(total == 0.0, np.nan, total)
+            cum = np.zeros(len(x), dtype=float)
+            for i, c in enumerate(cols):
+                frac = np.nan_to_num(dct[c][order] / total, nan=0.0,
+                                     posinf=0.0, neginf=0.0)
+                if np.nanmax(frac) < threshold:
+                    continue
+                cum = cum + sign * frac
+                key = prefix + c
+                show = key not in seen
+                seen.add(key)
+                fig.add_trace(go.Scatter(
+                    x=x, y=cum.copy(), mode='lines',
+                    line=dict(width=0.55, color='#1f1f1f'),
+                    fill='tonexty', fillcolor=color_fn(c, i),
+                    name=name_dict.get(c, c), legendgroup=key, showlegend=show,
+                    legend=legend_id, customdata=frac,
+                    hovertemplate=name_dict.get(c, c) + ': %{customdata:.2f}<extra></extra>'),
+                    row=1, col=ci)
+
+        _stack(heat_cols, data['heat'], _heat_color, _HEAT_NAME_DICT, 1.0, 'h:', 'legend')
+        _stack(cool_cols, data['cool'], _cool_color, _COOL_NAME_DICT, -1.0, 'c:', 'legend2')
+        fig.add_hline(y=0.0, line=dict(color=t['axis_line'], width=1.2), row=1, col=ci)
+        fig.update_yaxes(range=[-1.05, 1.05], row=1, col=ci)
+        fig.update_xaxes(title_text=_CRIR_XLABEL, row=1, col=ci)
+    fig.update_yaxes(title_text='Normalized contribution (heat +, cool \u2212)', row=1, col=1)
+    return _apply_crir_layout(fig, theme, height=640, legends='heat_cool',
+                              title='Normalized heating / cooling contributions vs CRIR')
+
+
+def fig_absolute_heating_cooling_vs_crir(data, densities, min_rate=1e23,
+                                         min_points=2, show_totals=True, theme='light'):
+    """Absolute heating (top row) and cooling (bottom row) vs CRIR, log y."""
+    dens_list = [float(d) for d in (densities or [])]
+    if not dens_list:
+        return placeholder_fig('Select at least one density', theme=theme)
+    heat_cols = list(data['heat'].keys())
+    cool_cols = list(data['cool'].keys())
+    heat_cmap = {c: _DISTINCT_PALETTE[i % len(_DISTINCT_PALETTE)]
+                 for i, c in enumerate(heat_cols)}
+    cool_cmap = {c: _DISTINCT_PALETTE[i % len(_DISTINCT_PALETTE)]
+                 for i, c in enumerate(cool_cols)}
+    heat_keep = [c for c in heat_cols
+                 if data['heat'][c].size and np.nanmax(np.abs(data['heat'][c])) >= min_rate]
+    cool_keep = [c for c in cool_cols
+                 if data['cool'][c].size and np.nanmax(np.abs(data['cool'][c])) >= min_rate]
+    n_cols = len(dens_list)
+    titles = [f'log\u2081\u2080(n) = {d:.1f}' for d in dens_list]
+    fig = make_subplots(rows=2, cols=n_cols, shared_xaxes=True, shared_yaxes='rows',
+                        subplot_titles=titles, vertical_spacing=0.09,
+                        horizontal_spacing=0.05)
+    seen = set()
+    for ci, n_val in enumerate(dens_list, start=1):
+        order, x = _select_density(data, n_val)
+        if order is None:
+            _empty_panel_note(fig, 1, ci)
+            _empty_panel_note(fig, 2, ci)
+            fig.update_xaxes(title_text=_CRIR_XLABEL, row=2, col=ci)
+            continue
+        for c in heat_keep:
+            vals = np.abs(data['heat'][c][order])
+            vals = np.where(vals >= min_rate, vals, np.nan)
+            if int(np.sum(np.isfinite(vals))) < min_points:
+                continue
+            key = 'h:' + c
+            show = key not in seen
+            seen.add(key)
+            fig.add_trace(go.Scatter(x=x, y=vals, mode='lines+markers',
+                          line=dict(color=heat_cmap[c], width=2.2),
+                          marker=dict(size=5),
+                          name=_HEAT_NAME_DICT.get(c, c), legendgroup=key,
+                          showlegend=show, legend='legend'), row=1, col=ci)
+        if show_totals:
+            tot = np.abs(np.nansum([data['heat'][c][order] for c in heat_keep], axis=0))
+            tot = np.where(tot >= min_rate, tot, np.nan)
+            fig.add_trace(go.Scatter(x=x, y=tot, mode='lines',
+                          line=dict(color='#111111', width=3),
+                          name='Total heating', legendgroup='tot_h',
+                          showlegend='tot_h' not in seen, legend='legend'),
+                          row=1, col=ci)
+            seen.add('tot_h')
+        for c in cool_keep:
+            vals = np.abs(data['cool'][c][order])
+            vals = np.where(vals >= min_rate, vals, np.nan)
+            if int(np.sum(np.isfinite(vals))) < min_points:
+                continue
+            key = 'c:' + c
+            show = key not in seen
+            seen.add(key)
+            fig.add_trace(go.Scatter(x=x, y=vals, mode='lines+markers',
+                          line=dict(color=cool_cmap[c], width=2.2, dash='dash'),
+                          marker=dict(size=5, symbol='square'),
+                          name=_COOL_NAME_DICT.get(c, c), legendgroup=key,
+                          showlegend=show, legend='legend2'), row=2, col=ci)
+        if show_totals:
+            tot = np.abs(np.nansum([data['cool'][c][order] for c in cool_keep], axis=0))
+            tot = np.where(tot >= min_rate, tot, np.nan)
+            fig.add_trace(go.Scatter(x=x, y=tot, mode='lines',
+                          line=dict(color='#111111', width=3),
+                          name='Total cooling', legendgroup='tot_c',
+                          showlegend='tot_c' not in seen, legend='legend2'),
+                          row=2, col=ci)
+            seen.add('tot_c')
+        fig.update_xaxes(title_text=_CRIR_XLABEL, row=2, col=ci)
+    for ci in range(1, n_cols + 1):
+        fig.update_yaxes(type='log', row=1, col=ci)
+        fig.update_yaxes(type='log', row=2, col=ci)
+    fig.update_yaxes(title_text='Heating [erg s\u207B\u00B9]', row=1, col=1)
+    fig.update_yaxes(title_text='Cooling [erg s\u207B\u00B9]', row=2, col=1)
+    return _apply_crir_layout(fig, theme, height=980, legends='heat_cool',
+                              title='Absolute heating (top) and cooling (bottom) vs CRIR')
+
+
+# --- Abundance PDF ----------------------------------------------------------
+
+def _col_dens_profile_key(species):
+    """Per-depth column-density profile key ``cd_prof_<name>`` (KoSens)."""
+    return 'cd_prof_' + tot_col_dens_hdf5_key(species)[len('cd_'):]
+
+
+def _col_dens_profile_from_file(filepath, species):
+    """Read the per-depth column-density profile for ``species`` from one file."""
+    cache_key = (filepath, species)
+    if cache_key in _col_dens_profile_cache:
+        return _col_dens_profile_cache[cache_key]
+    key = _col_dens_profile_key(species)
+    prof = None
+    if key in _field_map:
+        path, idx = _field_map[key]
+        try:
+            with h5py.File(filepath, 'r') as hf:
+                arr = np.asarray(hf[path][:], dtype=float)
+            arr = np.squeeze(arr)
+            idx = int(idx)
+            if arr.ndim == 1:
+                prof = arr
+            elif arr.ndim == 2:
+                if idx < arr.shape[1]:
+                    prof = arr[:, idx]
+                elif idx < arr.shape[0]:
+                    prof = arr[idx, :]
+        except (OSError, KeyError, TypeError, ValueError):
+            prof = None
+    _col_dens_profile_cache[cache_key] = prof
+    return prof
+
+
+def _abundance_xy(cosray, nH, y_arr):
+    """(log10(cosray/nH), log10(abundance)) for valid depth points."""
+    c = np.asarray(cosray, dtype=float)
+    p = np.asarray(nH, dtype=float)
+    y = np.asarray(y_arr, dtype=float)
+    n = min(c.size, p.size, y.size)
+    if n == 0:
+        return np.zeros(0), np.zeros(0)
+    c, p, y = c[:n], p[:n], y[:n]
+    valid = (c > 0) & (p > 0) & np.isfinite(c) & np.isfinite(p) & (y > 0) & np.isfinite(y)
+    if not np.any(valid):
+        return np.zeros(0), np.zeros(0)
+    return np.log10(c[valid] / p[valid]), np.log10(y[valid])
+
+
+def _binned_profile(x, y, n_bins=50, statistic='mean'):
+    """KoSens ``_binned_profile``: statistic of y within equal-width x bins."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if x.size == 0:
+        return np.zeros(0), np.zeros(0)
+    edges = np.linspace(x.min(), x.max(), int(n_bins) + 1)
+    ids = np.digitize(x, edges)
+    func = np.median if statistic == 'median' else np.mean
+    bx, by = [], []
+    for b in range(1, int(n_bins) + 1):
+        mask = ids == b
+        if np.any(mask):
+            bx.append(func(x[mask]))
+            by.append(func(y[mask]))
+    return np.asarray(bx), np.asarray(by)
+
+
+def _abundance_pdf_collect(values, species, dens_choice):
+    """Collect per-model (log CRIR init, x, y) points over the grid.
+
+    Mass / metallicity / attenuation are fixed to the current sliders; density,
+    FUV and CRIR vary. Returns a list of ``(log_crir_init, x_arr, y_arr)``.
+    """
+    if not (_grid and _grid.get('has_hdf5')):
+        return None
+    base = _tokens_from_values(values)
+    if base is None:
+        return None
+    fixed_axes = [_PARAM_IDX['mass'], _PARAM_IDX['metal'], _PARAM_IDX['atten']]
+    fixed = [(i, base[i]) for i in fixed_axes]
+    sp_idx = _grid.get('species_idx', {}).get(species)
+    out = []
+    for tokens, path in _grid['files'].items():
+        if any(tokens[i] != tok for i, tok in fixed):
+            continue
+        model = get_model(path)
+        if model is None:
+            continue
+        cosray, nH = model.get('cosray'), model.get('nH')
+        if cosray is None or nH is None:
+            continue
+        if dens_choice == 'column':
+            y_arr = _col_dens_profile_from_file(path, species)
+            if y_arr is None:
+                continue
+        else:
+            arr = model.get('rel' if dens_choice == 'rel' else 'dens')
+            if arr is None or getattr(arr, 'ndim', 0) != 2 or sp_idx is None \
+                    or sp_idx >= arr.shape[1]:
+                continue
+            y_arr = arr[:, sp_idx]
+        x, y = _abundance_xy(cosray, nH, y_arr)
+        if x.size == 0:
+            continue
+        cr0 = float(np.asarray(cosray, dtype=float)[0])
+        log_cr = round(float(np.log10(cr0)), 1) if cr0 > 0 else None
+        out.append((log_cr, x, y))
+    return out
+
+
+_APDF_YLABEL = {
+    'rel': 'log \u03C7 (n/n_H)',
+    'number': 'log n [cm\u207B\u00B3]',
+    'column': 'log N [cm\u207B\u00B2]',
+}
+_APDF_XLABEL = 'log(\u03B6_H / n_H) [cm\u00B3 s\u207B\u00B9]'
+
+
+def _add_abundance_hist2d(fig, row, col, xs, ys, n_bins, log_color, show_cbar):
+    if xs.size == 0:
+        _empty_panel_note(fig, row, col, 'No data')
+        return
+    try:
+        nb = int(n_bins)
+    except (TypeError, ValueError):
+        nb = 100
+    nb = max(5, min(nb, 400))
+    hist, xe, ye = np.histogram2d(xs, ys, bins=nb)
+    z = hist.T
+    z = np.where(z >= 1, z, np.nan)
+    if log_color:
+        z = np.log10(z)
+    xc = 0.5 * (xe[:-1] + xe[1:])
+    yc = 0.5 * (ye[:-1] + ye[1:])
+    fig.add_trace(go.Heatmap(
+        x=xc, y=yc, z=z, colorscale='Viridis', showscale=show_cbar,
+        colorbar=(dict(title='log\u2081\u2080 counts' if log_color else 'counts')
+                  if show_cbar else None),
+        hovertemplate='\u03B6/n_H=%{x:.2f}<br>abund=%{y:.2f}<br>%{z:.2f}<extra></extra>'),
+        row=row, col=col)
+
+
+def fig_abundance_pdf(values, species, dens_choice='rel', n_bins=100,
+                      split_by_crir=True, log_color=True, overplot_average=False,
+                      theme='light'):
+    """2D histogram of species abundance vs ζ_H/n_H over the grid (KoSens PDF)."""
+    models = _abundance_pdf_collect(values, species, dens_choice)
+    if not models:
+        return placeholder_fig(f'No abundance data for {species}', theme=theme)
+    ylabel = _APDF_YLABEL.get(dens_choice, 'log abundance')
+    if split_by_crir:
+        groups = {}
+        for log_cr, x, y in models:
+            if log_cr is None:
+                continue
+            groups.setdefault(log_cr, []).append((x, y))
+        crs = sorted(groups.keys())
+        if not crs:
+            return placeholder_fig(f'No CRIR groups for {species}', theme=theme)
+        n_cols = min(3, len(crs))
+        n_rows = (len(crs) + n_cols - 1) // n_cols
+        titles = [f'\u03B6_H = 10^{c:.1f} s\u207B\u00B9' for c in crs]
+        fig = make_subplots(rows=n_rows, cols=n_cols, subplot_titles=titles,
+                            horizontal_spacing=0.09, vertical_spacing=0.14)
+        for gi, cr in enumerate(crs):
+            r, c = gi // n_cols + 1, gi % n_cols + 1
+            xs = np.concatenate([a for a, _ in groups[cr]])
+            ys = np.concatenate([b for _, b in groups[cr]])
+            _add_abundance_hist2d(fig, r, c, xs, ys, n_bins, log_color,
+                                  show_cbar=(gi == 0))
+            if overplot_average:
+                bx, by = _binned_profile(xs, ys)
+                if bx.size:
+                    fig.add_trace(go.Scatter(x=bx, y=by, mode='lines',
+                                  line=dict(color='#ff2d2d', width=2),
+                                  name='Binned average',
+                                  showlegend=(gi == 0)), row=r, col=c)
+            fig.update_xaxes(title_text=_APDF_XLABEL, row=r, col=c)
+            fig.update_yaxes(title_text=ylabel, row=r, col=c)
+        height = 380 * n_rows
+    else:
+        xs = np.concatenate([x for _, x, _ in models])
+        ys = np.concatenate([y for _, _, y in models])
+        fig = make_subplots(rows=1, cols=1)
+        _add_abundance_hist2d(fig, 1, 1, xs, ys, n_bins, log_color, show_cbar=True)
+        if overplot_average:
+            bx, by = _binned_profile(xs, ys)
+            if bx.size:
+                fig.add_trace(go.Scatter(x=bx, y=by, mode='lines',
+                              line=dict(color='#ff2d2d', width=2),
+                              name='Binned average'), row=1, col=1)
+        fig.update_xaxes(title_text=_APDF_XLABEL, row=1, col=1)
+        fig.update_yaxes(title_text=ylabel, row=1, col=1)
+        height = 440
+    _apply_crir_layout(fig, theme, height=height, legends='none',
+                       title=f'Abundance PDF \u2014 {species}')
+    if overplot_average:
+        t = _theme_colors(theme)
+        fig.update_layout(showlegend=True, legend=dict(
+            bgcolor=t['legend_bg'], borderwidth=1, bordercolor=t['legend_border'],
+            font=ps.legend_font(t['font']), orientation='h',
+            xref='paper', x=0.5, xanchor='center',
+            yref='paper', y=1.08, yanchor='bottom'))
+    return fig
+
+
 def get_reaction_data(filepath, species, mode):
     """Load (and cache) the reaction-rate matrix + av for one species/mode.
 
@@ -2529,12 +3150,34 @@ def _base_layout(theme='light'):
     return dict(
         paper_bgcolor=t['paper_bg'],
         plot_bgcolor=t['plot_bg'],
-        margin=dict(l=70, r=20, t=44, b=54),
+        margin=dict(l=70, r=20, t=54, b=54),
         font=ps.layout_font(t['font']),
         height=320,
         legend=dict(bgcolor=t['legend_bg'], borderwidth=1, bordercolor=t['legend_border'],
                     font=ps.legend_font(t['font'])),
     )
+
+
+def _title_box(text, theme, yshift=8):
+    """Bold, boxed figure title (paper annotation) shared across all figures."""
+    t = _theme_colors(theme)
+    dark = _parse_plot_theme(theme) == 'dark'
+    return dict(
+        text=f'<b>{text}</b>', xref='paper', yref='paper',
+        x=0.0, xanchor='left', y=1.0, yanchor='bottom', yshift=yshift,
+        showarrow=False, align='left',
+        font=dict(size=ps.PLOT_TITLE_FONT_SIZE + 2, color=t['title'],
+                  family=ps.PLOT_FONT_FAMILY),
+        bgcolor=('#111c30' if dark else '#eef2ff'),
+        bordercolor=t['accent'], borderwidth=1.2, borderpad=5,
+    )
+
+
+def _apply_title_box(fig, text, theme, yshift=8):
+    """Add the shared bold/boxed title annotation to *fig* (no-op if blank)."""
+    if text:
+        fig.add_annotation(**_title_box(text, theme, yshift=yshift))
+    return fig
 
 
 def _axis_style(theme='light'):
@@ -2555,7 +3198,6 @@ def _apply_layout(fig, title, xlabel, xtype, xrange, ylabel, ytype, theme='light
         uirev = f'{uirev}|{uirevision_extra}'
     fig.update_layout(
         **_base_layout(theme),
-        title=dict(text=title, font=ps.title_font(t['title']), x=0.02, xanchor='left'),
         # Reset zoom/colorbar when log↔linear / A_V range changes (uirevision must change).
         uirevision=uirev,
         xaxis=dict(**_axis_style(theme),
@@ -2565,6 +3207,7 @@ def _apply_layout(fig, title, xlabel, xtype, xrange, ylabel, ytype, theme='light
                    title=dict(text=ylabel, font=ps.axis_title_font(t['font'])),
                    type=ytype, autorange=True),
     )
+    _apply_title_box(fig, title, theme, yshift=6)
 
 
 def _parse_av_range(value):
@@ -3442,7 +4085,7 @@ def _compact_slice_layout_kw(title, xlabel, ylabel, theme='light', uirevision='s
     else:
         yaxis['autorange'] = True
     return dict(
-        title=dict(text=title, font=ps.title_font(t['title']),
+        title=dict(text=f'<b>{title}</b>', font=ps.title_font(t['title']),
                    x=0.02, xanchor='left'),
         paper_bgcolor=t['paper_bg'],
         plot_bgcolor=t['plot_bg'],
@@ -3476,7 +4119,7 @@ def _apply_square_contour_layout(fig, x_plot, y_plot, xdef, ydef, title,
         ))
         return fig
 
-    title_kw = dict(text=title, font=ps.title_font(t['title']),
+    title_kw = dict(text=f'<b>{title}</b>', font=ps.title_font(t['title']),
                     x=0.02, xanchor='left')
     axis_common = dict(
         type='linear', showgrid=True, gridcolor=t['grid'],
@@ -7177,18 +7820,83 @@ app.layout = html.Div(
             html.Div(style={'paddingTop': '10px'}, children=[
                 html.P('Thermal balance and per-component heating and cooling rates vs depth.',
                        style=_PAGE_INTRO),
-                dcc.Loading(id='loading-thermal', type='circle', children=[
-                    html.Div([
-                        dcc.Graph(id='plot-thermal', figure=placeholder_fig(), config=_GRAPH_CFG,
-                                  style={'flex': '1', 'minWidth': '0'}),
-                        dcc.Graph(id='plot-heat-breakdown', figure=placeholder_fig(), config=_GRAPH_CFG,
-                                  style={'flex': '1', 'minWidth': '0'}),
-                    ], style={'display': 'flex', 'gap': '12px', 'marginBottom': '12px'}),
-                    html.Div([
-                        dcc.Graph(id='plot-cool-breakdown', figure=placeholder_fig(), config=_GRAPH_CFG,
-                                  style={'flex': '1', 'minWidth': '0'}),
-                        html.Div(style={'flex': '1', 'minWidth': '0'}),
-                    ], style={'display': 'flex', 'gap': '12px'}),
+                dcc.Tabs(id='thermal-subtabs', value='thermal-depth',
+                         style={'marginTop': '4px'},
+                         content_style={'paddingTop': '16px'}, children=[
+                    dcc.Tab(label='Depth profiles', value='thermal-depth',
+                            style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
+                            children=[
+                        dcc.Loading(id='loading-thermal', type='circle', children=[
+                            html.Div([
+                                dcc.Graph(id='plot-thermal', figure=placeholder_fig(), config=_GRAPH_CFG,
+                                          style={'flex': '1', 'minWidth': '0'}),
+                                dcc.Graph(id='plot-heat-breakdown', figure=placeholder_fig(), config=_GRAPH_CFG,
+                                          style={'flex': '1', 'minWidth': '0'}),
+                            ], style={'display': 'flex', 'gap': '12px', 'marginBottom': '12px'}),
+                            html.Div([
+                                dcc.Graph(id='plot-cool-breakdown', figure=placeholder_fig(), config=_GRAPH_CFG,
+                                          style={'flex': '1', 'minWidth': '0'}),
+                                html.Div(style={'flex': '1', 'minWidth': '0'}),
+                            ], style={'display': 'flex', 'gap': '12px'}),
+                        ]),
+                    ]),
+                    dcc.Tab(label='Grid-integrated vs CRIR', value='thermal-crir',
+                            style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
+                            children=[
+                        html.P('KoSens grid-integrated diagnostics: each heating / cooling '
+                               'mechanism is volume-integrated (\u222B 4\u03C0r\u00B2 rate n dr) per '
+                               'model and plotted against the cosmic-ray ionization rate \u03B6 for '
+                               'the selected densities. FUV, clump mass, metallicity and '
+                               'attenuation are held at the current slider values.',
+                               style=_PAGE_INTRO),
+                        html.Div([
+                            html.Div([
+                                html.Label('Densities  log\u2081\u2080(n)', style=_CTRL_LABEL),
+                                dcc.Dropdown(id='therm-crir-densities', options=[], value=[],
+                                             multi=True,
+                                             placeholder='Load a grid\u2026 then pick densities',
+                                             style={'fontSize': '13px'}),
+                            ], style={'flex': '2', 'minWidth': '240px', 'marginRight': '18px'}),
+                            html.Div([
+                                html.Label('Stack threshold', style=_CTRL_LABEL),
+                                dcc.Slider(id='therm-crir-threshold', min=0.0, max=0.3,
+                                           step=0.01, value=0.01,
+                                           marks={0: '0', 0.1: '0.1', 0.2: '0.2', 0.3: '0.3'},
+                                           tooltip={'placement': 'bottom'}),
+                            ], style={'flex': '1', 'minWidth': '180px', 'marginRight': '18px'}),
+                        ], className='kosma-panel',
+                           style={'display': 'flex', 'alignItems': 'flex-start',
+                                  'flexWrap': 'wrap', 'padding': '12px 18px',
+                                  'marginBottom': '12px'}),
+                        html.Div([
+                            html.Div([
+                                html.Label('Min rate floor [erg s\u207B\u00B9]', style=_CTRL_LABEL),
+                                dcc.Input(id='therm-minrate', type='number', value=1e23,
+                                          debounce=True, style={'width': '140px'}),
+                            ], style={**_CTRL_BOX, 'minWidth': '160px'}),
+                            html.Div([
+                                html.Label('Min points / channel', style=_CTRL_LABEL),
+                                dcc.Input(id='therm-minpoints', type='number', value=2,
+                                          min=1, step=1, debounce=True,
+                                          style={'width': '90px'}),
+                            ], style={**_CTRL_BOX, 'minWidth': '120px'}),
+                            html.Div([
+                                html.Label('Totals', style=_CTRL_LABEL),
+                                dcc.Checklist(id='therm-show-totals',
+                                              options=[{'label': ' show totals', 'value': 'on'}],
+                                              value=['on'], **_RADIO),
+                            ], style={**_CTRL_BOX, 'minWidth': '120px'}),
+                        ], className='kosma-panel',
+                           style={'display': 'flex', 'alignItems': 'flex-start',
+                                  'flexWrap': 'wrap', 'padding': '12px 18px',
+                                  'marginBottom': '12px'}),
+                        dcc.Loading(id='loading-thermal-crir', type='circle', children=[
+                            dcc.Graph(id='plot-heat-contrib-crir', figure=placeholder_fig(),
+                                      config=_GRAPH_CFG, style={'marginBottom': '12px'}),
+                            dcc.Graph(id='plot-abs-heatcool-crir', figure=placeholder_fig(),
+                                      config=_GRAPH_CFG),
+                        ]),
+                    ]),
                 ]),
             ]),
         ]),
@@ -7243,7 +7951,8 @@ app.layout = html.Div(
                 _advanced_details('Interpolation & resampling', _interp_control_row(prefix='')),
                 _advanced_details('Attenuation x-shift matching', _shift_control_row(prefix='')),
                 dcc.Tabs(id='grid-subtabs', value='grid-maps',
-                         style={'marginTop': '4px'}, children=[
+                         style={'marginTop': '4px'},
+                         content_style={'paddingTop': '16px'}, children=[
                     dcc.Tab(label='Maps', value='grid-maps',
                             style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
                             children=[
@@ -7282,6 +7991,58 @@ app.layout = html.Div(
                                  style={'marginBottom': '8px'}),
                         dcc.Loading(id='loading-grid-ratios', type='circle', children=[
                             html.Div(id='grid-ratio-rows'),
+                        ]),
+                    ]),
+                    dcc.Tab(label='Abundance PDF', value='grid-apdf',
+                            style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
+                            children=[
+                        html.P('KoSens abundance PDF: a 2-D histogram of species abundance '
+                               'versus \u03B6_H / n_H, aggregating every depth point across the '
+                               'grid (mass, metallicity and attenuation fixed to the sliders; '
+                               'density, FUV and CRIR vary). With "split by CRIR" one panel is '
+                               'made per initial cosmic-ray rate; one figure is produced per '
+                               'selected species.',
+                               style=_PAGE_INTRO),
+                        html.Div([
+                            html.Div([
+                                html.Label('Species', style=_CTRL_LABEL),
+                                dcc.Dropdown(id='apdf-species', options=[], value=[],
+                                             multi=True,
+                                             placeholder='Load a grid\u2026 then pick species',
+                                             style={'fontSize': '13px'}),
+                            ], style={'flex': '2', 'minWidth': '240px', 'marginRight': '18px'}),
+                            html.Div([
+                                html.Label('Abundance', style=_CTRL_LABEL),
+                                dcc.RadioItems(id='apdf-dens-choice',
+                                               options=[{'label': 'relative n/n_H', 'value': 'rel'},
+                                                        {'label': 'number n', 'value': 'number'},
+                                                        {'label': 'column N', 'value': 'column'}],
+                                               value='rel', **_RADIO),
+                            ], style={**_CTRL_BOX, 'minWidth': '150px'}),
+                            html.Div([
+                                html.Label('Histogram bins', style=_CTRL_LABEL),
+                                dcc.Input(id='apdf-nbins', type='number', value=100,
+                                          min=5, max=400, step=5, debounce=True,
+                                          style={'width': '90px'}),
+                            ], style={**_CTRL_BOX, 'minWidth': '120px'}),
+                            html.Div([
+                                html.Label('Options', style=_CTRL_LABEL),
+                                dcc.Checklist(id='apdf-split-crir',
+                                              options=[{'label': ' split by CRIR', 'value': 'on'}],
+                                              value=['on'], **_RADIO),
+                                dcc.Checklist(id='apdf-log-color',
+                                              options=[{'label': ' log color', 'value': 'on'}],
+                                              value=['on'], **_RADIO),
+                                dcc.Checklist(id='apdf-overplot-avg',
+                                              options=[{'label': ' binned average', 'value': 'on'}],
+                                              value=[], **_RADIO),
+                            ], style={**_CTRL_BOX, 'minWidth': '150px'}),
+                        ], className='kosma-panel',
+                           style={'display': 'flex', 'alignItems': 'flex-start',
+                                  'flexWrap': 'wrap', 'padding': '12px 18px',
+                                  'marginBottom': '12px'}),
+                        dcc.Loading(id='loading-apdf', type='circle', children=[
+                            html.Div(id='apdf-rows'),
                         ]),
                     ]),
                 ]),
@@ -10606,6 +11367,146 @@ def update_thermal_plots(*args_in):
     return make_thermal_plots(values, xvar, xscale, yscale,
                               theme=_parse_plot_theme(plot_theme),
                               av_range=av_range)
+
+
+@app.callback(
+    Output('therm-crir-densities', 'options'),
+    Output('therm-crir-densities', 'value'),
+    Input('grid-loaded', 'data'),
+    Input('thermal-subtabs', 'value'),
+    State('therm-crir-densities', 'value'),
+    prevent_initial_call=True,
+)
+def populate_therm_crir_densities(_loaded, _subtab, current):
+    if not (_grid and _grid.get('has_hdf5')):
+        return [], []
+    dens_def = PARAM_DEFS[_PARAM_IDX['density']]
+    toks = _grid['axis_tokens'].get('density', [])
+    dvals = [round(float(np.log10(dens_def['decode'](t))), 1) for t in toks]
+    opts = [{'label': f'log\u2081\u2080(n) = {v:.1f}', 'value': v} for v in dvals]
+    kept = [v for v in (current or []) if v in dvals]
+    if kept:
+        value = kept
+    else:
+        value = dvals[:3] if len(dvals) > 3 else dvals
+    return opts, value
+
+
+@app.callback(
+    Output('apdf-species', 'options'),
+    Output('apdf-species', 'value'),
+    Input('grid-loaded', 'data'),
+    Input('grid-subtabs', 'value'),
+    State('apdf-species', 'value'),
+    prevent_initial_call=True,
+)
+def populate_apdf_species(_loaded, _subtab, current):
+    if not (_grid and _grid.get('has_hdf5')):
+        return [], []
+    species = _grid.get('species', [])
+    species_idx = _grid.get('species_idx', {})
+    opts = [{'label': s, 'value': s} for s in species]
+    kept = [s for s in _as_str_list(current) if s in species_idx]
+    if kept:
+        value = kept
+    else:
+        value = [s for s in DEFAULT_CUSTOM if s in species_idx][:3] or species[:1]
+    return opts, value
+
+
+@app.callback(
+    Output('plot-heat-contrib-crir', 'figure'),
+    Output('plot-abs-heatcool-crir', 'figure'),
+    _slider_value_inputs
+    + [Input('therm-crir-densities', 'value'),
+       Input('therm-crir-threshold', 'value'),
+       Input('therm-minrate', 'value'),
+       Input('therm-minpoints', 'value'),
+       Input('therm-show-totals', 'value'),
+       Input('thermal-subtabs', 'value'),
+       Input('overlay-state', 'data'),
+       Input('plot-theme', 'value')],
+    prevent_initial_call=True,
+)
+def update_heatcool_crir_plots(*args_in):
+    values = list(args_in[:N_PARAMS])
+    (densities, threshold, min_rate, min_points, show_totals,
+     _subtab, _overlay_state, plot_theme) = args_in[N_PARAMS:]
+    theme = _parse_plot_theme(plot_theme)
+    if not (_grid and _grid.get('has_hdf5')):
+        ph = placeholder_fig('Grid-integrated heating/cooling requires an HDF5 model grid',
+                             theme=theme)
+        return ph, ph
+    data = _grid_heat_cool_dataframes(values)
+    if not data:
+        ph = placeholder_fig('No models for the current FUV / mass / metallicity selection',
+                             theme=theme)
+        return ph, ph
+    dens = [float(d) for d in (densities or [])]
+    if not dens:
+        ph = placeholder_fig('Select one or more densities above', theme=theme)
+        return ph, ph
+    try:
+        thr = float(threshold)
+    except (TypeError, ValueError):
+        thr = 0.01
+    try:
+        mr = float(min_rate)
+    except (TypeError, ValueError):
+        mr = 1e23
+    try:
+        mp = int(min_points)
+    except (TypeError, ValueError):
+        mp = 2
+    show = bool(show_totals)
+    f1 = fig_heating_contributions_vs_crir(data, dens, threshold=thr, theme=theme)
+    f3 = fig_absolute_heating_cooling_vs_crir(
+        data, dens, min_rate=mr, min_points=max(1, mp), show_totals=show, theme=theme)
+    return f1, f3
+
+
+@app.callback(
+    Output('apdf-rows', 'children'),
+    _slider_value_inputs
+    + [Input('apdf-species', 'value'),
+       Input('apdf-dens-choice', 'value'),
+       Input('apdf-nbins', 'value'),
+       Input('apdf-split-crir', 'value'),
+       Input('apdf-log-color', 'value'),
+       Input('apdf-overplot-avg', 'value'),
+       Input('grid-subtabs', 'value'),
+       Input('grid-loaded', 'data'),
+       Input('plot-theme', 'value')],
+    prevent_initial_call=True,
+)
+def update_abundance_pdf(*args_in):
+    values = list(args_in[:N_PARAMS])
+    (species, dens_choice, nbins, split, log_color, overplot_avg,
+     _subtab, _loaded, plot_theme) = args_in[N_PARAMS:]
+    theme = _parse_plot_theme(plot_theme)
+    if not (_grid and _grid.get('has_hdf5')):
+        return [dcc.Graph(figure=placeholder_fig(
+            'Abundance PDF requires an HDF5 model grid', theme=theme), config=_GRAPH_CFG)]
+    selected = _as_str_list(species)
+    if not selected:
+        return [html.Div('Select one or more species to build abundance PDFs.',
+                         className='kosma-muted', style={'padding': '8px'})]
+    split_on = bool(split)
+    log_on = bool(log_color)
+    over_on = bool(overplot_avg)
+    try:
+        nb = int(nbins)
+    except (TypeError, ValueError):
+        nb = 100
+    rows = []
+    for sp in selected:
+        fig = fig_abundance_pdf(values, sp, dens_choice=(dens_choice or 'rel'),
+                                n_bins=nb, split_by_crir=split_on,
+                                log_color=log_on, overplot_average=over_on,
+                                theme=theme)
+        rows.append(dcc.Graph(figure=fig, config=_GRAPH_CFG,
+                              style={'marginBottom': '14px'}))
+    return rows
 
 
 @app.callback(

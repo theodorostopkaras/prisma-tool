@@ -978,6 +978,18 @@ body:has(#app-root.theme-dark) [class$="-MenuList"] {
   background-color: #1e293b !important;
 }
 
+/* ---- Larger dropdown menus: show more species/options at once ---- */
+#app-root .Select-menu-outer,
+#app-root .Select-menu,
+#app-root div[class*="-MenuList"],
+#app-root [class$="-MenuList"],
+body:has(#app-root) .Select-menu-outer,
+body:has(#app-root) .Select-menu,
+body:has(#app-root) div[class*="-MenuList"],
+body:has(#app-root) [class$="-MenuList"] {
+  max-height: 400px !important;
+}
+
 /* ---- Radios / checklists dark ---- */
 #app-root.theme-dark .radio,
 #app-root.theme-dark label.radio,

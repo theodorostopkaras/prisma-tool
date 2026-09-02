@@ -24,7 +24,7 @@ After loading a main grid on **Load grids**, the other tabs become active:
 | **Grid slices** | 2-D contour maps over n_H, FUV, and ζ |
 | **Chemistry** | Top formation / destruction reactions with contribution metrics |
 | **Intensities** | SIMLINE line-intensity slice maps and spectrum |
-| **Spectra** | SimLine PV FITS velocity spectra and position–velocity diagrams |
+| **Spectra** | SimLine PV FITS velocity spectra / PV diagrams, plus a CARTA-style observational cube viewer |
 | **Interpolation error** | Native vs resampled grids with decimation error maps (abundance + SIMLINE) |
 | **CR attenuation** | ζ<sub>H₂</sub> vs N<sub>H₂</sub> profiles with Padovani 𝓛/𝓗/𝓤 reference bands |
 | **Map fit** | Fit observed FITS maps to the 3-D SIMLINE model grid (KoSens3D) |
@@ -206,6 +206,9 @@ image cube (``hdu_index=0``). Controls:
 - **Line core limits** — velocities *outside* this range define the continuum
   (polynomial degree 1); inside is the line core for the Gaussian fit
 - **N Gaussians** — multi-component line model (Astropy LevMar, same as KoSens)
+- **Optional Peak / v₀ / FWHM** per component — starting values (blank = auto).
+  **Lock filled values** holds those parameters instead of fitting them.
+  Width is FWHM, not σ.
 - **Overlay** — plot the observed spectrum on the SimLine 1-D panel
 - **Fit Gaussians** — continuum + sum of Gaussians; shows per-component
   amplitudes, centres, widths, integrated intensities, and total
@@ -213,6 +216,42 @@ image cube (``hdu_index=0``). Controls:
 
 Implementation: ``obs_spectrum_fits.py`` (vendored from KoSens ``spectrum_fits``;
 no KoSens import).
+
+### Cube viewer (CARTA-like)
+
+The **Cube viewer** sub-tab under **Spectra** is a custom reader for the IRAM
+30 m CLASS/GILDAS ``MATRIX`` tables (and ordinary NAXIS=3 image cubes). Those
+CLASS files are *not* 3-D FITS images — each row is one 15″ OTF cell with a
+full spectrum — so a standard cube viewer has nothing to slice until they are
+gridded here:
+
+- **Map** (left) — moment-0 (``∫T dv``) or peak temperature, collapsed over the
+  line-core velocity window. Missing OTF cells stay blank (no interpolation).
+  RA offset increases to the left (sky convention).
+- **Spectrum** (right) — **Pixel / region** uses a map click or a box/lasso
+  average; **Mean (whole map)** is the nan-mean of every filled OTF cell
+  (same spatial-mean option as the SimLine observational overlay).
+  **Spectrum X axis** switches between LSR velocity and observed frequency
+  (GHz; radio definition).
+- **Possible lines** — a separate panel under the map/spectrum lists catalog
+  rest frequencies that fall in the cube’s frequency coverage (typically
+  ~50 MHz for a CLASS OTF cube, so you see the target line plus hyperfine
+  structure such as N₂H⁺ 1–0). The list is filled as soon as a cube is
+  loaded (it does not depend on the selected pixel). Default is a local
+  3 mm list; **Splatalogue (CDMS/JPL)** queries rest frequencies that fall
+  in the cube’s frequency window (the same window whether the spectrum is
+  plotted in velocity or frequency). ``astroquery`` ≥ 0.4.8 returns those
+  IDs as ``orderedfreq`` in MHz. **Source VLSR** Doppler-shifts catalog
+  lines onto the observed frame. Optional purple markers overlay the spectrum.
+- **Measurements** — peak T, v(peak), ν(peak), centroid, half-max FWHM, integrated
+  intensity, RMS, S/N, and sky position. Optional multi-Gaussian fit adds
+  per-component peak, v₀, FWHM, σ, and ``∫I dv``. You can type Peak / v₀ /
+  FWHM starting values for each component (or lock filled values).
+- Species labels come from the **filename + RESTFREQ**, not the CLASS ``LINE``
+  keyword (often a leftover backend name such as ``HCN_LSB``).
+
+Point **FITS file or directory** at a single cube or a folder of CLASS exports
+(e.g. the DR21 IRAM ``grid15`` set). Implementation: ``cube_viewer.py``.
 
 ## Interpolation error check
 
@@ -310,11 +349,10 @@ tabs, overlays additionally enable the triple-panel x-shift view described above
 
 ## Install & run
 
-```bash
-cd Kosma-online-tool
-pip install -r requirements.txt
+From the project directory:
 
-# uses the built-in default directory; or pass your own:
+```bash
+python -m pip install -r requirements.txt
 python app.py --dir /path/to/pdrgrid_hdf5
 ```
 
@@ -322,8 +360,28 @@ Then open <http://127.0.0.1:8050>. You can also paste a directory path into the
 box at the top of the page and click **Load grid** (tick *recursive* to walk
 sub-folders).
 
-**Dependencies:** `dash`, `plotly`, `numpy`, `h5py`, `scipy`, `astropy`.
-Optional: `tqdm` (progress bar during map fitting).
+If you already had the tool installed, re-run the `pip install` line after
+pulling updates so new packages (in particular **astroquery**) are picked up.
+
+**Required packages** (from `requirements.txt`):
+
+| Package | Used for |
+|---|---|
+| `dash`, `plotly` | Interactive UI and figures |
+| `numpy`, `scipy` | Arrays, interpolation, numerics |
+| `h5py` | KOSMA-τ / chemistry HDF5 grids |
+| `astropy` | FITS cubes, WCS, Gaussian line fitting |
+| `astroquery` | Splatalogue (CDMS/JPL) line ID on **Spectra → Cube viewer** |
+| `tqdm` | Progress bar during map fitting |
+| `Pillow` | Image export |
+
+The cube viewer’s **local 3 mm catalog** works with the core stack only.
+**Splatalogue** needs `astroquery` and a network connection. To install that
+piece on its own:
+
+```bash
+python -m pip install 'astroquery>=0.4.7'
+```
 
 ### CLI options
 
@@ -347,6 +405,8 @@ Optional: `tqdm` (progress bar during map fitting).
 | `simline_spectra.py` | SimLine PV FITS spectra and PV diagrams (local, no KoSens) |
 | `cr_attenuation.py` | CR attenuation profiles and Padovani reference bands (local, no KoSens) |
 | `obs_spectrum_fits.py` | Observational FITS spectra extraction and Gaussian fitting |
+| `cube_viewer.py` | CLASS MATRIX / spectral-cube map + spectrum (CARTA-like) |
+| `line_catalog.py` | Local 3 mm line list and optional Splatalogue queries |
 | `smli_labels.py` | SIMLINE transition label formatting |
 | `model_config.py` | JSON config scan and Model setup panel |
 

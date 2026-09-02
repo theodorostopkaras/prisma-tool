@@ -374,7 +374,108 @@ def fit_polynomial_continuum(velocity_kms, flux, continuum_mask, degree=1):
     return poly_fit(v)
 
 
-def fit_multi_gaussian(velocity_kms, flux, n_components=1, p0=None, bounds=None):
+FWHM_OVER_SIGMA = 2.0 * np.sqrt(2.0 * np.log(2.0))  # ≈ 2.3548
+
+
+def fwhm_to_sigma(fwhm_kms):
+    return abs(float(fwhm_kms)) / FWHM_OVER_SIGMA
+
+
+def sigma_to_fwhm(sigma_kms):
+    return abs(float(sigma_kms)) * FWHM_OVER_SIGMA
+
+
+def coerce_optional_floats(values, n):
+    """Pad/trim a list of optional numbers to length *n* (None = unset)."""
+    n = int(n)
+    out = [None] * max(n, 0)
+    for i, val in enumerate(list(values or [])[:n]):
+        if val is None or val == '':
+            continue
+        try:
+            x = float(val)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(x):
+            out[i] = x
+    return out
+
+
+def auto_gaussian_p0(velocity_kms, flux, n_components=1):
+    """Default LevMar starting vector: [A, v0, σ] × N + offset."""
+    v = np.asarray(velocity_kms, dtype=float)
+    y = np.asarray(flux, dtype=float)
+    finite = np.isfinite(v) & np.isfinite(y)
+    v, y = v[finite], y[finite]
+    n_components = int(n_components)
+    if y.size == 0:
+        p0 = []
+        for _ in range(n_components):
+            p0.extend([0.0, 0.0, 1.0])
+        p0.append(0.0)
+        return tuple(p0)
+    offset_guess = float(np.median(y))
+    peak = float(np.max(y) - offset_guess)
+    if abs(peak) < abs(float(np.min(y) - offset_guess)):
+        peak = float(np.min(y) - offset_guess)
+    center_guess = float(v[np.argmax(np.abs(y - offset_guess))])
+    width = float(v.max() - v.min()) or 1.0
+    p0_list = []
+    for i in range(n_components):
+        if i == 0:
+            sigma_guess = max(width / 20.0, 1.0e-6)
+            amp_guess = peak * 0.85 if peak != 0.0 else 0.0
+        elif i == 1:
+            sigma_guess = max(width / 5.0, 1.0e-6)
+            amp_guess = peak * 0.45 if peak != 0.0 else 0.0
+        else:
+            sigma_guess = max(width / (3.0 + 2.0 * i), 1.0e-6)
+            amp_guess = (peak * 0.25 / max(i, 1)) if peak != 0.0 else 0.0
+        p0_list.extend([amp_guess, center_guess, sigma_guess])
+    p0_list.append(offset_guess)
+    return tuple(p0_list)
+
+
+def merge_user_gaussian_p0(n_gaussians, auto_p0, amplitudes=None, centers=None,
+                           fwhms=None, offset=None):
+    """Overwrite auto-guess slots with user Peak / v0 / FWHM (unset stays auto).
+
+    Returns ``(p0, user_set)`` where *user_set* is a bool list of the same
+    length marking which parameters the user actually provided.
+    """
+    n = int(n_gaussians)
+    n_params = 3 * n + 1
+    p0 = list(auto_p0)
+    if len(p0) != n_params:
+        raise ValueError(f'auto_p0 must have length {n_params}; got {len(p0)}')
+    user_set = [False] * n_params
+    amps = coerce_optional_floats(amplitudes, n)
+    ctrs = coerce_optional_floats(centers, n)
+    widths = coerce_optional_floats(fwhms, n)
+    for i in range(n):
+        i0 = 3 * i
+        if amps[i] is not None:
+            p0[i0] = float(amps[i])
+            user_set[i0] = True
+        if ctrs[i] is not None:
+            p0[i0 + 1] = float(ctrs[i])
+            user_set[i0 + 1] = True
+        if widths[i] is not None:
+            p0[i0 + 2] = max(fwhm_to_sigma(widths[i]), 1.0e-6)
+            user_set[i0 + 2] = True
+    if offset is not None and offset != '':
+        try:
+            off = float(offset)
+        except (TypeError, ValueError):
+            off = None
+        if off is not None and np.isfinite(off):
+            p0[-1] = off
+            user_set[-1] = True
+    return tuple(p0), user_set
+
+
+def fit_multi_gaussian(velocity_kms, flux, n_components=1, p0=None, bounds=None,
+                       fixed=None):
     if models is None or fitting is None:
         raise ImportError('astropy.modeling is required for line fitting')
     v = np.asarray(velocity_kms, dtype=float)
@@ -387,30 +488,18 @@ def fit_multi_gaussian(velocity_kms, flux, n_components=1, p0=None, bounds=None)
         raise ValueError(f'need at least {n_params} points for fit; got {len(y)}')
 
     if p0 is None:
-        offset_guess = float(np.median(y))
-        peak = float(np.max(y) - offset_guess)
-        if abs(peak) < abs(float(np.min(y) - offset_guess)):
-            peak = float(np.min(y) - offset_guess)
-        center_guess = float(v[np.argmax(np.abs(y - offset_guess))])
-        width = float(v.max() - v.min()) or 1.0
-        p0_list = []
-        for i in range(n_components):
-            if i == 0:
-                sigma_guess = max(width / 20.0, 1.0e-6)
-                amp_guess = peak * 0.85 if peak != 0.0 else 0.0
-            elif i == 1:
-                sigma_guess = max(width / 5.0, 1.0e-6)
-                amp_guess = peak * 0.45 if peak != 0.0 else 0.0
-            else:
-                sigma_guess = max(width / (3.0 + 2.0 * i), 1.0e-6)
-                amp_guess = (peak * 0.25 / max(i, 1)) if peak != 0.0 else 0.0
-            p0_list.extend([amp_guess, center_guess, sigma_guess])
-        p0_list.append(offset_guess)
-        p0 = tuple(p0_list)
+        p0 = auto_gaussian_p0(v, y, n_components)
     else:
         p0 = tuple(p0)
         if len(p0) != n_params:
             raise ValueError(f'p0 must have length {n_params}')
+
+    if fixed is None:
+        fixed = [False] * n_params
+    else:
+        fixed = [bool(x) for x in fixed]
+        if len(fixed) != n_params:
+            raise ValueError(f'fixed must have length {n_params}')
 
     if bounds is None:
         lowers, uppers = [], []
@@ -429,9 +518,16 @@ def fit_multi_gaussian(velocity_kms, flux, n_components=1, p0=None, bounds=None)
         g.bounds['amplitude'] = (lower[i0], upper[i0])
         g.bounds['mean'] = (lower[i0 + 1], upper[i0 + 1])
         g.bounds['stddev'] = (max(lower[i0 + 2], 1.0e-12), upper[i0 + 2])
+        g.fixed['amplitude'] = fixed[i0]
+        g.fixed['mean'] = fixed[i0 + 1]
+        g.fixed['stddev'] = fixed[i0 + 2]
         gaussians.append(g)
     const = models.Const1D(amplitude=p0[-1], name='offset')
     const.bounds['amplitude'] = (lower[-1], upper[-1])
+    const.fixed['amplitude'] = fixed[-1]
+
+    if all(fixed):
+        return np.asarray(p0, dtype=float), np.full((n_params, n_params), np.nan)
 
     model_init = gaussians[0]
     for g in gaussians[1:]:
@@ -471,14 +567,25 @@ def integrated_intensity_total_error_kms(amplitudes, sigmas, pcov, n_components)
 
 
 def _fit_gaussian_line_core(v, y, low_line_limit, high_line_limit, degree=1,
-                            n_gaussians=1, line_p0=None, line_bounds=None):
+                            n_gaussians=1, line_p0=None, line_bounds=None,
+                            amplitudes=None, centers=None, fwhms=None,
+                            offset=None, lock_user=False):
     continuum_mask = (v <= low_line_limit) | (v >= high_line_limit)
     noise_sigma_rms, noise_sigma_mad = noise_estimates_line_free(y, continuum_mask)
     cont = fit_polynomial_continuum(v, y, continuum_mask, degree=degree)
     residual = y - cont
-    popt, pcov = fit_multi_gaussian(
-        v, residual, n_components=n_gaussians, p0=line_p0, bounds=line_bounds)
     n_g = int(n_gaussians)
+    if line_p0 is None:
+        auto = auto_gaussian_p0(v, residual, n_g)
+        line_p0, user_set = merge_user_gaussian_p0(
+            n_g, auto, amplitudes=amplitudes, centers=centers,
+            fwhms=fwhms, offset=offset)
+        fixed = user_set if lock_user else None
+    else:
+        fixed = None
+    popt, pcov = fit_multi_gaussian(
+        v, residual, n_components=n_g, p0=line_p0, bounds=line_bounds,
+        fixed=fixed)
     amps = popt[0:3 * n_g:3]
     ctrs = popt[1:3 * n_g:3]
     sigs = popt[2:3 * n_g:3]
@@ -564,6 +671,10 @@ def spectrum_fitting(
     resample_vel_res_kms=None,
     peak_threshold_fraction=0.5,
     peak_intensity_metric='integrated',
+    amplitudes=None,
+    centers=None,
+    fwhms=None,
+    lock_user=False,
 ) -> SpectrumFitResult:
     """Fit continuum + multi-Gaussian line model to an observational spectrum."""
     v, spectra, cube_data, spectral_axis, v_native, path = load_spectra_from_fits(
@@ -582,15 +693,42 @@ def spectrum_fitting(
 
     out = _fit_gaussian_line_core(
         v, y, low_line_limit, high_line_limit,
-        n_gaussians=int(n_gaussians))
+        n_gaussians=int(n_gaussians),
+        amplitudes=amplitudes, centers=centers, fwhms=fwhms,
+        lock_user=bool(lock_user))
 
+    return _spectrum_fit_result_from_core(
+        v, y, out,
+        file_path=path,
+        spectrum_selection=agg['spectrum_selection'],
+        row_index=agg['row_index'],
+        n_spectra=agg['n_spectra'],
+        n_spectra_selected=agg['n_spectra_selected'],
+        mean_noise_rms=agg['mean_noise_rms'],
+        mean_noise_mad=agg['mean_noise_mad'],
+        peak_n_selected=peak_info['n_selected'] if peak_info else None,
+        peak_threshold=peak_info['intensity_threshold'] if peak_info else None,
+    )
+
+
+def _spectrum_fit_result_from_core(
+    v, y, out, *,
+    file_path='',
+    spectrum_selection='',
+    row_index=None,
+    n_spectra=1,
+    n_spectra_selected=1,
+    mean_noise_rms=None,
+    mean_noise_mad=None,
+    peak_n_selected=None,
+    peak_threshold=None,
+) -> SpectrumFitResult:
     amps_fit = np.asarray(out['amplitudes'], dtype=float).ravel()
     sigs_fit = np.asarray(out['sigmas'], dtype=float).ravel()
     int_per = integrated_intensity_per_component_kms(amps_fit, sigs_fit)
     int_total = float(np.sum(int_per))
     int_total_err = integrated_intensity_total_error_kms(
         amps_fit, sigs_fit, out['pcov'], out['n_components'])
-
     return SpectrumFitResult(
         v=v, y=y,
         continuum_mask=out['continuum_mask'],
@@ -612,15 +750,38 @@ def spectrum_fitting(
         integrated_intensity_total_error=int_total_err,
         noise_sigma_rms=float(out['noise_sigma_rms']),
         noise_sigma_mad=float(out['noise_sigma_mad']),
-        spectrum_selection=agg['spectrum_selection'],
-        row_index=agg['row_index'],
-        n_spectra=agg['n_spectra'],
-        n_spectra_selected=agg['n_spectra_selected'],
-        mean_noise_rms=agg['mean_noise_rms'],
-        mean_noise_mad=agg['mean_noise_mad'],
-        file_path=path,
-        peak_n_selected=peak_info['n_selected'] if peak_info else None,
-        peak_threshold=peak_info['intensity_threshold'] if peak_info else None,
+        spectrum_selection=spectrum_selection,
+        row_index=row_index,
+        n_spectra=n_spectra,
+        n_spectra_selected=n_spectra_selected,
+        mean_noise_rms=mean_noise_rms,
+        mean_noise_mad=mean_noise_mad,
+        file_path=file_path,
+        peak_n_selected=peak_n_selected,
+        peak_threshold=peak_threshold,
+    )
+
+
+def fit_spectrum_arrays(velocity_kms, flux, low_line_limit, high_line_limit,
+                        n_gaussians=1, file_path='', spectrum_selection='selection',
+                        row_index=None, n_spectra=1, n_spectra_selected=1,
+                        amplitudes=None, centers=None, fwhms=None,
+                        lock_user=False,
+                        ) -> SpectrumFitResult:
+    """Fit continuum + Gaussians to an already extracted (v, y) spectrum."""
+    v = np.asarray(velocity_kms, dtype=float)
+    y = np.asarray(flux, dtype=float)
+    out = _fit_gaussian_line_core(
+        v, y, low_line_limit, high_line_limit, n_gaussians=int(n_gaussians),
+        amplitudes=amplitudes, centers=centers, fwhms=fwhms,
+        lock_user=bool(lock_user))
+    return _spectrum_fit_result_from_core(
+        v, y, out,
+        file_path=file_path,
+        spectrum_selection=spectrum_selection,
+        row_index=row_index,
+        n_spectra=n_spectra,
+        n_spectra_selected=n_spectra_selected,
     )
 
 

@@ -73,6 +73,8 @@ import grid_interp as gi
 import model_config as mc
 import simline_spectra as ss
 import obs_spectrum_fits as osf
+import cube_viewer as cv
+import line_catalog as lc
 import cr_attenuation as cra
 import grid_naming as gn
 import rgb_phase
@@ -90,6 +92,27 @@ OBS_ROW_OPTIONS = [
 ]
 DEFAULT_OBS_V_LOW = -20.0
 DEFAULT_OBS_V_HIGH = 20.0
+DEFAULT_CUBE_MAP_METRIC = 'moment0'
+CUBE_MAP_METRIC_OPTIONS = [
+    {'label': ' Moment-0  ∫T dv  (K km/s)', 'value': 'moment0'},
+    {'label': ' Peak T  (K)', 'value': 'peak'},
+]
+CUBE_SPEC_MODE_OPTIONS = [
+    {'label': ' Pixel / region', 'value': 'pixel'},
+    {'label': ' Mean (whole map)', 'value': 'mean'},
+]
+DEFAULT_CUBE_SPEC_MODE = 'pixel'
+CUBE_XAXIS_OPTIONS = [
+    {'label': ' Velocity  (km/s)', 'value': 'velocity'},
+    {'label': ' Frequency  (GHz)', 'value': 'frequency'},
+]
+CUBE_LINECAT_OPTIONS = [
+    {'label': ' Local 3 mm catalog', 'value': 'local'},
+    {'label': ' Splatalogue (CDMS/JPL)', 'value': 'splatalogue'},
+]
+DEFAULT_CUBE_LINECAT = 'local'
+_CV_SPEC_HEIGHT = 360
+_CV_COL_HEIGHT = 688  # spectrum + gap + measurements; map column matches this
 DEFAULT_DIR = ''
 
 
@@ -6282,7 +6305,9 @@ def _obs_fit_summary_layout(result):
 
 
 def _run_obs_spectrum_fit(obs_path, obs_hdu, obs_row_mode, obs_row_index,
-                          obs_v_low, obs_v_high, obs_n_gauss, do_fit):
+                          obs_v_low, obs_v_high, obs_n_gauss, do_fit,
+                          amplitudes=None, centers=None, fwhms=None,
+                          lock_user=False):
     """Load observational spectrum; optionally run Gaussian fit."""
     path = (obs_path or '').strip()
     if not path or not os.path.isfile(os.path.expanduser(path)):
@@ -6300,7 +6325,9 @@ def _run_obs_spectrum_fit(obs_path, obs_hdu, obs_row_mode, obs_row_index,
     try:
         if do_fit:
             result = osf.spectrum_fitting(
-                path, row, v_lo, v_hi, hdu_index=hdu, n_gaussians=n_g)
+                path, row, v_lo, v_hi, hdu_index=hdu, n_gaussians=n_g,
+                amplitudes=amplitudes, centers=centers, fwhms=fwhms,
+                lock_user=bool(lock_user))
             return result.v, result.y, result
         v, y, _, _ = osf.extract_spectrum_only(path, row, v_lo, v_hi, hdu_index=hdu)
         return v, y, None
@@ -6324,7 +6351,9 @@ def fig_spectra_plot(values, species, transitions, positions_text,
                      obs_path=None, obs_hdu=None, obs_row_mode='mean',
                      obs_row_index=None, obs_v_low=None, obs_v_high=None,
                      obs_n_gauss=1, obs_overlay=False, obs_fit=False,
-                     pv_quantity='intensity', theme='light'):
+                     pv_quantity='intensity', theme='light',
+                     gauss_amps=None, gauss_centers=None, gauss_fwhms=None,
+                     gauss_lock=False):
     """SimLine PV spectra with optional observational overlay and Gaussian fit."""
     t = _theme_colors(theme)
     fig = go.Figure()
@@ -6403,7 +6432,9 @@ def fig_spectra_plot(values, species, transitions, positions_text,
     if obs_overlay or obs_fit:
         v_obs, y_obs, fit_or_err = _run_obs_spectrum_fit(
             obs_path, obs_hdu, obs_row_mode, obs_row_index,
-            obs_v_low, obs_v_high, obs_n_gauss, do_fit=obs_fit)
+            obs_v_low, obs_v_high, obs_n_gauss, do_fit=obs_fit,
+            amplitudes=gauss_amps, centers=gauss_centers, fwhms=gauss_fwhms,
+            lock_user=gauss_lock)
         if isinstance(fit_or_err, str):
             fit_error = fit_or_err
         elif fit_or_err is not None:
@@ -6506,6 +6537,579 @@ def fig_simline_spectrum(values, species, transitions, positions_text, theme='li
     fig, _, _ = fig_spectra_plot(
         values, species, transitions, positions_text, theme=theme)
     return fig
+
+
+def _cv_velocity_window(v_low, v_high):
+    lo = float(v_low if v_low is not None else DEFAULT_OBS_V_LOW)
+    hi = float(v_high if v_high is not None else DEFAULT_OBS_V_HIGH)
+    if lo > hi:
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def _load_cv_cube(path, hdu):
+    path = os.path.abspath(os.path.expanduser(str(path or '').strip()))
+    if not path or not os.path.isfile(path):
+        return None, 'Enter a CLASS MATRIX or spectral-cube FITS path (file or directory)'
+    try:
+        hdu_i = int(hdu) if hdu is not None else None
+    except (TypeError, ValueError):
+        hdu_i = None
+    try:
+        return cv.load_spectral_cube(path, hdu_index=hdu_i), None
+    except Exception as exc:
+        try:
+            alt = cv.default_hdu_index(path)
+            if hdu_i is None or alt != hdu_i:
+                return cv.load_spectral_cube(path, hdu_index=alt), None
+        except Exception:
+            pass
+        return None, str(exc)
+
+
+def _cv_spec_mode(spec_mode):
+    mode = (spec_mode or DEFAULT_CUBE_SPEC_MODE).strip().lower()
+    return 'mean' if mode == 'mean' else 'pixel'
+
+
+def _cv_row_selection(cube, selection, spec_mode='pixel'):
+    """Rows for the displayed spectrum: whole map, or the click / lasso selection."""
+    if _cv_spec_mode(spec_mode) == 'mean':
+        return list(range(int(cube.n_spectra)))
+    if not selection:
+        return []
+    rows = selection.get('rows') or []
+    out = []
+    for r in rows:
+        try:
+            ri = int(r)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= ri < cube.n_spectra:
+            out.append(ri)
+    return out
+
+
+def fig_cube_map(path, hdu, metric, v_low, v_high, colorscale, zscale,
+                 selection=None, spec_mode='pixel', theme='light'):
+    """Collapsed spatial map of a CLASS table or image cube, with selection overlay."""
+    cube, err = _load_cv_cube(path, hdu)
+    if cube is None:
+        return placeholder_fig(err, theme=theme)
+    try:
+        lo, hi = _cv_velocity_window(v_low, v_high)
+        map2d = cv.collapse_map(cube, lo, hi, metric=metric or DEFAULT_CUBE_MAP_METRIC)
+    except Exception as exc:
+        return placeholder_fig(str(exc), theme=theme)
+
+    t = _theme_colors(theme)
+    metric_l = (metric or DEFAULT_CUBE_MAP_METRIC).strip().lower()
+    if metric_l == 'peak':
+        z_label = f'Peak T ({cube.intensity_unit})'
+        z_hover = f'T<sub>peak</sub> = %{{z:.4g}} {cube.intensity_unit}'
+        cbar_zscale = zscale or 'linear'
+    else:
+        z_label = '∫T dv (K km/s)'
+        z_hover = '∫T dv = %{z:.4g} K km/s'
+        cbar_zscale = zscale or 'linear'
+    zplot, zmin, zmax = _apply_zscale(map2d, zscale or 'linear')
+    if zscale == 'log':
+        z_label = f'log<sub>10</sub> {z_label}'
+        z_hover = 'log<sub>10</sub> = %{z:.4g}'
+        cbar_zscale = 'log'
+
+    custom = cv.customdata_stack(cube)
+    heat_kw = dict(
+        x=cube.ra_axis_arcmin,
+        y=cube.dec_axis_arcmin,
+        z=zplot,
+        customdata=custom,
+        colorscale=colorscale or DEFAULT_GRID_COLORMAP,
+        colorbar=_contour_colorbar(z_label, theme=theme, zscale=cbar_zscale,
+                                   compact=False),
+        hoverongaps=False,
+        hovertemplate=(
+            'ΔRA = %{x:.3f}′<br>ΔDec = %{y:.3f}′<br>'
+            f'{z_hover}<br>row = %{{customdata[0]}}<extra></extra>'
+        ),
+    )
+    if zmin is not None:
+        heat_kw.update(zmin=zmin, zmax=zmax, zauto=False)
+    fig = go.Figure(go.Heatmap(**heat_kw))
+
+    rows = _cv_row_selection(cube, selection, spec_mode)
+    # Whole-map mean uses every filled cell — skip the X overlay (it would cover the map).
+    if rows and _cv_spec_mode(spec_mode) != 'mean' and len(rows) < cube.n_spectra:
+        fig.add_trace(go.Scatter(
+            x=cube.ra_off_deg[rows] * 60.0,
+            y=cube.dec_off_deg[rows] * 60.0,
+            mode='markers',
+            marker=dict(
+                symbol='x',
+                size=12 if len(rows) == 1 else 8,
+                color='#f8fafc',
+                line=dict(color='#ef4444', width=1.6),
+            ),
+            name='selection',
+            hoverinfo='skip',
+        ))
+
+    n_fill = cube.n_spectra
+    n_tot = cube.ny * cube.nx
+    title = (f'{cube.species_label}'
+             f'  ·  {n_fill}/{n_tot} cells'
+             f'  ·  {cube.grid_step_arcsec:.3g}″ grid')
+    fig.update_layout(**{
+        **_base_layout(theme),
+        'height': _CV_COL_HEIGHT,
+        'margin': dict(l=70, r=90, t=58, b=58),
+        'title': dict(text=title, font=ps.title_font(t['title']),
+                      x=0.02, xanchor='left'),
+        'xaxis': dict(
+            **{k: v for k, v in _axis_style(theme).items()
+               if k not in ('exponentformat', 'showexponent')},
+            title=dict(text='ΔRA (arcmin)', font=ps.axis_title_font()),
+            autorange='reversed',
+            scaleanchor='y',
+            scaleratio=1,
+            constrain='domain',
+            exponentformat='none',
+            showexponent='none',
+        ),
+        'yaxis': dict(
+            **{k: v for k, v in _axis_style(theme).items()
+               if k not in ('exponentformat', 'showexponent')},
+            title=dict(text='ΔDec (arcmin)', font=ps.axis_title_font()),
+            exponentformat='none',
+            showexponent='none',
+        ),
+        'dragmode': 'zoom',
+        'clickmode': 'event+select',
+        'uirevision': f'cv-map|{cube.path}',
+        'showlegend': False,
+    })
+    return fig
+
+
+def _cv_identify_window_lines(cube, line_catalog, v_source, eu_max):
+    """Catalog lines whose observed frequency falls in the cube's spectral window."""
+    win = None if cube is None else cube.freq_window_ghz()
+    line_rows, line_err = [], None
+    if win is not None:
+        try:
+            eu = float(eu_max) if eu_max not in (None, '') else None
+        except (TypeError, ValueError):
+            eu = 150.0
+        try:
+            vsrc = float(v_source) if v_source is not None else 0.0
+        except (TypeError, ValueError):
+            vsrc = 0.0
+        line_rows, line_err = lc.identify_lines(
+            win[0], win[1], catalog=line_catalog or DEFAULT_CUBE_LINECAT,
+            v_source_kms=vsrc, eu_max_k=eu)
+    return win, line_rows, line_err
+
+
+def fig_cube_spectrum(path, hdu, selection, v_low, v_high, n_gauss, do_fit,
+                      theme='light', gauss_amps=None, gauss_centers=None,
+                      gauss_fwhms=None, gauss_lock=False,
+                      xaxis='velocity', line_catalog='local',
+                      mark_lines=True, v_source=0.0, eu_max=150.0,
+                      spec_mode='pixel'):
+    """Spectrum of the selected pixel / region, or the mean of the whole map."""
+    cube, err = _load_cv_cube(path, hdu)
+    win, line_rows, line_err = _cv_identify_window_lines(
+        cube, line_catalog, v_source, eu_max)
+    line_table = _line_id_table_layout(cube, win, line_rows, line_err, v_source)
+    if cube is None:
+        return placeholder_fig(err, theme=theme), html.Div(), line_table
+    mode = _cv_spec_mode(spec_mode)
+    rows = _cv_row_selection(cube, selection, mode)
+    if not rows:
+        empty_stats = html.Div([
+            html.P(html.B('Pixel measurements'), style={'margin': '0 0 6px'}),
+            html.P('Click a map pixel, or box/lasso a region, to measure '
+                   'the spectrum — or switch Spectrum to Mean (whole map).',
+                   style={'margin': '0', 'opacity': 0.75}),
+        ], style={'fontSize': '13px'})
+        return placeholder_fig(
+            'Click a map pixel, or box/lasso a region in the toolbar',
+            theme=theme), empty_stats, line_table
+    try:
+        v, y = cv.extract_spectrum(cube, rows)
+        lo, hi = _cv_velocity_window(v_low, v_high)
+        meas = cv.measure_spectrum(v, y, lo, hi)
+        sky = cv.selection_sky(cube, rows)
+    except Exception as exc:
+        return placeholder_fig(str(exc), theme=theme), html.Span(
+            str(exc), style={'color': '#d62728'}), line_table
+
+    freq = cube.frequency_ghz
+    use_freq = (xaxis == 'frequency') and freq is not None
+    x = freq if use_freq else v
+    if use_freq:
+        x_title = 'Frequency (GHz)'
+        x_hover = 'ν = %{x:.6f} GHz'
+    else:
+        x_title = 'V<sub>LSR</sub> (km/s)'
+        x_hover = 'v = %{x:.3g} km/s'
+        if xaxis == 'frequency' and freq is None:
+            x_title = 'V<sub>LSR</sub> (km/s)  — no frequency axis in this file'
+
+    def _x_at_v(vq):
+        if use_freq:
+            return lc.remap_velocity_to_axis(v, freq, vq)
+        return vq
+
+    t = _theme_colors(theme)
+    fig = go.Figure()
+    n_pix = len(rows)
+    if mode == 'mean':
+        spec_name = f'Map mean ({n_pix} pixels)'
+    elif n_pix == 1:
+        spec_name = 'Pixel spectrum'
+    else:
+        spec_name = f'Region mean ({n_pix} pixels)'
+    fig.add_trace(go.Scatter(
+        x=x, y=y, mode='lines',
+        line=dict(color='#d62728', width=2.0),
+        name=spec_name,
+        hovertemplate=x_hover + '<br>T = %{y:.4g} K<extra></extra>',
+    ))
+
+    fit_result = None
+    fit_error = None
+    if do_fit:
+        try:
+            n_g = max(1, int(n_gauss or 1))
+            if mode == 'mean':
+                kind = 'mean'
+            elif n_pix == 1:
+                kind = 'pixel'
+            else:
+                kind = 'region'
+            fit_result = osf.fit_spectrum_arrays(
+                v, y, lo, hi, n_gaussians=n_g,
+                file_path=cube.path,
+                spectrum_selection=kind,
+                row_index=rows[0] if n_pix == 1 else None,
+                n_spectra=cube.n_spectra,
+                n_spectra_selected=n_pix,
+                amplitudes=gauss_amps, centers=gauss_centers, fwhms=gauss_fwhms,
+                lock_user=gauss_lock,
+            )
+        except Exception as exc:
+            fit_error = str(exc)
+
+    if fit_result is not None:
+        x_fit = _x_at_v(fit_result.v)
+        fig.add_trace(go.Scatter(
+            x=x_fit, y=fit_result.cont, mode='lines',
+            line=dict(color='#888', width=1.2, dash='dot'),
+            name='Continuum',
+            hovertemplate='continuum = %{y:.4g}<extra></extra>',
+        ))
+        for j in range(fit_result.n_components):
+            comp = (fit_result.cont + fit_result.offset
+                    + fit_result.gaussian_components[j])
+            fig.add_trace(go.Scatter(
+                x=x_fit, y=comp, mode='lines',
+                line=dict(color='#ff7f0e', width=1.2, dash='dash'),
+                name=f'Gauss {j + 1}',
+                hovertemplate=f'Gauss {j + 1}<extra></extra>',
+            ))
+        fig.add_trace(go.Scatter(
+            x=x_fit, y=fit_result.fit_total, mode='lines',
+            line=dict(color='#2ca02c', width=2.0),
+            name='Total fit',
+            hovertemplate='fit = %{y:.4g}<extra></extra>',
+        ))
+        for vlim in (lo, hi):
+            xv = _x_at_v(vlim)
+            if np.isfinite(xv):
+                fig.add_vline(x=float(xv), line=dict(color='rgba(60,120,200,0.45)',
+                                                     width=1, dash='dot'))
+
+    if mark_lines and line_rows:
+        y_span = np.nanmax(y) - np.nanmin(y) if np.any(np.isfinite(y)) else 1.0
+        y0 = float(np.nanmin(y)) if np.any(np.isfinite(y)) else 0.0
+        y1 = y0 + (y_span if np.isfinite(y_span) and y_span > 0 else 1.0)
+        rest0 = cube.restfreq_ghz
+        for rec in line_rows[:16]:
+            if use_freq:
+                xmark = rec['obs_ghz']
+            elif rest0 is not None and np.isfinite(rest0):
+                xmark = lc.radio_velocity_kms(rec['obs_ghz'], rest0)
+            else:
+                continue
+            if not np.isfinite(xmark):
+                continue
+            label = f"{rec['species']} {rec['transition']}"
+            fig.add_trace(go.Scatter(
+                x=[xmark, xmark], y=[y0, y1],
+                mode='lines',
+                line=dict(color='rgba(99,102,241,0.55)', width=1, dash='dash'),
+                name=label,
+                hovertemplate=label + f"<br>ν₀ = {rec['rest_ghz']:.6f} GHz<extra></extra>",
+                showlegend=False,
+            ))
+
+    unit = cube.intensity_unit or 'K'
+    title = f'{cube.species_label}  ·  {spec_name}'
+    fig.update_layout(**{
+        **_base_layout(theme),
+        'height': _CV_SPEC_HEIGHT,
+        'title': dict(text=title, font=ps.title_font(t['title']),
+                      x=0.02, xanchor='left'),
+        'xaxis': dict(**{k: v for k, v in _axis_style(theme).items()
+                         if k not in ('exponentformat', 'showexponent')},
+                      title=dict(text=x_title, font=ps.axis_title_font()),
+                      type='linear', exponentformat='none', showexponent='none'),
+        'yaxis': dict(**_axis_style(theme),
+                      title=dict(text=f'T ({unit})', font=ps.axis_title_font()),
+                      type='linear'),
+        'showlegend': len([tr for tr in fig.data if tr.showlegend is not False]) > 1,
+        'uirevision': f'cv-spec|{cube.path}|{"freq" if use_freq else "vel"}',
+    })
+    if freq is not None and np.any(np.isfinite(freq)):
+        meas = dict(meas)
+        ipeak = int(np.nanargmax(y)) if np.any(np.isfinite(y)) else None
+        if ipeak is not None:
+            meas['nu_peak_ghz'] = float(freq[ipeak])
+        meas['nu_min_ghz'] = float(np.nanmin(freq))
+        meas['nu_max_ghz'] = float(np.nanmax(freq))
+    summary = _cube_stats_layout(cube, sky, meas, fit_result, lo, hi, spec_mode=mode)
+    if fit_error:
+        summary = html.Div([
+            html.Span(f'Fit failed: {fit_error}', style={'color': '#d62728'}),
+            summary,
+        ])
+    return fig, summary, line_table
+
+
+def _fmt_cv(val, unit='', decimals=3):
+    if val is None:
+        return '—'
+    try:
+        x = float(val)
+    except (TypeError, ValueError):
+        return '—'
+    if not np.isfinite(x):
+        return '—'
+    text = f'{x:.{decimals}g}'
+    return f'{text} {unit}'.strip()
+
+
+def _cube_stats_layout(cube, sky, meas, fit_result, v_low, v_high, spec_mode='pixel'):
+    """Small table of position + line measurements for the cube-viewer selection."""
+    cell = {'padding': '3px 10px', 'borderBottom': '1px solid #e2e8f0'}
+    left = {**cell, 'textAlign': 'left', 'color': '#64748b', 'whiteSpace': 'nowrap'}
+    right = {**cell, 'textAlign': 'right', 'fontVariantNumeric': 'tabular-nums'}
+
+    def row(label, value):
+        return html.Tr([html.Td(label, style=left), html.Td(value, style=right)])
+
+    n_pix = int((sky or {}).get('n_pixels') or 0)
+    mode = _cv_spec_mode(spec_mode)
+    if mode == 'mean':
+        kind = f'map mean ({n_pix} filled cells)'
+    elif n_pix <= 1:
+        kind = 'single pixel'
+    else:
+        kind = f'region mean ({n_pix} pixels)'
+    cal = 'T_mb' if cube.is_main_beam else 'T (CLASS)'
+    pos_rows = [
+        row('Selection', kind),
+        row('ΔRA, ΔDec',
+            f'{_fmt_cv((sky or {}).get("ra_off_arcmin"), "′")} , '
+            f'{_fmt_cv((sky or {}).get("dec_off_arcmin"), "′")}'),
+    ]
+    if mode != 'mean':
+        pos_rows.append(row(
+            'Grid cell (iy, ix)',
+            f'{(sky or {}).get("iy", "—")}, {(sky or {}).get("ix", "—")}'))
+    if mode != 'mean' and n_pix == 1 and (sky or {}).get('row_index') is not None:
+        pos_rows.append(row('Table row', str(sky['row_index'])))
+    if (sky or {}).get('ra_deg') is not None and (sky or {}).get('dec_deg') is not None:
+        pos_rows.append(row(
+            'RA, Dec (J2000)',
+            f'{sky["ra_deg"]:.5f}°, {sky["dec_deg"]:.5f}°'))
+    pos_rows.extend([
+        row('Object', cube.object_name or '—'),
+        row('Calibration', cal),
+        row('Line window', f'{v_low:g} … {v_high:g} km/s'),
+    ])
+    if cube.restfreq_ghz:
+        pos_rows.append(row('Rest frequency', f'{cube.restfreq_ghz:.6f} GHz'))
+    if meas.get('nu_min_ghz') is not None:
+        pos_rows.append(row(
+            'Frequency coverage',
+            f'{meas["nu_min_ghz"]:.5f} – {meas["nu_max_ghz"]:.5f} GHz'))
+
+    meas_rows = [
+        row('Peak T', _fmt_cv(meas.get('peak_k'), cube.intensity_unit)),
+        row('v (peak)', _fmt_cv(meas.get('v_peak_kms'), 'km/s')),
+        row('ν (peak)', _fmt_cv(meas.get('nu_peak_ghz'), 'GHz', decimals=6)),
+        row('Centroid v', _fmt_cv(meas.get('centroid_kms'), 'km/s')),
+        row('FWHM (half-max)', _fmt_cv(meas.get('fwhm_kms'), 'km/s')),
+        row('∫T dv', _fmt_cv(meas.get('integrated_k_kms'), 'K km/s')),
+        row('RMS (line-free)', _fmt_cv(meas.get('rms_k'), cube.intensity_unit)),
+        row('S/N (peak/RMS)', _fmt_cv(meas.get('snr'))),
+    ]
+
+    tables = html.Div([
+        html.Table(pos_rows, style={'borderCollapse': 'collapse', 'width': '100%'}),
+        html.Table(meas_rows, style={'borderCollapse': 'collapse', 'width': '100%',
+                                     'marginTop': '8px'}),
+    ], style={'display': 'grid', 'gridTemplateColumns': '1fr 1fr', 'gap': '12px'})
+
+    fit_block = html.Div()
+    if fit_result is not None:
+        fcell = {'padding': '4px 8px'}
+        fcenter = {**fcell, 'textAlign': 'center'}
+        head = html.Tr([
+            html.Th('Component', style={**fcell, 'textAlign': 'left'}),
+            html.Th('Peak (K)', style=fcenter),
+            html.Th('v₀ (km/s)', style=fcenter),
+            html.Th('FWHM (km/s)', style=fcenter),
+            html.Th('σ (km/s)', style=fcenter),
+            html.Th('∫I dv (K km/s)', style=fcenter),
+        ], style={'backgroundColor': '#eef2f7'})
+        grow = [head]
+        errs = fit_result.param_errors
+        for j in range(fit_result.n_components):
+            k = 3 * j
+            fwhm = float(fit_result.sigmas[j]) * cv.FWHM_SIGMA
+            fwhm_err = (float(errs[k + 2]) * cv.FWHM_SIGMA
+                        if errs.size > k + 2 else float('nan'))
+            grow.append(html.Tr([
+                html.Td(f'Gaussian {j + 1}', style=fcell),
+                html.Td(_obs_fit_val_err(fit_result.amplitudes[j], errs[k]),
+                        style=fcenter),
+                html.Td(_obs_fit_val_err(fit_result.centers[j], errs[k + 1]),
+                        style=fcenter),
+                html.Td(_obs_fit_val_err(fwhm, fwhm_err), style=fcenter),
+                html.Td(_obs_fit_val_err(fit_result.sigmas[j], errs[k + 2]),
+                        style=fcenter),
+                html.Td(f'{float(fit_result.integrated_intensity_per_component[j]):.4g}',
+                        style=fcenter),
+            ]))
+        tot = _obs_fit_val_err(
+            fit_result.integrated_intensity_total,
+            fit_result.integrated_intensity_total_error)
+        grow.append(html.Tr([
+            html.Td('Total ∫I dv', style={**fcell, 'fontWeight': '600'}),
+            html.Td(f'{tot} K km/s', colSpan=5,
+                    style={**fcenter, 'fontWeight': '600'}),
+        ], style={'backgroundColor': '#f0f8f0'}))
+        fit_block = html.Div([
+            html.P('Gaussian fit', style={'margin': '10px 0 4px', 'fontWeight': '600'}),
+            html.Table(grow, style={'borderCollapse': 'collapse', 'width': '100%'}),
+        ])
+
+    header = html.P([
+        html.B('Pixel measurements'), ' — ',
+        html.Code(os.path.basename(cube.path)),
+        html.Span(f'  ·  {cube.source_kind.replace("_", " ")}',
+                  style={'opacity': 0.7}),
+    ], style={'margin': '0 0 8px'})
+    return html.Div([header, tables, fit_block],
+                    style={'fontSize': '13px', 'lineHeight': '1.45'})
+
+
+def _line_id_table_layout(cube, freq_window, line_rows, error, v_source):
+    """Table of catalog lines that fall in the cube's frequency window."""
+    title = html.B('Possible lines in this window')
+    if cube is None:
+        return html.Div([
+            html.P(title, style={'margin': '0 0 6px'}),
+            html.P('Load a CLASS MATRIX or cube FITS file to list catalog lines '
+                   'that fall in its frequency coverage.',
+                   style={'margin': '0', 'opacity': 0.75}),
+        ], style={'fontSize': '13px'})
+    if freq_window is None:
+        return html.Div([
+            html.P([
+                title,
+                html.Span('  — no frequency axis in this file, so catalog '
+                          'matching is not available.', style={'opacity': 0.75}),
+            ], style={'margin': '0'}),
+        ], style={'fontSize': '13px'})
+
+    lo, hi = freq_window
+    try:
+        vsrc = float(v_source) if v_source is not None else 0.0
+    except (TypeError, ValueError):
+        vsrc = 0.0
+    width_mhz = (hi - lo) * 1000.0
+    species = getattr(cube, 'species_label', None) or ''
+    header = html.P([
+        title,
+        html.Span(
+            (f'  ·  {species}' if species else '')
+            + f'  ·  {lo:.5f} – {hi:.5f} GHz  ({width_mhz:.1f} MHz)'
+            + (f'  ·  source VLSR = {vsrc:g} km/s' if vsrc else ''),
+            style={'opacity': 0.75}),
+    ], style={'margin': '0 0 4px'})
+    blurb = html.P(
+        'Catalog matches in this cube’s frequency coverage — independent of '
+        'the selected pixel. Purple markers on the spectrum use the same list.',
+        style={'margin': '0 0 10px', 'opacity': 0.75, 'fontSize': '12px'})
+    if error:
+        return html.Div([header, blurb,
+                         html.Span(error, style={'color': '#d62728'})],
+                        style={'fontSize': '13px'})
+    if not line_rows:
+        return html.Div([
+            header, blurb,
+            html.P('No catalog lines in this window. A CLASS cube is typically '
+                   '~50 MHz wide, so you usually see the target line and any '
+                   'hyperfine components (e.g. N₂H⁺ 1–0). Try Splatalogue for a '
+                   'deeper CDMS/JPL search, or check the source VLSR.',
+                   style={'margin': '0', 'opacity': 0.8}),
+        ], style={'fontSize': '13px'})
+
+    rest0 = getattr(cube, 'restfreq_ghz', None)
+    show_v = rest0 is not None and np.isfinite(rest0) and rest0 > 0
+    cell = {'padding': '3px 8px', 'borderBottom': '1px solid #e2e8f0'}
+    center = {**cell, 'textAlign': 'center', 'fontVariantNumeric': 'tabular-nums'}
+    heads = [
+        html.Th('Species', style={**cell, 'textAlign': 'left'}),
+        html.Th('Transition', style={**cell, 'textAlign': 'left'}),
+        html.Th('ν₀ rest (GHz)', style=center),
+        html.Th('ν obs (GHz)', style=center),
+    ]
+    if show_v:
+        heads.append(html.Th('v (km/s)', style=center))
+    heads.append(html.Th('E_u (K)', style=center))
+    body = [html.Tr(heads, style={'backgroundColor': '#eef2f7'})]
+    for rec in line_rows:
+        eu = rec.get('eu_k')
+        eu_s = f'{eu:.1f}' if eu is not None and np.isfinite(eu) else '—'
+        cols = [
+            html.Td(rec.get('species') or '—', style=cell),
+            html.Td(rec.get('transition') or '—', style=cell),
+            html.Td(f'{rec["rest_ghz"]:.6f}', style=center),
+            html.Td(f'{rec["obs_ghz"]:.6f}', style=center),
+        ]
+        if show_v:
+            v_line = lc.radio_velocity_kms(rec['obs_ghz'], rest0)
+            cols.append(html.Td(
+                f'{v_line:.2f}' if np.isfinite(v_line) else '—', style=center))
+        cols.append(html.Td(eu_s, style=center))
+        body.append(html.Tr(cols))
+    note = html.P(
+        f'{len(line_rows)} line(s). Rest frequencies from the '
+        f'{line_rows[0].get("source", "local")} catalog; observed frequency uses '
+        'the radio definition ν = ν₀ (1 − v/c).'
+        + ('  v is LSR velocity of ν obs relative to the cube rest frequency.'
+           if show_v else ''),
+        style={'margin': '8px 0 0', 'opacity': 0.7, 'fontSize': '12px'})
+    return html.Div([
+        header, blurb,
+        html.Table(body, style={'borderCollapse': 'collapse', 'width': '100%'}),
+        note,
+    ], style={'fontSize': '13px', 'lineHeight': '1.4'})
 
 
 def fig_simline_pv(values, species, transition, pos_min, pos_max, zscale,
@@ -6926,6 +7530,15 @@ _GRAPH_CFG = {
         'hoverCompareCartesian', 'toggleSpikelines',
     ],
 }
+_CUBE_MAP_CFG = {
+    'toImageButtonOptions': {'format': 'png', 'scale': 2},
+    'displaylogo': False,
+    'scrollZoom': True,
+    'modeBarButtonsToRemove': [
+        'autoScale2d', 'hoverClosestCartesian',
+        'hoverCompareCartesian', 'toggleSpikelines',
+    ],
+}
 _SLICE_GRAPH_CFG = {**_GRAPH_CFG, 'responsive': False}
 _TAB_STYLE = {}
 _TAB_SEL = {}
@@ -6940,6 +7553,82 @@ _PANEL_ROW = {
 _INPUT_STYLE = {
     'padding': '8px 10px', 'fontSize': '13px',
 }
+
+
+def _n_gaussians(value):
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        n = 1
+    return max(1, min(6, n))
+
+
+def _lock_filled(value):
+    return 'on' in (value or [])
+
+
+def _gaussian_guess_rows(kind, n, amps=None, centers=None, fwhms=None):
+    """One Peak / v0 / FWHM row per Gaussian component (optional user values)."""
+    n = _n_gaussians(n)
+    amps = list(amps or [])
+    centers = list(centers or [])
+    fwhms = list(fwhms or [])
+    inp = {'width': '100%', 'fontSize': '13px'}
+
+    def _kept(seq, i):
+        if i < len(seq) and seq[i] not in (None, ''):
+            return seq[i]
+        return None
+
+    rows = []
+    for i in range(n):
+        rows.append(html.Div([
+            html.Div(f'G{i + 1}', style={
+                'fontWeight': '600', 'fontSize': '13px', 'minWidth': '36px',
+                'paddingTop': '22px',
+            }),
+            html.Div([
+                html.Label('Peak T (K)', style=_CTRL_LABEL),
+                dcc.Input(id={'type': f'{kind}-g-amp', 'index': i},
+                          type='number', value=_kept(amps, i),
+                          placeholder='auto', debounce=True, step=0.1,
+                          style=inp),
+            ], style={'flex': '1', 'minWidth': '110px', 'marginRight': '12px'}),
+            html.Div([
+                html.Label('v₀ (km/s)', style=_CTRL_LABEL),
+                dcc.Input(id={'type': f'{kind}-g-v0', 'index': i},
+                          type='number', value=_kept(centers, i),
+                          placeholder='auto', debounce=True, step=0.1,
+                          style=inp),
+            ], style={'flex': '1', 'minWidth': '110px', 'marginRight': '12px'}),
+            html.Div([
+                html.Label('FWHM (km/s)', style=_CTRL_LABEL),
+                dcc.Input(id={'type': f'{kind}-g-fwhm', 'index': i},
+                          type='number', value=_kept(fwhms, i),
+                          placeholder='auto', debounce=True, step=0.1,
+                          min=0, style=inp),
+            ], style={'flex': '1', 'minWidth': '110px'}),
+        ], style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
+                  'marginBottom': '8px'}))
+    return rows
+
+
+def _gaussian_guess_panel(kind, n=1):
+    return html.Div([
+        html.P('Optional Gaussian values — leave a field blank to auto-guess it. '
+               'Filled values are starting points for the fit. Enable lock to hold '
+               'filled values fixed (useful when a component is well known). Width '
+               'is FWHM, not σ.',
+               style={**_PAGE_INTRO, 'marginBottom': '8px'}),
+        dcc.Checklist(
+            id=f'{kind}-g-lock',
+            options=[{'label': ' Lock filled values (do not fit them)', 'value': 'on'}],
+            value=[],
+            style={'fontSize': '13px', 'marginBottom': '8px'},
+        ),
+        html.Div(id=f'{kind}-gauss-params',
+                 children=_gaussian_guess_rows(kind, n)),
+    ])
 
 
 def _advanced_details(summary, *children):
@@ -8288,10 +8977,21 @@ app.layout = html.Div(
             ]),
         ]),
 
-        # --- Page 7: SIMLINE spectra (PV FITS) --------------------------------
+        # --- Page 7: spectra (SimLine PV + CARTA-like cube viewer) ------------
         dcc.Tab(label='Spectra', value='spectra', style=_TAB_STYLE,
                 selected_style=_TAB_SEL, children=[
             html.Div(style={'paddingTop': '10px'}, children=[
+                html.P('SimLine position–velocity cubes, or a CARTA-style viewer for '
+                       'observational CLASS/GILDAS MATRIX tables and spectral image cubes: '
+                       'collapse the map, click a pixel (or box/lasso a region), and plot '
+                       'that spectrum.',
+                       style=_PAGE_INTRO),
+                dcc.Tabs(id='spectra-subtabs', value='sp-simline',
+                         style={'marginTop': '4px'},
+                         content_style={'paddingTop': '16px'}, children=[
+                    dcc.Tab(label='SimLine PV', value='sp-simline',
+                            style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
+                            children=[
                 html.P('Velocity-resolved spectra and position–velocity diagrams from SimLine '
                        'PV FITS cubes (brightness temperature or optical depth), with optional '
                        'observational CLASS MATRIX / cube FITS overlay and multi-Gaussian '
@@ -8403,6 +9103,7 @@ app.layout = html.Div(
                             ], value=['on'], style={'fontSize': '13px'}),
                         ], style={'flex': '1.4', 'minWidth': '200px'}),
                     ], style={'display': 'flex', 'alignItems': 'center', 'flexWrap': 'wrap'}),
+                    _gaussian_guess_panel('obs', 1),
                 ], className='kosma-panel',
                           style={'padding': '12px 18px', 'marginBottom': '12px'}),
                 dcc.Loading(id='loading-spectra', type='circle', children=[
@@ -8410,6 +9111,149 @@ app.layout = html.Div(
                               style={'marginBottom': '8px'}),
                     html.Div(id='sp-fit-summary', style={'padding': '0 18px 12px'}),
                     dcc.Graph(id='plot-sp-pv', figure=placeholder_fig(), config=_GRAPH_CFG),
+                ]),
+                    ]),
+                    dcc.Tab(label='Cube viewer', value='sp-cube',
+                            style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
+                            children=[
+                html.P('CARTA-like view of an observational spectral cube. CLASS/GILDAS '
+                       'MATRIX tables are gridded as-is; '
+                       'missing cells stay blank. Spectrum can be a clicked pixel, a '
+                       'box/lasso region average, or the mean of every filled cell on '
+                       'the map (same spatial-mean option as the SimLine observational '
+                       'overlay). LINE in the FITS header is ignored — the species label '
+                       'comes from the filename and RESTFREQ.',
+                       style=_PAGE_INTRO),
+                dcc.Store(id='cv-selection', data=None),
+                html.Div([
+                    html.Div([
+                        html.Label('FITS file or directory', style=_CTRL_LABEL),
+                        dcc.Input(id='cv-path', type='text', value='',
+                                  placeholder='/path/to/cube.fits or /path/to/IRAM/cube',
+                                  style={'width': '100%', 'fontSize': '13px'}),
+                    ], style={'flex': '2.4', 'minWidth': '260px', 'marginRight': '18px'}),
+                    html.Div([
+                        html.Label('Cube', style=_CTRL_LABEL),
+                        dcc.Dropdown(id='cv-file', options=[], value=None,
+                                     placeholder='Paste a path above\u2026',
+                                     style={'fontSize': '13px'}),
+                    ], style={'flex': '2.2', 'minWidth': '240px', 'marginRight': '18px'}),
+                    html.Div([
+                        html.Label('HDU', style=_CTRL_LABEL),
+                        dcc.Input(id='cv-hdu', type='number', value=1, min=0, step=1,
+                                  style={'width': '100%'}),
+                    ], style={'flex': '0.5', 'minWidth': '64px', 'marginRight': '18px'}),
+                    html.Div([
+                        html.Label('Map', style=_CTRL_LABEL),
+                        dcc.RadioItems(id='cv-map-metric', options=CUBE_MAP_METRIC_OPTIONS,
+                                       value=DEFAULT_CUBE_MAP_METRIC, **_RADIO),
+                    ], style={'flex': '1.4', 'minWidth': '200px', 'marginRight': '18px'}),
+                    html.Div([
+                        html.Label('Spectrum', style=_CTRL_LABEL),
+                        dcc.RadioItems(id='cv-spec-mode', options=CUBE_SPEC_MODE_OPTIONS,
+                                       value=DEFAULT_CUBE_SPEC_MODE, **_RADIO),
+                    ], style={'flex': '1.3', 'minWidth': '180px'}),
+                ], className='kosma-panel',
+                   style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
+                          'padding': '12px 18px', 'marginBottom': '12px'}),
+                html.Div([
+                    html.Div([
+                        html.Label('Line core low (km/s)', style=_CTRL_LABEL),
+                        dcc.Input(id='cv-v-low', type='number', value=DEFAULT_OBS_V_LOW,
+                                  step=0.5, style={'width': '100%'}),
+                    ], style={'flex': '1', 'minWidth': '120px', 'marginRight': '18px'}),
+                    html.Div([
+                        html.Label('Line core high (km/s)', style=_CTRL_LABEL),
+                        dcc.Input(id='cv-v-high', type='number', value=DEFAULT_OBS_V_HIGH,
+                                  step=0.5, style={'width': '100%'}),
+                    ], style={'flex': '1', 'minWidth': '120px', 'marginRight': '18px'}),
+                    html.Div([
+                        html.Label('Map Z scale', style=_CTRL_LABEL),
+                        dcc.RadioItems(id='cv-zscale', options=_SCALE_OPTIONS,
+                                       value='linear', **_SEG),
+                    ], style={**_CTRL_BOX, 'marginRight': '18px'}),
+                    html.Div([
+                        html.Label('Colormap', style=_CTRL_LABEL),
+                        dcc.Dropdown(id='cv-colorscale', options=GRID_COLORMAP_OPTIONS,
+                                     value=DEFAULT_GRID_COLORMAP,
+                                     style={'fontSize': '13px'}),
+                    ], style={'flex': '1', 'minWidth': '120px', 'marginRight': '18px'}),
+                    html.Div([
+                        html.Label('N Gaussians', style=_CTRL_LABEL),
+                        dcc.Input(id='cv-n-gauss', type='number', value=1, min=1,
+                                  max=6, step=1, style={'width': '100%'}),
+                    ], style={'flex': '0.7', 'minWidth': '80px', 'marginRight': '18px'}),
+                    html.Div([
+                        dcc.Checklist(id='cv-fit', options=[
+                            {'label': ' Fit Gaussians (+ continuum)', 'value': 'on'},
+                        ], value=['on'], style={'fontSize': '13px', 'marginTop': '22px'}),
+                    ], style={'flex': '1.4', 'minWidth': '200px'}),
+                ], className='kosma-panel',
+                   style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
+                          'padding': '12px 18px', 'marginBottom': '12px'}),
+                html.Div(_gaussian_guess_panel('cv', 1), className='kosma-panel',
+                         style={'padding': '12px 18px', 'marginBottom': '12px'}),
+                html.Div([
+                    html.Div([
+                        html.Label('Spectrum X axis', style=_CTRL_LABEL),
+                        dcc.RadioItems(id='cv-xaxis', options=CUBE_XAXIS_OPTIONS,
+                                       value='velocity', **_RADIO),
+                    ], style={'flex': '1.2', 'minWidth': '180px', 'marginRight': '18px'}),
+                    html.Div([
+                        html.Label('Line catalog', style=_CTRL_LABEL),
+                        dcc.Dropdown(id='cv-linecat', options=CUBE_LINECAT_OPTIONS,
+                                     value=DEFAULT_CUBE_LINECAT,
+                                     style={'fontSize': '13px'}),
+                    ], style={'flex': '1.4', 'minWidth': '200px', 'marginRight': '18px'}),
+                    html.Div([
+                        html.Label('Source VLSR (km/s)', style=_CTRL_LABEL),
+                        dcc.Input(id='cv-v-source', type='number', value=0.0,
+                                  step=0.5, style={'width': '100%'}),
+                    ], style={'flex': '0.9', 'minWidth': '110px', 'marginRight': '18px'}),
+                    html.Div([
+                        html.Label('E_u max (K)', style=_CTRL_LABEL),
+                        dcc.Input(id='cv-eu-max', type='number', value=150.0,
+                                  min=0, step=10, style={'width': '100%'}),
+                    ], style={'flex': '0.8', 'minWidth': '90px', 'marginRight': '18px'}),
+                    html.Div([
+                        dcc.Checklist(id='cv-mark-lines', options=[
+                            {'label': ' Mark lines on spectrum', 'value': 'on'},
+                        ], value=['on'], style={'fontSize': '13px', 'marginTop': '22px'}),
+                    ], style={'flex': '1.2', 'minWidth': '180px'}),
+                ], className='kosma-panel',
+                   style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
+                          'padding': '12px 18px', 'marginBottom': '12px'}),
+                dcc.Loading(id='loading-cube-viewer', type='circle', children=[
+                    html.Div([
+                        dcc.Graph(id='plot-cv-map', figure=placeholder_fig(
+                                      'Paste a CLASS MATRIX or cube FITS path'),
+                                  config=_CUBE_MAP_CFG,
+                                  style={'flex': '1', 'minWidth': '0',
+                                         'height': f'{_CV_COL_HEIGHT}px'}),
+                        html.Div([
+                            dcc.Graph(id='plot-cv-spectrum',
+                                      figure=placeholder_fig(
+                                          'Click a map pixel or select a region'),
+                                      config=_GRAPH_CFG,
+                                      style={'height': f'{_CV_SPEC_HEIGHT}px',
+                                             'flex': 'none'}),
+                            html.Div(id='cv-stats', className='kosma-panel',
+                                     style={'padding': '12px 16px',
+                                            'marginTop': '8px',
+                                            'flex': '1',
+                                            'minHeight': '0',
+                                            'overflowY': 'auto'}),
+                        ], style={'flex': '1', 'minWidth': '0',
+                                  'height': f'{_CV_COL_HEIGHT}px',
+                                  'display': 'flex',
+                                  'flexDirection': 'column'}),
+                    ], style={'display': 'flex', 'gap': '12px',
+                              'alignItems': 'stretch', 'flexWrap': 'wrap'}),
+                    html.Div(id='cv-line-table', className='kosma-panel',
+                             style={'padding': '14px 18px', 'marginTop': '12px',
+                                    'maxHeight': '420px', 'overflowY': 'auto'}),
+                ]),
+                    ]),
                 ]),
             ]),
         ]),
@@ -10605,6 +11449,17 @@ def update_sp_transition(*args_in):
 
 
 @app.callback(
+    Output('obs-gauss-params', 'children'),
+    Input('obs-n-gauss', 'value'),
+    State({'type': 'obs-g-amp', 'index': ALL}, 'value'),
+    State({'type': 'obs-g-v0', 'index': ALL}, 'value'),
+    State({'type': 'obs-g-fwhm', 'index': ALL}, 'value'),
+)
+def update_obs_gauss_rows(n, amps, centers, fwhms):
+    return _gaussian_guess_rows('obs', n, amps, centers, fwhms)
+
+
+@app.callback(
     Output('plot-sp-spectrum', 'figure'),
     Output('sp-fit-summary', 'children'),
     _slider_value_inputs
@@ -10621,6 +11476,10 @@ def update_sp_transition(*args_in):
        Input('obs-n-gauss', 'value'),
        Input('obs-overlay', 'value'),
        Input('obs-fit', 'value'),
+       Input({'type': 'obs-g-amp', 'index': ALL}, 'value'),
+       Input({'type': 'obs-g-v0', 'index': ALL}, 'value'),
+       Input({'type': 'obs-g-fwhm', 'index': ALL}, 'value'),
+       Input('obs-g-lock', 'value'),
        Input('simline-state', 'data'),
        Input('plot-theme', 'value')],
     prevent_initial_call=True,
@@ -10629,7 +11488,8 @@ def update_sp_spectrum(*args_in):
     values = list(args_in[:N_PARAMS])
     (species, transition, positions_text, pv_quantity, obs_path, obs_hdu, obs_row_mode,
      obs_row_index, obs_v_low, obs_v_high, obs_n_gauss,
-     obs_overlay, obs_fit, _state, plot_theme) = args_in[N_PARAMS:]
+     obs_overlay, obs_fit, gauss_amps, gauss_centers, gauss_fwhms, gauss_lock,
+     _state, plot_theme) = args_in[N_PARAMS:]
     fig, summary, _err = fig_spectra_plot(
         values, species, transition, positions_text,
         obs_path=obs_path, obs_hdu=obs_hdu, obs_row_mode=obs_row_mode or 'mean',
@@ -10639,6 +11499,8 @@ def update_sp_spectrum(*args_in):
         obs_fit='on' in (obs_fit or []),
         pv_quantity=pv_quantity or SIMLINE_DEFAULT_PV_QUANTITY,
         theme=_parse_plot_theme(plot_theme),
+        gauss_amps=gauss_amps, gauss_centers=gauss_centers, gauss_fwhms=gauss_fwhms,
+        gauss_lock=_lock_filled(gauss_lock),
     )
     return fig, summary if summary is not None else html.Div()
 
@@ -10669,6 +11531,164 @@ def update_sp_pv(*args_in):
         pv_quantity=pv_quantity or SIMLINE_DEFAULT_PV_QUANTITY,
         theme=_parse_plot_theme(plot_theme),
     )
+
+
+@app.callback(
+    Output('cv-file', 'options'),
+    Output('cv-file', 'value'),
+    Input('cv-path', 'value'),
+    State('cv-file', 'value'),
+)
+def update_cv_file_list(path, current):
+    opts = cv.list_cube_fits(path or '')
+    if not opts:
+        return [], None
+    values = {o['value'] for o in opts}
+    if current in values:
+        return opts, current
+    return opts, opts[0]['value']
+
+
+@app.callback(
+    Output('cv-hdu', 'value'),
+    Input('cv-file', 'value'),
+    prevent_initial_call=True,
+)
+def update_cv_hdu(path):
+    if not path or not os.path.isfile(os.path.expanduser(str(path))):
+        raise PreventUpdate
+    return cv.default_hdu_index(path)
+
+
+@app.callback(
+    Output('cv-selection', 'data'),
+    Input('cv-file', 'value'),
+    Input('cv-hdu', 'value'),
+    Input('plot-cv-map', 'clickData'),
+    Input('plot-cv-map', 'selectedData'),
+    State('cv-v-low', 'value'),
+    State('cv-v-high', 'value'),
+    State('cv-map-metric', 'value'),
+    prevent_initial_call=True,
+)
+def update_cv_selection(path, hdu, click_data, selected_data,
+                        v_low, v_high, metric):
+    trig = dash.callback_context.triggered[0]['prop_id'] if dash.callback_context.triggered else ''
+    cube, err = _load_cv_cube(path, hdu)
+    if cube is None:
+        return None
+
+    if trig.startswith('cv-file') or trig.startswith('cv-hdu'):
+        try:
+            lo, hi = _cv_velocity_window(v_low, v_high)
+            map2d = cv.collapse_map(cube, lo, hi, metric=metric or DEFAULT_CUBE_MAP_METRIC)
+            peak = cv.peak_cell(cube, map2d)
+        except Exception:
+            peak = None
+        if peak is None:
+            return None
+        iy, ix, row = peak
+        return {'kind': 'peak', 'rows': [row], 'iy': iy, 'ix': ix}
+
+    if trig.endswith('selectedData') and selected_data and selected_data.get('points'):
+        rows = cv.rows_from_selected_points(selected_data['points'], cube)
+        if not rows:
+            raise PreventUpdate
+        sky = cv.selection_sky(cube, rows)
+        return {
+            'kind': 'region' if len(rows) > 1 else 'pixel',
+            'rows': rows,
+            'iy': sky.get('iy'),
+            'ix': sky.get('ix'),
+        }
+
+    if trig.endswith('clickData') and click_data and click_data.get('points'):
+        parsed = cv.parse_click_point(click_data['points'][0], cube)
+        if parsed is None:
+            raise PreventUpdate
+        iy, ix, row = parsed
+        return {'kind': 'pixel', 'rows': [row], 'iy': iy, 'ix': ix}
+
+    raise PreventUpdate
+
+
+@app.callback(
+    Output('plot-cv-map', 'figure'),
+    Input('cv-file', 'value'),
+    Input('cv-hdu', 'value'),
+    Input('cv-map-metric', 'value'),
+    Input('cv-v-low', 'value'),
+    Input('cv-v-high', 'value'),
+    Input('cv-colorscale', 'value'),
+    Input('cv-zscale', 'value'),
+    Input('cv-selection', 'data'),
+    Input('cv-spec-mode', 'value'),
+    Input('plot-theme', 'value'),
+)
+def update_cv_map(path, hdu, metric, v_low, v_high, colorscale, zscale,
+                  selection, spec_mode, plot_theme):
+    return fig_cube_map(
+        path, hdu, metric, v_low, v_high,
+        _parse_grid_colorscale(colorscale), zscale or 'linear',
+        selection=selection, spec_mode=spec_mode or DEFAULT_CUBE_SPEC_MODE,
+        theme=_parse_plot_theme(plot_theme),
+    )
+
+
+@app.callback(
+    Output('cv-gauss-params', 'children'),
+    Input('cv-n-gauss', 'value'),
+    State({'type': 'cv-g-amp', 'index': ALL}, 'value'),
+    State({'type': 'cv-g-v0', 'index': ALL}, 'value'),
+    State({'type': 'cv-g-fwhm', 'index': ALL}, 'value'),
+)
+def update_cv_gauss_rows(n, amps, centers, fwhms):
+    return _gaussian_guess_rows('cv', n, amps, centers, fwhms)
+
+
+@app.callback(
+    Output('plot-cv-spectrum', 'figure'),
+    Output('cv-stats', 'children'),
+    Output('cv-line-table', 'children'),
+    Input('cv-file', 'value'),
+    Input('cv-hdu', 'value'),
+    Input('cv-selection', 'data'),
+    Input('cv-spec-mode', 'value'),
+    Input('cv-v-low', 'value'),
+    Input('cv-v-high', 'value'),
+    Input('cv-n-gauss', 'value'),
+    Input('cv-fit', 'value'),
+    Input({'type': 'cv-g-amp', 'index': ALL}, 'value'),
+    Input({'type': 'cv-g-v0', 'index': ALL}, 'value'),
+    Input({'type': 'cv-g-fwhm', 'index': ALL}, 'value'),
+    Input('cv-g-lock', 'value'),
+    Input('cv-xaxis', 'value'),
+    Input('cv-linecat', 'value'),
+    Input('cv-mark-lines', 'value'),
+    Input('cv-v-source', 'value'),
+    Input('cv-eu-max', 'value'),
+    Input('plot-theme', 'value'),
+)
+def update_cv_spectrum(path, hdu, selection, spec_mode, v_low, v_high, n_gauss, do_fit,
+                       gauss_amps, gauss_centers, gauss_fwhms, gauss_lock,
+                       xaxis, linecat, mark_lines, v_source, eu_max,
+                       plot_theme):
+    fig, summary, line_table = fig_cube_spectrum(
+        path, hdu, selection, v_low, v_high, n_gauss,
+        do_fit='on' in (do_fit or []),
+        theme=_parse_plot_theme(plot_theme),
+        gauss_amps=gauss_amps, gauss_centers=gauss_centers, gauss_fwhms=gauss_fwhms,
+        gauss_lock=_lock_filled(gauss_lock),
+        xaxis=xaxis or 'velocity',
+        line_catalog=linecat or DEFAULT_CUBE_LINECAT,
+        mark_lines='on' in (mark_lines or []),
+        v_source=v_source if v_source is not None else 0.0,
+        eu_max=eu_max if eu_max is not None else 150.0,
+        spec_mode=spec_mode or DEFAULT_CUBE_SPEC_MODE,
+    )
+    return (fig,
+            summary if summary is not None else html.Div(),
+            line_table if line_table is not None else html.Div())
 
 
 @app.callback(

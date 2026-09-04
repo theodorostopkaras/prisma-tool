@@ -199,7 +199,8 @@ grid slider selection.
 
 Point **FITS file path** at a CLASS/GILDAS MATRIX table (``hdu_index=1``,
 ``SPECTRUM`` column, velocity from ``VELO-LSR`` / ``DELTAV``) or a spectral
-image cube (``hdu_index=0``). Controls:
+image cube (``hdu_index=0``). Click **Browse** to pick the file in a system
+window, or paste a path. Controls:
 
 - **Spectrum selection** — spatial mean, peak-region average (bright half of
   moment-0), or a single row/pixel index
@@ -251,7 +252,10 @@ gridded here:
   keyword (often a leftover backend name such as ``HCN_LSB``).
 
 Point **FITS file or directory** at a single cube or a folder of CLASS exports
-(e.g. the DR21 IRAM ``grid15`` set). Implementation: ``cube_viewer.py``.
+(e.g. the DR21 IRAM ``grid15`` set), or a CASA image cube
+(``*.image.fits`` / ``*.pbcor.fits``, including 4-D cubes with a dummy Stokes
+axis). Click **Browse** and pick any FITS file in that folder (the folder path
+is filled in). Implementation: ``cube_viewer.py``.
 
 ## Interpolation error check
 
@@ -356,9 +360,10 @@ python -m pip install -r requirements.txt
 python app.py --dir /path/to/pdrgrid_hdf5
 ```
 
-Then open <http://127.0.0.1:8050>. You can also paste a directory path into the
-box at the top of the page and click **Load grid** (tick *recursive* to walk
-sub-folders).
+Then open <http://127.0.0.1:8050>. On the **Load** tab, click **Browse** to
+open a system file window and pick any model file in the grid folder (the
+folder path is filled in automatically), or paste a path and click
+**Load grid** (tick *recursive* to walk sub-folders).
 
 If you already had the tool installed, re-run the `pip install` line after
 pulling updates so new packages (in particular **astroquery**) are picked up.

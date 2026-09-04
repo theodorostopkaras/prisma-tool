@@ -380,10 +380,16 @@ def resample_grid_3d_kosens(
 
     x_log = _axis_log10(x_phys, x_logscale)
     y_log = _axis_log10(y_phys, y_logscale)
-    z_log = _axis_log10(z_phys, z_logscale)
+    z_phys = np.asarray(z_phys, dtype=float)
+    z_ok = z_phys[np.isfinite(z_phys) & (z_phys > 0)]
     final_x = interpolate_axis_logspace(x_log, tx)
     final_y = interpolate_axis_logspace(y_log, ty)
-    final_z = interpolate_axis_logspace(z_log, tz)
+    # KoSens ``process_grids_3d`` interpolates the stacked axis with logspace
+    # between min and max, not index interpolation of the native nodes.
+    if z_ok.size >= 2 and z_logscale:
+        final_z = np.logspace(np.log10(z_ok.min()), np.log10(z_ok.max()), tz)
+    else:
+        final_z = interpolate_axis_logspace(_axis_log10(z_phys, z_logscale), tz)
 
     if tz == grid.shape[0]:
         return grid, final_x, final_y, final_z
@@ -393,7 +399,7 @@ def resample_grid_3d_kosens(
         grid_out = np.full((tz, ny, nx), fill, dtype=float)
         return grid_out, final_x, final_y, final_z
 
-    log_z_orig = np.log10(np.maximum(np.asarray(z_phys, float), np.finfo(float).tiny))
+    log_z_orig = np.log10(np.maximum(z_phys, np.finfo(float).tiny))
     log_z_new = np.log10(final_z)
     y_coords = np.arange(ny) / max(ny - 1, 1)
     x_coords = np.arange(nx) / max(nx - 1, 1)
@@ -405,7 +411,7 @@ def resample_grid_3d_kosens(
         grid,
         method='linear',
         bounds_error=False,
-        fill_value=np.nan,
+        fill_value=None,
     )
     Z_new, Y_new, X_new = np.meshgrid(log_z_new, y_target, x_target, indexing='ij')
     points = np.stack([Z_new.ravel(), Y_new.ravel(), X_new.ravel()], axis=-1)

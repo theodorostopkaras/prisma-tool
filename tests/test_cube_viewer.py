@@ -283,6 +283,142 @@ def test_image_cube_roundtrip():
             loaded.frequency_ghz.size, loaded.velocity_kms.size)
 
 
+def test_channel_map_matches_spectrum_and_keeps_blanks():
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, 'dr21_hco+10_grid15.fits')
+        _sparse_otf_cube(path)
+        cube = cv.load_spectral_cube(path, hdu_index=1, use_cache=False)
+        i0 = cv.default_channel_index(cube)
+        assert 0 <= i0 < cube.nchan
+        assert abs(cube.velocity_kms[i0]) == np.nanmin(np.abs(cube.velocity_kms))
+        plane = cv.channel_map(cube, i0)
+        assert plane.shape == (cube.ny, cube.nx)
+        assert np.isnan(plane[2, 2])
+        assert np.isfinite(plane).sum() == 8
+        iy, ix, row = cv.peak_cell(cube, plane)
+        _, y = cv.extract_spectrum(cube, [row])
+        np.testing.assert_allclose(plane[iy, ix], y[i0])
+        assert cv.clamp_channel(cube, -4) == 0
+        assert cv.clamp_channel(cube, 10_000) == cube.nchan - 1
+        label = cv.channel_label(cube, i0)
+        assert f'{i0 + 1}/{cube.nchan}' in label
+        assert 'km/s' in label
+
+
+def test_ppv_volume_is_downsampled_and_finite():
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, 'dr21_hco+10_grid15.fits')
+        _sparse_otf_cube(path)
+        cube = cv.load_spectral_cube(path, hdu_index=1, use_cache=False)
+        arr = cv.ppv_volume_arrays(cube, max_side=2)
+        vol = arr['intensity']
+        assert vol.ndim == 3
+        assert vol.shape[0] <= 2 and vol.shape[1] <= 2 and vol.shape[2] <= 2
+        assert vol.shape == (arr['dec_arcmin'].size, arr['ra_arcmin'].size,
+                             arr['velocity_kms'].size)
+        assert np.isfinite(vol).any()
+        assert arr['isomax'] >= arr['isomin']
+        # Missing OTF corner stays NaN in the native grid; downsampled cells
+        # that still land on filled rows remain finite.
+        full = cv.ppv_volume_arrays(cube, max_side=max(cube.ny, cube.nx, cube.nchan))
+        assert full['intensity'].shape == (cube.ny, cube.nx, cube.nchan)
+        assert np.isnan(full['intensity'][2, 2]).all()
+
+
+def _write_casa_image_cube(path, *, with_beams=True, restfrq=True, use_cd=False):
+    """Small CASA-like 4-D cube: STOKES × FREQ × Dec × RA, optional BEAMS table."""
+    nchan, ny, nx = 9, 4, 5
+    rest_hz = 39.68e9
+    nu0 = 38.986e9
+    dnu = 6.0e6
+    v = osf.radio_velocity_kms_from_frequency_ghz(
+        (nu0 + dnu * np.arange(nchan)) / 1e9, rest_hz / 1e9)
+    cube = np.zeros((1, nchan, ny, nx), dtype=np.float32)
+    cube[0, :, 1, 2] = 3.0 * np.exp(-0.5 * ((v - v[nchan // 2]) / 2.0) ** 2)
+    hdu = fits.PrimaryHDU(cube)
+    h = hdu.header
+    h['OBJECT'] = 'HELMS1'
+    h['BUNIT'] = 'Jy/beam'
+    h['ORIGIN'] = 'CASA 6.2.1'
+    h['CTYPE1'] = 'RA---SIN'
+    h['CTYPE2'] = 'DEC--SIN'
+    h['CTYPE3'] = 'FREQ'
+    h['CTYPE4'] = 'STOKES'
+    h['CUNIT1'] = 'deg'
+    h['CUNIT2'] = 'deg'
+    h['CUNIT3'] = 'Hz'
+    h['CUNIT4'] = ''
+    h['CRPIX1'] = 3.0
+    h['CRPIX2'] = 2.0
+    h['CRPIX3'] = 1.0
+    h['CRPIX4'] = 1.0
+    h['CRVAL1'] = 353.67
+    h['CRVAL2'] = -6.87
+    h['CRVAL3'] = nu0
+    h['CRVAL4'] = 1.0
+    h['PC1_1'] = 1.0
+    h['PC2_2'] = 1.0
+    h['PC3_3'] = 1.0
+    if use_cd:
+        h['CD1_1'] = -8.333e-5
+        h['CD2_2'] = 8.333e-5
+        h['CD3_3'] = dnu
+        h['CD4_4'] = 1.0
+    else:
+        h['CDELT1'] = -8.333e-5
+        h['CDELT2'] = 8.333e-5
+        h['CDELT3'] = dnu
+        h['CDELT4'] = 1.0
+    h['SPECSYS'] = 'LSRK'
+    if restfrq:
+        h['RESTFRQ'] = rest_hz
+    hdus = [hdu]
+    if with_beams:
+        cols = [
+            fits.Column(name='BMAJ', format='1E', array=np.full(nchan, 0.01, dtype=np.float32)),
+            fits.Column(name='BMIN', format='1E', array=np.full(nchan, 0.008, dtype=np.float32)),
+            fits.Column(name='BPA', format='1E', array=np.zeros(nchan, dtype=np.float32)),
+            fits.Column(name='CHAN', format='1J', array=np.arange(nchan, dtype=np.int32)),
+            fits.Column(name='POL', format='1J', array=np.zeros(nchan, dtype=np.int32)),
+        ]
+        hdus.append(fits.BinTableHDU.from_columns(cols, name='BEAMS'))
+    fits.HDUList(hdus).writeto(path, overwrite=True)
+    return v
+
+
+def test_casa_4d_cube_skips_beams_table():
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, 'helms01_usb_contsub_dirtycube.image.pbcor.fits')
+        v_exp = _write_casa_image_cube(path, with_beams=True)
+        assert cv.default_hdu_index(path) == 0
+        loaded = cv.load_spectral_cube(path, hdu_index=1, use_cache=False)
+        assert loaded.source_kind == 'image_cube'
+        assert loaded.hdu_index == 0
+        assert loaded.ny == 4 and loaded.nx == 5
+        assert loaded.nchan == 9
+        assert loaded.intensity_unit.lower().startswith('jy')
+        np.testing.assert_allclose(loaded.velocity_kms, v_exp, rtol=1e-5)
+        mom = cv.collapse_map(loaded, float(np.min(v_exp)), float(np.max(v_exp)),
+                              metric='peak')
+        iy, ix, row = cv.peak_cell(loaded, mom)
+        assert (iy, ix) == (1, 2)
+        _v, y = cv.extract_spectrum(loaded, [row])
+        np.testing.assert_allclose(y.max(), 3.0, rtol=1e-5)
+        assert loaded.freq_ghz is not None
+        assert loaded.restfreq_ghz == 39.68
+
+
+def test_casa_cube_cd_matrix_without_cdelt_or_restfrq():
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, 'casa_cd.fits')
+        _write_casa_image_cube(path, with_beams=False, restfrq=False, use_cd=True)
+        loaded = cv.load_spectral_cube(path, hdu_index=0, use_cache=False)
+        assert loaded.source_kind == 'image_cube'
+        assert loaded.nchan == 9
+        assert np.all(np.isfinite(loaded.velocity_kms))
+        np.testing.assert_allclose(loaded.velocity_kms[0], 0.0, atol=1e-3)
+
+
 def test_hco_window_finds_hco_plus():
     rows = lc.lines_in_window(89.165, 89.212, v_source_kms=0.0)
     names = {r['species'] for r in rows}
@@ -381,6 +517,10 @@ if __name__ == '__main__':
     test_list_cube_fits_directory()
     test_sky_coordinates_use_map_centre()
     test_image_cube_roundtrip()
+    test_channel_map_matches_spectrum_and_keeps_blanks()
+    test_ppv_volume_is_downsampled_and_finite()
+    test_casa_4d_cube_skips_beams_table()
+    test_casa_cube_cd_matrix_without_cdelt_or_restfrq()
     test_hco_window_finds_hco_plus()
     test_n2hp_window_finds_hyperfine()
     test_source_velocity_shifts_observed_frequency()

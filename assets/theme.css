@@ -691,10 +691,31 @@ body:has(#app-root.theme-dark) {
   flex-wrap: wrap;
 }
 
+.load-card-row .btn {
+  flex-shrink: 0;
+}
+
 .load-card-row .kosma-input,
 .load-card-row input[type="text"] {
   flex: 1;
   min-width: 180px;
+}
+
+.path-browse-row {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  width: 100%;
+}
+
+.path-browse-row .kosma-input,
+.path-browse-row input[type="text"] {
+  flex: 1;
+  min-width: 0;
+}
+
+.path-browse-row .btn {
+  flex-shrink: 0;
 }
 
 .load-status {
@@ -1152,4 +1173,143 @@ body:has(#app-root) [class$="-MenuList"] {
 
 #app-root.theme-dark #export-format-selector label {
   color: #c8d0dc;
+}
+
+/* ---- Probe ranking ---- */
+.probe-info {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  padding: 12px 16px 14px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.probe-math {
+  display: grid;
+  gap: 6px 16px;
+  grid-template-columns: minmax(16rem, 1.2fr) minmax(10rem, 1fr);
+  align-items: baseline;
+}
+
+.probe-eq {
+  font-family: ui-monospace, 'IBM Plex Mono', Menlo, monospace;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-heading);
+}
+
+.probe-table-wrap {
+  overflow-x: auto;
+  max-height: 420px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.probe-table-wrap table {
+  width: 100%;
+  margin: 0;
+}
+
+.probe-progress {
+  margin: 0 4px 16px;
+  max-width: 640px;
+}
+
+.probe-progress-track {
+  height: 8px;
+  background: var(--border);
+  border-radius: 99px;
+  overflow: hidden;
+}
+
+.probe-progress-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  border-radius: 99px;
+  transition: width 0.25s ease;
+}
+
+.probe-progress-label {
+  font-size: 12px;
+  margin-top: 6px;
+}
+
+.probe-empty-note:empty {
+  display: none;
+}
+
+.probe-empty-note {
+  font-size: 13px;
+  line-height: 1.45;
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  border-left: 3px solid var(--accent);
+  background: var(--card);
+}
+
+.probe-math-label,
+.probe-math-label p {
+  margin: 0 0 5px 0;
+  font-weight: 600;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.probe-math-label p {
+  margin: 0;
+}
+
+.probe-math-label mjx-container {
+  display: inline !important;
+}
+
+.probe-heatmap-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px 18px;
+  align-items: start;
+}
+
+.probe-heatmap-card {
+  min-width: 0;
+}
+
+.probe-heatmap-name {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 13px;
+  line-height: 1.2;
+  min-height: 34px;
+  padding: 6px 10px;
+  margin: 0 0 8px;
+  text-align: center;
+  color: var(--text-heading);
+  background: var(--seg-bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-sizing: border-box;
+}
+
+.probe-heatmap-card .probe-empty-note {
+  font-size: 12px;
+  margin: 0 0 8px;
+  padding: 6px 8px;
+}
+
+.probe-heatmap-card .js-plotly-plot,
+.probe-heatmap-card .dash-graph {
+  width: 100% !important;
+}
+
+@media (max-width: 720px) {
+  .probe-heatmap-grid {
+    grid-template-columns: 1fr;
+  }
 }

@@ -40,19 +40,53 @@ def velocity_axis_lsr_kms(header, nchan=None):
     return v_ref + (j - crpix) * (deltav_m_s * 1.0e-3)
 
 
-def _header_channel_axis_values(header, axis_index):
-    naxis = int(header[f'NAXIS{axis_index}'])
-    j = np.arange(1, naxis + 1, dtype=float)
-    crpix = float(header.get(f'CRPIX{axis_index}', 1.0))
-    crval = float(header[f'CRVAL{axis_index}'])
-    cdelt = float(header[f'CDELT{axis_index}'])
+def _axis_increment(header, axis_index):
+    """Pixel step for FITS axis ``axis_index`` (CDELT, else CD_ii / PC_ii)."""
+    def _finite(key):
+        if key not in header:
+            return None
+        try:
+            val = float(header[key])
+        except (TypeError, ValueError):
+            return None
+        if np.isfinite(val) and val != 0.0:
+            return val
+        return None
+
+    cdelt = _finite(f'CDELT{axis_index}')
+    if cdelt is not None:
+        return cdelt
+    cd = _finite(f'CD{axis_index}_{axis_index}')
+    if cd is not None:
+        return cd
+    pc = _finite(f'PC{axis_index}_{axis_index}')
+    if pc is not None:
+        scale = _finite(f'CDELT{axis_index}')
+        return pc if scale is None else pc * scale
+    raise KeyError(
+        f'no CDELT{axis_index} / CD{axis_index}_{axis_index} increment in header')
+
+
+def _header_channel_axis_values(header, axis_index, n=None):
+    if n is None:
+        n = int(header.get(f'NAXIS{axis_index}', 0) or 0)
+    n = int(n)
+    if n < 1:
+        raise ValueError(f'NAXIS{axis_index} is missing or < 1')
+    j = np.arange(1, n + 1, dtype=float)
+    crpix = float(header.get(f'CRPIX{axis_index}', 1.0) or 1.0)
+    crval = float(header.get(f'CRVAL{axis_index}', 0.0) or 0.0)
+    cdelt = _axis_increment(header, axis_index)
     return crval + (j - crpix) * cdelt
 
 
 def radio_velocity_kms_from_frequency_ghz(observed_freq_ghz, rest_freq_ghz):
+    """Radio convention: ``v = c (ν0 − ν) / ν0`` (LSRK as in CASA / CARTA)."""
     nu = np.asarray(observed_freq_ghz, dtype=float)
     nu0 = float(rest_freq_ghz)
-    return _C_LIGHT_KMS * (nu - nu0) / nu0
+    if not np.isfinite(nu0) or nu0 == 0.0:
+        return np.full(nu.shape, np.nan, dtype=float)
+    return _C_LIGHT_KMS * (nu0 - nu) / nu0
 
 
 def rest_frequency_hz_from_header(header):
@@ -68,49 +102,152 @@ def rest_frequency_hz_from_header(header):
     return None
 
 
-def _spectral_axis_from_header_kms(header):
-    naxis = int(header.get('NAXIS', 0))
+_SPECTRAL_CTYPE_TAGS = ('VRAD', 'VELO', 'VOPT', 'FELO', 'FREQ', 'WAVE', 'AWAV')
+_SPATIAL_CTYPE_TAGS = ('RA', 'DEC', 'GLON', 'GLAT', 'ELON', 'ELAT', 'OFFSET')
+
+
+def _ctype_is_spectral(ctype):
+    c = str(ctype or '').strip().upper()
+    return any(tag in c for tag in _SPECTRAL_CTYPE_TAGS)
+
+
+def _ctype_is_stokes(ctype):
+    return 'STOKES' in str(ctype or '').strip().upper()
+
+
+def _ctype_is_spatial(ctype):
+    c = str(ctype or '').strip().upper()
+    return any(tag in c for tag in _SPATIAL_CTYPE_TAGS) or c.startswith('LAT') or c.startswith('LON')
+
+
+def _axis_values_to_hz(axis_vals, cunit, ctype=''):
+    """Convert a FREQ (or WAVE) world-coordinate array to Hz."""
+    u = str(cunit or '').strip().lower().replace(' ', '')
+    vals = np.asarray(axis_vals, dtype=float)
+    ctype_u = str(ctype or '').upper()
+    if 'WAVE' in ctype_u or 'AWAV' in ctype_u:
+        # wavelength → frequency; default metres if unit missing
+        if u in ('angstrom', 'angstroms', 'a'):
+            lam_m = vals * 1.0e-10
+        elif u in ('nm', 'nanometer', 'nanometre'):
+            lam_m = vals * 1.0e-9
+        elif u in ('um', 'micron', 'micrometre', 'micrometer'):
+            lam_m = vals * 1.0e-6
+        elif u in ('mm',):
+            lam_m = vals * 1.0e-3
+        elif u in ('cm',):
+            lam_m = vals * 1.0e-2
+        else:
+            lam_m = vals
+        with np.errstate(divide='ignore', invalid='ignore'):
+            return _C_LIGHT_KMS * 1.0e3 / lam_m
+    if 'ghz' in u:
+        return vals * 1.0e9
+    if 'mhz' in u:
+        return vals * 1.0e6
+    if 'khz' in u:
+        return vals * 1.0e3
+    if u in ('hz', 'hzs') or u.endswith('hz') and 'ghz' not in u:
+        return vals
+    med = float(np.nanmedian(np.abs(vals))) if vals.size else 0.0
+    if med > 1.0e6:
+        return vals
+    if med > 1.0e3:
+        return vals * 1.0e6
+    return vals * 1.0e9
+
+
+def _find_spectral_axis(header):
+    naxis = int(header.get('NAXIS', 0) or 0)
     if naxis < 1:
         raise ValueError('header has no FITS axes (NAXIS < 1)')
-
-    candidates = []
+    spectral = []
+    fallback = []
     for ax in range(1, naxis + 1):
         ctype = str(header.get(f'CTYPE{ax}', '')).strip().upper()
-        if any(tag in ctype for tag in ('VRAD', 'VELO', 'VOPT', 'FELO', 'FREQ')):
-            candidates.append((ax, ctype))
-    if not candidates:
-        raise KeyError('could not identify a spectral axis from CTYPE* keywords')
+        n = int(header.get(f'NAXIS{ax}', 0) or 0)
+        if _ctype_is_stokes(ctype):
+            continue
+        if _ctype_is_spectral(ctype):
+            spectral.append((ax, ctype, n))
+        elif n > 1 and not _ctype_is_spatial(ctype):
+            fallback.append((ax, ctype, n))
+    if spectral:
+        spectral.sort(key=lambda t: (0 if any(x in t[1] for x in ('FREQ', 'VRAD', 'VELO')) else 1, t[0]))
+        return spectral[0][0], spectral[0][1]
+    if fallback:
+        fallback.sort(key=lambda t: -t[2])
+        return fallback[0][0], fallback[0][1]
+    raise KeyError('could not identify a spectral axis from CTYPE* / NAXIS* keywords')
 
-    spectral_axis, ctype = candidates[0]
-    axis_vals = _header_channel_axis_values(header, spectral_axis)
+
+def _spectral_axis_from_header_kms(header, nchan=None):
+    """Return ``(fits_axis_1based, velocity_kms)`` for an image cube."""
+    spectral_axis, ctype = _find_spectral_axis(header)
+    axis_vals = _header_channel_axis_values(header, spectral_axis, n=nchan)
     cunit = str(header.get(f'CUNIT{spectral_axis}', '')).strip().lower()
 
-    if 'freq' in ctype:
+    if 'freq' in ctype.lower() or 'wave' in ctype.lower() or 'awav' in ctype.lower():
+        freq_hz = _axis_values_to_hz(axis_vals, cunit, ctype)
         rest_hz = rest_frequency_hz_from_header(header)
-        if rest_hz is None:
+        if rest_hz is None or not np.isfinite(rest_hz) or rest_hz <= 0:
+            crval = float(header.get(f'CRVAL{spectral_axis}', np.nan) or np.nan)
+            rest_hz = float(_axis_values_to_hz([crval], cunit, ctype)[0])
+            if not np.isfinite(rest_hz) or rest_hz <= 0:
+                rest_hz = float(np.nanmedian(freq_hz))
+        if not np.isfinite(rest_hz) or rest_hz <= 0:
             raise ValueError(
-                'frequency spectral axis requires RESTFREQ / RESTFRQ / LINEFREQ / FREQ0')
-        if 'ghz' in cunit:
-            obs_ghz = axis_vals
-        elif 'mhz' in cunit:
-            obs_ghz = axis_vals / 1.0e3
-        elif 'khz' in cunit:
-            obs_ghz = axis_vals / 1.0e6
-        else:
-            obs_ghz = axis_vals / 1.0e9
+                'frequency spectral axis needs RESTFREQ / RESTFRQ / LINEFREQ / FREQ0 '
+                '(or a usable CRVAL on the frequency axis)')
         velocity_kms = radio_velocity_kms_from_frequency_ghz(
-            obs_ghz, rest_hz / 1.0e9)
+            freq_hz / 1.0e9, rest_hz / 1.0e9)
     else:
-        if 'km/s' in cunit or 'km s-1' in cunit:
+        if 'km/s' in cunit or 'km s-1' in cunit or 'km s^-1' in cunit:
             velocity_kms = axis_vals
         else:
             velocity_kms = axis_vals * 1.0e-3
     return spectral_axis, np.asarray(velocity_kms, dtype=float)
 
 
+def frequency_ghz_from_header(header, nchan=None):
+    """Observed frequency axis (GHz) if the spectral WCS is frequency-like."""
+    try:
+        spectral_axis, ctype = _find_spectral_axis(header)
+    except (KeyError, ValueError):
+        return None
+    if 'freq' not in ctype.lower() and 'wave' not in ctype.lower() and 'awav' not in ctype.lower():
+        rest_hz = rest_frequency_hz_from_header(header)
+        if rest_hz is None:
+            return None
+        _, v = _spectral_axis_from_header_kms(header, nchan=nchan)
+        return rest_hz / 1.0e9 * (1.0 - np.asarray(v, dtype=float) / _C_LIGHT_KMS)
+    axis_vals = _header_channel_axis_values(header, spectral_axis, n=nchan)
+    cunit = str(header.get(f'CUNIT{spectral_axis}', '')).strip().lower()
+    return _axis_values_to_hz(axis_vals, cunit, ctype) / 1.0e9
+
+
 # ---------------------------------------------------------------------------
 # Cube / table loading
 # ---------------------------------------------------------------------------
+
+def squeeze_dummy_fits_axes(data, header):
+    """Drop size-1 STOKES / dummy FITS axes (CASA cubes are often 4-D)."""
+    data = np.asarray(data)
+    naxis = int(header.get('NAXIS', data.ndim) or data.ndim)
+    drop_np = []
+    for ax in range(1, naxis + 1):
+        np_ax = data.ndim - ax
+        if np_ax < 0 or np_ax >= data.ndim:
+            continue
+        n = int(data.shape[np_ax])
+        ctype = str(header.get(f'CTYPE{ax}', '') or '')
+        if n > 1 or _ctype_is_spectral(ctype):
+            continue
+        drop_np.append(np_ax)
+    if drop_np:
+        data = np.squeeze(data, axis=tuple(sorted(set(drop_np))))
+    return data
+
 
 def _reshape_cube_to_spectra(cube_data, spectral_axis_1based):
     data = np.asarray(cube_data, dtype=float)
@@ -306,7 +443,7 @@ def load_spectra_from_fits(file, hdu_index=1, spectrum_column='SPECTRUM',
                 spectra = spectra.reshape(1, -1)
         else:
             spectral_axis, v = _spectral_axis_from_header_kms(h)
-            cube_data = np.asarray(data, dtype=float)
+            cube_data = squeeze_dummy_fits_axes(np.asarray(data, dtype=float), h)
             spectra = _reshape_cube_to_spectra(cube_data, spectral_axis)
 
     if spectra.shape[-1] != v.size:

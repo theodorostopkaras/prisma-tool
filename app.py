@@ -44,6 +44,10 @@ import argparse
 import os
 import glob
 import re
+import shutil
+import subprocess
+import sys
+import threading
 
 import numpy as np
 import h5py
@@ -81,6 +85,7 @@ import rgb_phase
 import chem_network
 import plot_style as ps
 import map_fit_extras as mfe
+import probe_ranking as pr
 
 
 # --- CLI ----------------------------------------------------------------------
@@ -96,6 +101,7 @@ DEFAULT_CUBE_MAP_METRIC = 'moment0'
 CUBE_MAP_METRIC_OPTIONS = [
     {'label': ' Moment-0  ∫T dv  (K km/s)', 'value': 'moment0'},
     {'label': ' Peak T  (K)', 'value': 'peak'},
+    {'label': ' Channel  (one spectral plane)', 'value': 'channel'},
 ]
 CUBE_SPEC_MODE_OPTIONS = [
     {'label': ' Pixel / region', 'value': 'pixel'},
@@ -113,6 +119,7 @@ CUBE_LINECAT_OPTIONS = [
 DEFAULT_CUBE_LINECAT = 'local'
 _CV_SPEC_HEIGHT = 360
 _CV_COL_HEIGHT = 688  # spectrum + gap + measurements; map column matches this
+_CV_PPV_HEIGHT = 540
 DEFAULT_DIR = ''
 
 
@@ -404,6 +411,29 @@ COLORS = [
 ]
 
 DEFAULT_CUSTOM = ['HCO+', 'N2H+', 'O']
+PROBE_TYPICAL_SPECIES = (
+    'C+', 'C', 'CO', '13CO', 'C18O', 'HCO+', 'HCN', 'CN', 'N2H+',
+    'OH', 'H2O', 'CH', 'CH+', 'O', 'e-', 'H', 'H2',
+)
+PROBE_QUANTITY_OPTIONS = [
+    {'label': ' Clump-integrated X', 'value': 'rel_abund'},
+    {'label': ' Column density N', 'value': 'column_density'},
+    {'label': ' Line intensity', 'value': 'intensity'},
+]
+PROBE_FILTER_OPTIONS = [
+    {'label': html.Span('species', className='seg-opt'), 'value': 'species'},
+    {'label': html.Span('ratios', className='seg-opt'), 'value': 'ratios'},
+    {'label': html.Span('both', className='seg-opt'), 'value': 'both'},
+]
+PROBE_COLOR_OPTIONS = [
+    {'label': ' Relative quartile (this environment)', 'value': 'quartile'},
+    {'label': ' Absolute score band', 'value': 'absolute'},
+]
+PROBE_METRIC_OPTIONS = [
+    {'label': ' Probe score S', 'value': 'probe_score'},
+    {'label': ' Functional factor F', 'value': 'functional_factor'},
+    {'label': ' Variation factor V', 'value': 'variation_factor'},
+]
 
 _MAP_FIT_MAPS_EXAMPLE = (
     '{\n'
@@ -432,6 +462,16 @@ _chem_overlay = {}    # optional overlay chemistry grid (comparison)
 _simline = {}         # optional SIMLINE (.smli) intensity grid
 _simline_overlay = {} # optional attenuated SIMLINE grid (intensity comparison)
 _fit_results = {}     # last map-fit output (parameter maps + paths)
+_probe_results = {}   # last CRIR probe-ranking output (tables + 3-D cubes)
+_probe_job_lock = threading.Lock()
+_probe_progress = {
+    'running': False,
+    'frac': 0.0,
+    'message': '',
+    'error': None,
+    'token': 0,
+    'seen_token': 0,
+}
 _model_config_summary = None  # scan of Models/**/config_files/*.json
 _field_map = {}       # field_key -> (hdf5_path, column_index)
 _profile_cache = {}   # filepath -> dict of profile arrays
@@ -995,7 +1035,7 @@ def scan_directory(directory, recursive=False):
     """Scan ``directory`` for per-model HDF5 files and build the main grid."""
     global _grid, _field_map, _profile_cache
     global _heat_components, _cool_components, _cr_heat_idx
-    global _model_config_summary
+    global _model_config_summary, _probe_results
 
     source, files, axis_tokens, skipped, n_from_hdf5, phys_by_path = _scan_files(
         directory, recursive)
@@ -1006,6 +1046,7 @@ def scan_directory(directory, recursive=False):
     _scalar_cache = {}
     _heatcool_crir_cache.clear()
     _col_dens_profile_cache.clear()
+    _probe_results = {}
     _field_map = field_map
     _heat_components = heat_comp
     _cool_components = cool_comp
@@ -1566,6 +1607,7 @@ def clear_main_grid():
     """Clear the main HDF5 / virtual grid and related caches."""
     global _grid, _field_map, _profile_cache, _scalar_cache, _SLICE_PLANES_ACTIVE
     global _heat_components, _cool_components, _cr_heat_idx, _model_config_summary
+    global _probe_results
     _grid = {}
     _field_map = {}
     _profile_cache = {}
@@ -1575,6 +1617,7 @@ def clear_main_grid():
     _cr_heat_idx = None
     _model_config_summary = None
     _SLICE_PLANES_ACTIVE = None
+    _probe_results = {}
 
 
 def _simline_sample_path(tok_tuple):
@@ -3833,6 +3876,345 @@ def _token_list_from_sliders(slider_values):
     return [_middle_token(p['key']) for p in PARAM_DEFS]
 
 
+def _probe_axis_tokens(key):
+    toks = list((_grid.get('axis_tokens') or {}).get(key) or [])
+    if toks:
+        return toks
+    return [_middle_token(key)] if _grid else []
+
+
+def _sort_probe_axis(phys, logscale):
+    phys = np.asarray(phys, dtype=float)
+    if logscale:
+        order = np.argsort(np.log10(np.maximum(phys, np.finfo(float).tiny)))
+    else:
+        order = np.argsort(phys)
+    return phys[order], order
+
+
+def _probe_full_tokens(base_tokens, *, density=None, fuv=None, crir=None):
+    tokens = list(base_tokens)
+    if density is not None:
+        tokens[_PARAM_IDX['density']] = density
+    if fuv is not None:
+        tokens[_PARAM_IDX['fuv']] = fuv
+    if crir is not None:
+        tokens[_PARAM_IDX['crir']] = crir
+    return tuple(tokens)
+
+
+def _build_probe_index(slider_values):
+    """Native (nz, ny, nx) index over density × FUV × CRIR at fixed other axes."""
+    if not _grid:
+        raise RuntimeError('Load a grid on the Load tab first.')
+    crir_toks = _probe_axis_tokens('crir')
+    if len(crir_toks) < 2:
+        raise ValueError(
+            'Probe ranking needs a varying CRIR axis (ζ must take more than '
+            'one value in the loaded grid).'
+        )
+    dens_toks = _probe_axis_tokens('density')
+    fuv_toks = _probe_axis_tokens('fuv')
+    base = _token_list_from_sliders(slider_values)
+
+    nx, ny, nz = len(dens_toks), len(fuv_toks), len(crir_toks)
+    tok_to_ijk = {}
+    for iz, zt in enumerate(crir_toks):
+        for iy, yt in enumerate(fuv_toks):
+            for ix, xt in enumerate(dens_toks):
+                tokens = _probe_full_tokens(base, density=xt, fuv=yt, crir=zt)
+                tok_to_ijk[tokens] = (iz, iy, ix)
+
+    x_phys = np.array([_physical_param_value('density', t) for t in dens_toks], dtype=float)
+    y_phys = np.array([_physical_param_value('fuv', t) for t in fuv_toks], dtype=float)
+    z_phys = np.array([_physical_param_value('crir', t) for t in crir_toks], dtype=float)
+    x_phys, x_ord = _sort_probe_axis(x_phys, True)
+    y_phys, y_ord = _sort_probe_axis(y_phys, True)
+    z_phys, z_ord = _sort_probe_axis(z_phys, True)
+    return tok_to_ijk, (nz, ny, nx), (x_phys, y_phys, z_phys), (x_ord, y_ord, z_ord)
+
+
+def _probe_pack_cubes(cubes, shape_xyz, phys, orders):
+    """Sort cubes onto increasing physical axes and attach meshgrids."""
+    nz, ny, nx = shape_xyz
+    x_phys, y_phys, z_phys = phys
+    x_ord, y_ord, z_ord = orders
+    z_mesh, y_mesh, x_mesh = np.meshgrid(z_phys, y_phys, x_phys, indexing='ij')
+    out = {}
+    for name, cube in cubes.items():
+        grid = np.asarray(cube, dtype=float)
+        if grid.shape == (nz, ny, nx):
+            grid = grid[np.ix_(z_ord, y_ord, x_ord)]
+        out[name] = {
+            'grid': grid,
+            gn.PARAM_MESH_KEYS['density']: x_mesh,
+            gn.PARAM_MESH_KEYS['fuv']: y_mesh,
+            gn.PARAM_MESH_KEYS['crir']: z_mesh,
+        }
+    return out
+
+
+def _probe_report(frac, message, *, error=None):
+    with _probe_job_lock:
+        _probe_progress['frac'] = float(min(1.0, max(0.0, frac)))
+        _probe_progress['message'] = str(message or '')
+        if error is not None:
+            _probe_progress['error'] = str(error)
+
+
+def _probe_snapshot():
+    with _probe_job_lock:
+        return dict(_probe_progress)
+
+
+def _copy_probe_grids(grids):
+    """Deep-copy species cubes so interpolation does not overwrite the native grid."""
+    out = {}
+    for name, gdata in grids.items():
+        if not isinstance(gdata, dict) or 'grid' not in gdata:
+            continue
+        out[name] = {
+            k: (np.array(v, copy=True) if isinstance(v, np.ndarray) else v)
+            for k, v in gdata.items()
+        }
+    return out
+
+
+def _build_probe_grids_3d(
+    quantity, tracers, slider_values, idef, progress=None, interp_target_shape=None,
+    return_native=False,
+):
+    """Native (optionally KoSens-resampled) 3-D cubes for probe ranking."""
+    def _p(frac, msg):
+        if callable(progress):
+            progress(frac, msg)
+
+    tok_to_ijk, shape, phys, orders = _build_probe_index(slider_values)
+    nz, ny, nx = shape
+    tracers = [t for t in tracers if t and '/' not in t]
+    if not tracers:
+        raise ValueError('Select at least one tracer (not a ratio).')
+
+    cubes = {sp: np.full((nz, ny, nx), np.nan, dtype=float) for sp in tracers}
+    n_models = max(1, len(tok_to_ijk))
+    step = max(1, n_models // 40)
+
+    if quantity == 'intensity':
+        if not _simline:
+            raise RuntimeError('Load a SIMLINE directory to rank line intensities.')
+        lookup = gf._line_lookup(_simline, idef or SIMLINE_DEFAULT_IDEF)
+        missing = [n for n in tracers if n not in lookup]
+        if missing:
+            raise ValueError(
+                f'No SIMLINE transition for: {missing}. '
+                'Pick spectroscopic line keys such as CO(1-0).'
+            )
+        n_work = max(1, len(tracers) * n_models)
+        done = 0
+        for name in tracers:
+            species, tidx = lookup[name]
+            for tokens, (iz, iy, ix) in tok_to_ijk.items():
+                cubes[name][iz, iy, ix] = get_smli_intensity(
+                    tokens, species, idef, tidx)
+                done += 1
+                if done % step == 0 or done == n_work:
+                    _p(0.06 + 0.70 * done / n_work,
+                       f'Reading intensities ({done}/{n_work})…')
+    elif quantity == 'column_density':
+        if not _grid_has_hdf5():
+            raise RuntimeError('Load an HDF5 model grid to rank column densities.')
+        for k, (tokens, (iz, iy, ix)) in enumerate(tok_to_ijk.items(), 1):
+            path = _grid['files'].get(tokens)
+            if path:
+                try:
+                    with h5py.File(path, 'r') as hf:
+                        for sp in tracers:
+                            cubes[sp][iz, iy, ix] = _total_column_density_from_hf(hf, sp)
+                except OSError:
+                    pass
+            if k % step == 0 or k == n_models:
+                _p(0.06 + 0.70 * k / n_models,
+                   f'Reading column densities ({k}/{n_models})…')
+    else:
+        if not _grid_has_hdf5():
+            raise RuntimeError(
+                'Load an HDF5 model grid to rank clump-integrated abundances.')
+        for k, (tokens, (iz, iy, ix)) in enumerate(tok_to_ijk.items(), 1):
+            path = _grid['files'].get(tokens)
+            if path:
+                model = get_model(path)
+                xs = _integrated_x_for_species(model, tracers)
+                for sp in tracers:
+                    cubes[sp][iz, iy, ix] = xs.get(sp, np.nan)
+            if k % step == 0 or k == n_models:
+                _p(0.06 + 0.70 * k / n_models,
+                   f'Reading models ({k}/{n_models})…')
+
+    _p(0.78, 'Packing 3-D cubes…')
+    grids = _probe_pack_cubes(cubes, shape, phys, orders)
+    grids_native = _copy_probe_grids(grids)
+
+    # Optional: KoSens-style resampling so probe results match KoSens notebook
+    # heatmaps when users pick the same interpolation size.
+    if interp_target_shape is not None:
+        if (not isinstance(interp_target_shape, (tuple, list))
+                or len(interp_target_shape) != 3):
+            raise ValueError(
+                f'interp_target_shape must be (z,y,x), got {interp_target_shape!r}',
+            )
+        tz, ty, tx = (
+            int(interp_target_shape[0]),
+            int(interp_target_shape[1]),
+            int(interp_target_shape[2]),
+        )
+        if tz < 2 or ty < 2 or tx < 2:
+            raise ValueError(
+                f'interp_target_shape values must be >= 2, got {interp_target_shape!r}',
+            )
+
+        if (tz, ty, tx) != (nz, ny, nx):
+            x_phys, y_phys, z_phys = phys
+            _p(0.82, 'KoSens-style resampling of 3-D cubes…')
+            tracers_len = max(1, len(tracers))
+            for i_sp, sp in enumerate(tracers, 1):
+                if callable(progress):
+                    _p(0.82 + 0.16 * i_sp / tracers_len,
+                       f'Resampling {sp} ({i_sp}/{tracers_len})…')
+
+                native = np.asarray(grids[sp]['grid'], dtype=float)
+                grid_out, final_x, final_y, final_z = gi.resample_grid_3d_kosens(
+                    native,
+                    x_phys=x_phys,
+                    y_phys=y_phys,
+                    z_phys=z_phys,
+                    target_shape=(tz, ty, tx),
+                    interpolation_method='linear',
+                    smoothing_order=2,
+                    clip_to_bounds=False,
+                    log_values=True,
+                )
+
+                z_mesh, y_mesh, x_mesh = np.meshgrid(
+                    final_z, final_y, final_x, indexing='ij',
+                )
+                grids[sp]['grid'] = grid_out
+                grids[sp][gn.PARAM_MESH_KEYS['density']] = x_mesh
+                grids[sp][gn.PARAM_MESH_KEYS['fuv']] = y_mesh
+                grids[sp][gn.PARAM_MESH_KEYS['crir']] = z_mesh
+
+    if return_native:
+        return grids, grids_native
+    return grids
+
+
+def _probe_ratio_pairs(quantity, tracers):
+    names = [t for t in tracers if t and '/' not in str(t)]
+    if len(names) < 2:
+        return []
+    if quantity == 'intensity':
+        return mfe.transition_ratio_pairs(names)
+    return mfe.abundance_ratio_pairs(names)
+
+
+def run_probe_ranking_job(
+    quantity, tracers, include_ratios, slider_values, idef,
+    plateau_factor, min_abundance, min_points, min_span, var_cap,
+    good_score, regime_edges_text, progress=None, interp_target_shape=None,
+):
+    """Build 3-D cubes (optionally KoSens-resampled) and compute probe ranking."""
+    global _probe_results
+    quantity = quantity or 'rel_abund'
+    tracers = _as_str_list(tracers)
+    idef = idef or SIMLINE_DEFAULT_IDEF
+    if callable(progress):
+        progress(0.02, 'Indexing the n × G₀ × ζ cube…')
+    grids, grids_native = _build_probe_grids_3d(
+        quantity,
+        tracers,
+        slider_values,
+        idef,
+        progress=progress,
+        interp_target_shape=interp_target_shape,
+        return_native=True,
+    )
+    if include_ratios:
+        if callable(progress):
+            progress(0.79, 'Adding ratio grids…')
+        pairs = _probe_ratio_pairs(quantity, tracers)
+        pr.add_ratio_grids(grids, pairs)
+        pr.add_ratio_grids(grids_native, pairs)
+
+    try:
+        plateau_slope = float(np.log10(float(plateau_factor)))
+    except (TypeError, ValueError):
+        plateau_slope = pr.DEFAULT_PLATEAU_SLOPE
+    try:
+        r_cap = float(np.log10(float(var_cap))) if var_cap not in (None, '') else pr.DEFAULT_VARIATION_R_CAP
+    except (TypeError, ValueError):
+        r_cap = pr.DEFAULT_VARIATION_R_CAP
+    try:
+        min_ab = float(min_abundance)
+    except (TypeError, ValueError):
+        min_ab = pr.DEFAULT_MIN_ABUNDANCE
+    try:
+        n_pts = int(min_points)
+    except (TypeError, ValueError):
+        n_pts = pr.DEFAULT_MIN_POINTS
+    try:
+        min_log_span = float(min_span)
+    except (TypeError, ValueError):
+        min_log_span = pr.DEFAULT_MIN_LOG_CRIR_SPAN
+    try:
+        good = float(good_score)
+    except (TypeError, ValueError):
+        good = pr.DEFAULT_GOOD_SCORE_THRESHOLD
+
+    def _score_progress(frac, msg):
+        if callable(progress):
+            progress(0.80 + 0.18 * float(frac or 0.0), msg)
+
+    ranking = pr.compute_probe_ranking(
+        grids,
+        species_list=None,
+        include_ratios=bool(include_ratios),
+        crir_regimes=pr.parse_regime_edges(regime_edges_text),
+        min_abundance=min_ab,
+        min_points=max(2, n_pts),
+        min_log_crir_span=min_log_span,
+        plateau_slope=plateau_slope,
+        variation_r_cap=r_cap,
+        good_score_threshold=good,
+        progress=_score_progress,
+    )
+    ranking['quantity'] = quantity
+    ranking['idef'] = idef
+    _probe_results = {
+        'ranking': ranking,
+        'grids': grids,
+        'grids_native': grids_native,
+    }
+    if callable(progress):
+        progress(1.0, 'Done')
+    return ranking
+
+
+def _run_probe_ranking_worker(kwargs):
+    try:
+        _probe_report(0.01, 'Starting…')
+        run_probe_ranking_job(progress=_probe_report, **kwargs)
+        with _probe_job_lock:
+            _probe_progress['running'] = False
+            _probe_progress['error'] = None
+            _probe_progress['frac'] = 1.0
+            _probe_progress['message'] = 'Done'
+            _probe_progress['token'] += 1
+    except Exception as exc:
+        _probe_report(_probe_snapshot().get('frac', 0.0), f'Failed: {exc}', error=exc)
+        with _probe_job_lock:
+            _probe_progress['running'] = False
+            _probe_progress['token'] += 1
+
+
 def _model_point_tokens(slider_values=None, int_slice_indices=None):
     """Resolve the full model token tuple for the current UI selection."""
     if not _grid:
@@ -3917,6 +4299,102 @@ def _as_str_list(value):
     if isinstance(value, (list, tuple)):
         return [str(v) for v in value if v is not None and v != '']
     return [str(value)]
+
+
+def _probe_float_list(value):
+    """Dropdown values as floats; empty / unset → None (use ranking defaults)."""
+    out = []
+    for v in _as_str_list(value):
+        try:
+            out.append(float(v))
+        except (TypeError, ValueError):
+            continue
+    return out or None
+
+
+def _probe_note_children(messages):
+    texts = [m for m in messages if m]
+    if not texts:
+        return ''
+    if len(texts) == 1:
+        return texts[0]
+    return [html.P(m, style={'margin': '0 0 8px'}) for m in texts]
+
+
+def _probe_env_figure_block(fig, note=None):
+    children = []
+    if note:
+        children.append(html.P(note, className='probe-empty-note'))
+    children.append(dcc.Graph(
+        figure=fig, config=_GRAPH_CFG, mathjax=True,
+        style=_probe_graph_style(fig, 480),
+    ))
+    return html.Div(children, style={'marginBottom': '20px'})
+
+
+def _probe_heatmap_card(species, fig, note=None):
+    children = [html.Div(species, className='probe-heatmap-name')]
+    if note:
+        children.append(html.P(note, className='probe-empty-note'))
+    children.append(dcc.Graph(
+        figure=fig, config=_GRAPH_CFG,
+        style={**_probe_graph_style(fig, 300), 'width': '100%'},
+    ))
+    return html.Div(children, className='probe-heatmap-card')
+
+
+def _probe_heatmap_grid(cards):
+    return html.Div(cards, className='probe-heatmap-grid')
+
+
+def _probe_graph_style(fig, fallback=420):
+    h = fallback
+    layout = getattr(fig, 'layout', None)
+    raw = getattr(layout, 'height', None) if layout is not None else None
+    try:
+        if raw:
+            h = int(raw)
+    except (TypeError, ValueError):
+        pass
+    return {'height': f'{h}px'}
+
+
+def _probe_heatmap_default_species(ranking, n=None, *, regime=None):
+    """KoSens3D default: tracers in Q1 (green) of the median-score ranking."""
+    green = pr.species_in_quartile(ranking, 'green', regime=regime)
+    if n is not None:
+        green = green[:n]
+    if green:
+        return green
+    species = ranking.get('species_list') or []
+    summary = ranking.get('summary') or []
+    ranked = []
+    seen = set()
+    for row in sorted(summary, key=lambda r: -(r.get('Median_Probe_Score') or -1)):
+        sp = row.get('Species')
+        if sp in seen or sp not in species:
+            continue
+        seen.add(sp)
+        ranked.append(sp)
+        if n is not None and len(ranked) >= n:
+            break
+    return ranked or list(species[: (n or 6)])
+
+
+def _probe_ranked_status(ranking):
+    n_tr = len(ranking.get('species_list') or [])
+    n_env = len(ranking.get('n_levels') or []) * len(ranking.get('fuv_levels') or [])
+    n_reg = len(ranking.get('crir_regimes') or [])
+    qty = {'rel_abund': 'clump-integrated X',
+           'column_density': 'column density',
+           'intensity': 'line intensity'}.get(ranking.get('quantity'), 'quantity')
+    return html.Span([
+        html.Span('Ranked', className='status-chip ok'),
+        html.Span(
+            f'  {n_tr} tracers  ·  {n_env} environments  ·  {n_reg} CRIR '
+            f'regime{"s" if n_reg != 1 else ""}  ·  {qty}',
+            className='kosma-muted', style={'marginLeft': '10px'}),
+    ])
 
 
 def _first_str(value):
@@ -6590,23 +7068,49 @@ def _cv_row_selection(cube, selection, spec_mode='pixel'):
     return out
 
 
+def _cv_map_metric(metric):
+    return (metric or DEFAULT_CUBE_MAP_METRIC).strip().lower()
+
+
+def _cv_channel_marks(nchan):
+    """Sparse slider marks so a 170-channel cube stays readable."""
+    n = max(int(nchan or 1), 1)
+    last = n - 1
+    marks = {0: '0'}
+    if last > 0:
+        marks[last] = str(last)
+        mid = last // 2
+        if mid not in marks:
+            marks[mid] = str(mid)
+    return marks
+
+
 def fig_cube_map(path, hdu, metric, v_low, v_high, colorscale, zscale,
-                 selection=None, spec_mode='pixel', theme='light'):
-    """Collapsed spatial map of a CLASS table or image cube, with selection overlay."""
+                 selection=None, spec_mode='pixel', theme='light',
+                 channel_index=None):
+    """Spatial map of a CLASS table or image cube, with selection overlay."""
     cube, err = _load_cv_cube(path, hdu)
     if cube is None:
         return placeholder_fig(err, theme=theme)
+    metric_l = _cv_map_metric(metric)
     try:
-        lo, hi = _cv_velocity_window(v_low, v_high)
-        map2d = cv.collapse_map(cube, lo, hi, metric=metric or DEFAULT_CUBE_MAP_METRIC)
+        if metric_l in ('channel', 'chan', 'plane'):
+            map2d = cv.channel_map(cube, channel_index)
+        else:
+            lo, hi = _cv_velocity_window(v_low, v_high)
+            map2d = cv.collapse_map(cube, lo, hi, metric=metric_l or DEFAULT_CUBE_MAP_METRIC)
     except Exception as exc:
         return placeholder_fig(str(exc), theme=theme)
 
     t = _theme_colors(theme)
-    metric_l = (metric or DEFAULT_CUBE_MAP_METRIC).strip().lower()
-    if metric_l == 'peak':
-        z_label = f'Peak T ({cube.intensity_unit})'
-        z_hover = f'T<sub>peak</sub> = %{{z:.4g}} {cube.intensity_unit}'
+    unit = cube.intensity_unit or 'K'
+    if metric_l in ('channel', 'chan', 'plane'):
+        z_label = f'I ({unit})'
+        z_hover = f'I = %{{z:.4g}} {unit}'
+        cbar_zscale = zscale or 'linear'
+    elif metric_l == 'peak':
+        z_label = f'Peak T ({unit})'
+        z_hover = f'T<sub>peak</sub> = %{{z:.4g}} {unit}'
         cbar_zscale = zscale or 'linear'
     else:
         z_label = '∫T dv (K km/s)'
@@ -6659,6 +7163,8 @@ def fig_cube_map(path, hdu, metric, v_low, v_high, colorscale, zscale,
     title = (f'{cube.species_label}'
              f'  ·  {n_fill}/{n_tot} cells'
              f'  ·  {cube.grid_step_arcsec:.3g}″ grid')
+    if metric_l in ('channel', 'chan', 'plane'):
+        title = f'{title}  ·  {cv.channel_label(cube, channel_index)}'
     fig.update_layout(**{
         **_base_layout(theme),
         'height': _CV_COL_HEIGHT,
@@ -6691,6 +7197,92 @@ def fig_cube_map(path, hdu, metric, v_low, v_high, colorscale, zscale,
     return fig
 
 
+def fig_cube_ppv(path, hdu, colorscale, theme='light'):
+    """3-D position–position–velocity volume; colorbar is intensity."""
+    cube, err = _load_cv_cube(path, hdu)
+    if cube is None:
+        return placeholder_fig(err, theme=theme)
+    if cube.nchan < 2 or cube.ny < 2 or cube.nx < 2:
+        return placeholder_fig(
+            'Need a 3-D cube (at least 2×2 pixels and 2 channels) for PPV',
+            theme=theme)
+    try:
+        arr = cv.ppv_volume_arrays(cube)
+    except Exception as exc:
+        return placeholder_fig(str(exc), theme=theme)
+    vol = np.asarray(arr['intensity'], dtype=float)
+    finite = np.isfinite(vol)
+    if not np.any(finite):
+        return placeholder_fig('Cube has no finite voxels', theme=theme)
+    isomin = float(arr['isomin'])
+    isomax = float(arr['isomax'])
+    if not np.isfinite(isomax) or isomax <= isomin:
+        isomax = isomin + 1e-6
+    fill = np.where(finite, vol, isomin - abs(isomax - isomin) - 1.0)
+    # vol is (ny, nx, nchan) matching (Dec, RA, v)
+    dec, ra, vel = np.meshgrid(
+        arr['dec_arcmin'], arr['ra_arcmin'], arr['velocity_kms'], indexing='ij')
+    t = _theme_colors(theme)
+    unit = cube.intensity_unit or 'K'
+    ny_s, nx_s, nz_s = fill.shape
+    fig = go.Figure(data=go.Volume(
+        x=ra.ravel(),
+        y=dec.ravel(),
+        z=vel.ravel(),
+        value=fill.ravel(),
+        isomin=isomin,
+        isomax=isomax,
+        opacity=0.12,
+        opacityscale='max',
+        surface_count=15,
+        colorscale=colorscale or DEFAULT_GRID_COLORMAP,
+        colorbar=_contour_colorbar(f'I ({unit})', theme=theme, zscale='linear',
+                                   compact=False),
+        caps=dict(x_show=False, y_show=False, z_show=False),
+        hovertemplate=(
+            'ΔRA = %{x:.3f}′<br>ΔDec = %{y:.3f}′<br>'
+            'v = %{z:.3g} km/s<br>'
+            f'I = %{{value:.4g}} {unit}<extra></extra>'
+        ),
+        name='PPV',
+    ))
+    title = (f'{cube.species_label}  ·  PPV volume  '
+             f'{nx_s}×{ny_s}×{nz_s} (downsampled)')
+    axis_kw = dict(
+        backgroundcolor=t['plot_bg'],
+        gridcolor=t['grid'],
+        showbackground=True,
+        tickfont=ps.tick_font(t['font']),
+    )
+    fig.update_layout(**{
+        **_base_layout(theme),
+        'height': _CV_PPV_HEIGHT,
+        'margin': dict(l=0, r=90, t=58, b=8),
+        'title': dict(text=title, font=ps.title_font(t['title']),
+                      x=0.02, xanchor='left'),
+        'scene': dict(
+            xaxis=dict(
+                title=dict(text='ΔRA (arcmin)', font=ps.axis_title_font(t['font'])),
+                autorange='reversed',
+                **axis_kw,
+            ),
+            yaxis=dict(
+                title=dict(text='ΔDec (arcmin)', font=ps.axis_title_font(t['font'])),
+                **axis_kw,
+            ),
+            zaxis=dict(
+                title=dict(text='v (km/s)', font=ps.axis_title_font(t['font'])),
+                **axis_kw,
+            ),
+            aspectmode='cube',
+            camera=dict(eye=dict(x=1.55, y=1.55, z=1.15)),
+        ),
+        'uirevision': f'cv-ppv|{cube.path}',
+        'showlegend': False,
+    })
+    return fig
+
+
 def _cv_identify_window_lines(cube, line_catalog, v_source, eu_max):
     """Catalog lines whose observed frequency falls in the cube's spectral window."""
     win = None if cube is None else cube.freq_window_ghz()
@@ -6715,7 +7307,7 @@ def fig_cube_spectrum(path, hdu, selection, v_low, v_high, n_gauss, do_fit,
                       gauss_fwhms=None, gauss_lock=False,
                       xaxis='velocity', line_catalog='local',
                       mark_lines=True, v_source=0.0, eu_max=150.0,
-                      spec_mode='pixel'):
+                      spec_mode='pixel', channel_index=None):
     """Spectrum of the selected pixel / region, or the mean of the whole map."""
     cube, err = _load_cv_cube(path, hdu)
     win, line_rows, line_err = _cv_identify_window_lines(
@@ -6776,6 +7368,18 @@ def fig_cube_spectrum(path, hdu, selection, v_low, v_high, n_gauss, do_fit,
         name=spec_name,
         hovertemplate=x_hover + '<br>T = %{y:.4g} K<extra></extra>',
     ))
+
+    if cube.nchan >= 1:
+        ich = cv.clamp_channel(cube, channel_index)
+        if use_freq and freq is not None and ich < freq.size:
+            x_ch = float(freq[ich])
+        else:
+            x_ch = float(_x_at_v(cube.velocity_kms[ich]))
+        if np.isfinite(x_ch):
+            fig.add_vline(
+                x=x_ch,
+                line=dict(color='#f59e0b', width=1.8, dash='dash'),
+            )
 
     fit_result = None
     fit_error = None
@@ -7519,6 +8123,11 @@ _XVAR_OPTIONS = [
     {'label': html.Span('n_H (cm⁻³)', className='seg-opt'), 'value': 'nH'},
 ]
 
+def _math_label(tex):
+    """Inline MathJax for control labels (Dash html.Label cannot typeset TeX)."""
+    return dcc.Markdown(tex, mathjax=True, className='probe-math-label')
+
+
 _CTRL_LABEL = {'fontWeight': '600', 'fontSize': '13px', 'display': 'block', 'marginBottom': '5px'}
 _ALL_BTN_STYLE = {'marginTop': '22px'}
 _CTRL_BOX = {'flex': '1', 'minWidth': '110px', 'marginRight': '18px'}
@@ -7641,6 +8250,428 @@ def _advanced_details(summary, *children):
     )
 
 
+# Native file/folder dialogs for the Load tab. Dash runs locally, so a
+# system chooser can browse the real filesystem; the text fields remain
+# for paste / CLI ``--dir``. Dialogs run out-of-process (or via zenity /
+# kdialog / osascript / PowerShell) because Dash callbacks are not on
+# the Tk main thread.
+
+_DIALOG_LOCK = threading.Lock()
+_HDF5_FILETYPES = (
+    ('HDF5 files', '*.hdf5 *.h5'),
+    ('All files', '*.*'),
+)
+_SIMLINE_FILETYPES = (
+    ('SIMLINE files', '*.smli *.smlc'),
+    ('All files', '*.*'),
+)
+_FITS_FILETYPES = (
+    ('FITS files', '*.fits *.fit *.fts *.FITS'),
+    ('All files', '*.*'),
+)
+_PATH_BROWSE = (
+    {
+        'button': 'btn-browse-dir',
+        'input': 'dir-input',
+        'title': 'Select any HDF5 model file in the grid folder',
+        'filetypes': _HDF5_FILETYPES,
+        'keep': 'folder',
+        'mode': 'file',
+    },
+    {
+        'button': 'btn-browse-chem',
+        'input': 'chem-dir-input',
+        'title': 'Select any chemistry HDF5 file in the grid folder',
+        'filetypes': _HDF5_FILETYPES,
+        'keep': 'folder',
+        'mode': 'file',
+    },
+    {
+        'button': 'btn-browse-simline',
+        'input': 'simline-dir-input',
+        'title': 'Select any SIMLINE file in the output folder',
+        'filetypes': _SIMLINE_FILETYPES,
+        'keep': 'folder',
+        'mode': 'file',
+    },
+    {
+        'button': 'btn-browse-overlay',
+        'input': 'overlay-dir-input',
+        'title': 'Select any overlay HDF5 file in the grid folder',
+        'filetypes': _HDF5_FILETYPES,
+        'keep': 'folder',
+        'mode': 'file',
+    },
+    {
+        'button': 'btn-browse-chem-overlay',
+        'input': 'chem-overlay-dir-input',
+        'title': 'Select any overlay chemistry HDF5 file in the grid folder',
+        'filetypes': _HDF5_FILETYPES,
+        'keep': 'folder',
+        'mode': 'file',
+    },
+    {
+        'button': 'btn-browse-simline-overlay',
+        'input': 'simline-overlay-dir-input',
+        'title': 'Select any overlay SIMLINE file in the output folder',
+        'filetypes': _SIMLINE_FILETYPES,
+        'keep': 'folder',
+        'mode': 'file',
+    },
+    {
+        'button': 'btn-browse-obs-fits',
+        'input': 'obs-fits-path',
+        'title': 'Select a FITS cube or CLASS MATRIX file',
+        'filetypes': _FITS_FILETYPES,
+        'keep': 'file',
+        'mode': 'file',
+    },
+    {
+        'button': 'btn-browse-cv-path',
+        'input': 'cv-path',
+        'title': 'Select any FITS cube in the folder you want to load',
+        'filetypes': _FITS_FILETYPES,
+        'keep': 'folder',
+        'mode': 'file',
+    },
+    {
+        'button': 'btn-browse-fit-output',
+        'input': 'fit-output-dir',
+        'title': 'Select the map-fit output folder',
+        'filetypes': None,
+        'keep': 'folder',
+        'mode': 'directory',
+    },
+)
+_LOAD_BROWSE = _PATH_BROWSE
+
+
+def _dialog_start_dir(current):
+    """Existing folder to open the native chooser in."""
+    current = os.path.expanduser((current or '').strip())
+    if current and os.path.isfile(current):
+        current = os.path.dirname(os.path.abspath(current))
+    elif current:
+        current = os.path.abspath(current)
+        while current and not os.path.isdir(current):
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+    if current and os.path.isdir(current):
+        return current
+    return os.path.expanduser('~')
+
+
+def _load_source_from_pick(picked):
+    """Map a chooser result to the path the Load fields expect.
+
+    A picked model file uses its parent folder so the whole grid loads;
+    a picked folder is kept as-is.
+    """
+    picked = os.path.abspath(os.path.expanduser((picked or '').strip()))
+    if not picked:
+        return ''
+    if os.path.isfile(picked):
+        return os.path.dirname(picked) or picked
+    return picked
+
+
+def _resolve_browse_path(picked, keep='folder'):
+    """Turn a native-dialog result into the value written to a path field."""
+    picked = os.path.abspath(os.path.expanduser((picked or '').strip()))
+    if not picked:
+        return ''
+    if keep == 'folder':
+        return _load_source_from_pick(picked)
+    return picked
+
+
+def _run_dialog(cmd, env=None):
+    """Run a chooser. ``None`` = backend missing; ``''`` = cancelled."""
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return ''
+    text = (proc.stdout or '').strip()
+    return text.splitlines()[0].strip() if text else ''
+
+
+def _first_dialog(*factories):
+    """Try backends until one is available. Empty string means cancel."""
+    saw_backend = False
+    for factory in factories:
+        result = factory()
+        if result is None:
+            continue
+        saw_backend = True
+        return result
+    if not saw_backend:
+        print('PRISMA: could not open a system file window; paste the path instead.',
+              file=sys.stderr)
+    return ''
+
+
+def _zenity_filters(filetypes):
+    args = []
+    for name, pat in filetypes or ():
+        zen_pat = ' '.join(
+            p if p != '*.*' else '*' for p in pat.split())
+        args.extend(['--file-filter', f'{name} | {zen_pat}'])
+    return args
+
+
+def _pick_zenity_file(title, start_dir, filetypes):
+    exe = shutil.which('zenity')
+    if not exe:
+        return None
+    cmd = [exe, '--file-selection', '--title', title,
+           '--filename', os.path.join(start_dir, '')]
+    cmd.extend(_zenity_filters(filetypes))
+    return _run_dialog(cmd)
+
+
+def _pick_kdialog_file(title, start_dir, filetypes):
+    exe = shutil.which('kdialog')
+    if not exe:
+        return None
+    if filetypes:
+        filt = '|'.join(f'{pat}|{name}' for name, pat in filetypes)
+    else:
+        filt = '*'
+    return _run_dialog(
+        [exe, '--title', title, '--getopenfilename', start_dir, filt])
+
+
+def _pick_osascript_file(title, start_dir, filetypes):
+    if sys.platform != 'darwin':
+        return None
+    if not shutil.which('osascript'):
+        return None
+
+    def q(s):
+        return (s or '').replace('\\', '\\\\').replace('"', '\\"')
+
+    script = (
+        f'try\n'
+        f'  set theFile to choose file with prompt "{q(title)}" '
+        f'default location POSIX file "{q(start_dir)}"\n'
+        f'  return POSIX path of theFile\n'
+        f'on error\n'
+        f'  return ""\n'
+        f'end try'
+    )
+    result = _run_dialog(['osascript', '-e', script])
+    return result if result is not None else None
+
+
+def _pick_windows_file(title, start_dir, filetypes):
+    if sys.platform != 'win32':
+        return None
+    parts = []
+    for name, pat in filetypes or (('All files', '*.*'),):
+        win_pat = ';'.join(pat.split())
+        parts.append(f'{name} ({win_pat})|{win_pat}')
+    env = os.environ.copy()
+    env['PRISMA_DLG_TITLE'] = title
+    env['PRISMA_DLG_DIR'] = start_dir
+    env['PRISMA_DLG_FILTER'] = '|'.join(parts)
+    ps = (
+        'Add-Type -AssemblyName System.Windows.Forms | Out-Null\n'
+        '$dlg = New-Object System.Windows.Forms.OpenFileDialog\n'
+        '$dlg.Title = $env:PRISMA_DLG_TITLE\n'
+        '$dlg.InitialDirectory = $env:PRISMA_DLG_DIR\n'
+        '$dlg.Filter = $env:PRISMA_DLG_FILTER\n'
+        '$dlg.RestoreDirectory = $true\n'
+        '$dlg.CheckFileExists = $true\n'
+        '[void][System.Windows.Forms.Application]::EnableVisualStyles()\n'
+        'if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {\n'
+        '    [Console]::Out.Write($dlg.FileName)\n'
+        '}\n'
+    )
+    return _run_dialog(
+        ['powershell', '-NoProfile', '-STA', '-Command', ps], env=env)
+
+
+def _pick_tkinter(kind, title, start_dir, filetypes):
+    """Chooser in a child process so Tk has its own main thread."""
+    script = (
+        'import sys\n'
+        'from tkinter import Tk, filedialog\n'
+        'root = Tk()\n'
+        'root.withdraw()\n'
+        'try:\n'
+        '    root.wm_attributes("-topmost", True)\n'
+        'except Exception:\n'
+        '    pass\n'
+        'try:\n'
+        '    root.lift()\n'
+        '    root.update()\n'
+        'except Exception:\n'
+        '    pass\n'
+        'start, kind, title, raw = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]\n'
+        'ft = []\n'
+        'for part in raw.split(";;"):\n'
+        '    if "|" in part:\n'
+        '        name, pat = part.split("|", 1)\n'
+        '        ft.append((name, pat))\n'
+        'if kind == "file":\n'
+        '    path = filedialog.askopenfilename(\n'
+        '        title=title, initialdir=start or None,\n'
+        '        filetypes=ft or [("All files", "*.*")])\n'
+        'else:\n'
+        '    path = filedialog.askdirectory(title=title, initialdir=start or None)\n'
+        'try:\n'
+        '    root.destroy()\n'
+        'except Exception:\n'
+        '    pass\n'
+        'sys.stdout.write(path or "")\n'
+    )
+    encoded = ';;'.join(f'{name}|{pat}' for name, pat in (filetypes or ()))
+    try:
+        proc = subprocess.run(
+            [sys.executable, '-c', script, start_dir or '', kind, title, encoded],
+            capture_output=True, text=True)
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        err = (proc.stderr or '').lower()
+        if 'display' in err or 'tclerror' in err:
+            return None
+        return ''
+    return (proc.stdout or '').strip()
+
+
+def _native_pick_file(title, start_dir, filetypes):
+    """Open a native Open-file window. Returns a path or ``''`` if cancelled."""
+    start_dir = _dialog_start_dir(start_dir)
+    with _DIALOG_LOCK:
+        if sys.platform == 'darwin':
+            return _first_dialog(
+                lambda: _pick_osascript_file(title, start_dir, filetypes),
+                lambda: _pick_tkinter('file', title, start_dir, filetypes),
+            )
+        if sys.platform == 'win32':
+            return _first_dialog(
+                lambda: _pick_windows_file(title, start_dir, filetypes),
+                lambda: _pick_tkinter('file', title, start_dir, filetypes),
+            )
+        return _first_dialog(
+            lambda: _pick_zenity_file(title, start_dir, filetypes),
+            lambda: _pick_kdialog_file(title, start_dir, filetypes),
+            lambda: _pick_tkinter('file', title, start_dir, filetypes),
+        )
+
+
+def _pick_zenity_folder(title, start_dir):
+    exe = shutil.which('zenity')
+    if not exe:
+        return None
+    return _run_dialog([
+        exe, '--file-selection', '--directory', '--title', title,
+        '--filename', os.path.join(start_dir, ''),
+    ])
+
+
+def _pick_kdialog_folder(title, start_dir):
+    exe = shutil.which('kdialog')
+    if not exe:
+        return None
+    return _run_dialog(
+        [exe, '--title', title, '--getexistingdirectory', start_dir])
+
+
+def _pick_osascript_folder(title, start_dir):
+    if sys.platform != 'darwin':
+        return None
+    if not shutil.which('osascript'):
+        return None
+
+    def q(s):
+        return (s or '').replace('\\', '\\\\').replace('"', '\\"')
+
+    script = (
+        f'try\n'
+        f'  set theFolder to choose folder with prompt "{q(title)}" '
+        f'default location POSIX file "{q(start_dir)}"\n'
+        f'  return POSIX path of theFolder\n'
+        f'on error\n'
+        f'  return ""\n'
+        f'end try'
+    )
+    return _run_dialog(['osascript', '-e', script])
+
+
+def _pick_windows_folder(title, start_dir):
+    if sys.platform != 'win32':
+        return None
+    env = os.environ.copy()
+    env['PRISMA_DLG_TITLE'] = title
+    env['PRISMA_DLG_DIR'] = start_dir
+    ps = (
+        'Add-Type -AssemblyName System.Windows.Forms | Out-Null\n'
+        '$dlg = New-Object System.Windows.Forms.FolderBrowserDialog\n'
+        '$dlg.Description = $env:PRISMA_DLG_TITLE\n'
+        '$dlg.SelectedPath = $env:PRISMA_DLG_DIR\n'
+        '$dlg.ShowNewFolderButton = $true\n'
+        '[void][System.Windows.Forms.Application]::EnableVisualStyles()\n'
+        'if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {\n'
+        '    [Console]::Out.Write($dlg.SelectedPath)\n'
+        '}\n'
+    )
+    return _run_dialog(
+        ['powershell', '-NoProfile', '-STA', '-Command', ps], env=env)
+
+
+def _native_pick_folder(title, start_dir):
+    """Open a native folder window. Returns a path or ``''`` if cancelled."""
+    start_dir = _dialog_start_dir(start_dir)
+    with _DIALOG_LOCK:
+        if sys.platform == 'darwin':
+            return _first_dialog(
+                lambda: _pick_osascript_folder(title, start_dir),
+                lambda: _pick_tkinter('directory', title, start_dir, None),
+            )
+        if sys.platform == 'win32':
+            return _first_dialog(
+                lambda: _pick_windows_folder(title, start_dir),
+                lambda: _pick_tkinter('directory', title, start_dir, None),
+            )
+        return _first_dialog(
+            lambda: _pick_zenity_folder(title, start_dir),
+            lambda: _pick_kdialog_folder(title, start_dir),
+            lambda: _pick_tkinter('directory', title, start_dir, None),
+        )
+
+
+def _browse_btn(btn_id, *, title=None):
+    return html.Button(
+        'Browse', id=btn_id, n_clicks=0, className='btn btn-ghost',
+        title=title or (
+            'Open a file window on this computer and pick any model file '
+            'in the folder you want to load'
+        ),
+    )
+
+
+def _path_browse_row(input_id, browse_id, *, value='', placeholder='',
+                     input_style=None, browse_title=None):
+    """Text path field with a native-chooser Browse button."""
+    style = {'width': '100%', 'fontSize': '13px'}
+    if input_style:
+        style.update(input_style)
+    return html.Div([
+        dcc.Input(
+            id=input_id, type='text', value=value,
+            placeholder=placeholder, className='kosma-input',
+            style=style,
+        ),
+        _browse_btn(browse_id, title=browse_title),
+    ], className='path-browse-row')
+
+
 def _load_card(title, subtitle, body, *, accent='blue'):
     """Neutral load-page card with a coloured left accent."""
     accent_cls = {
@@ -7657,6 +8688,396 @@ def _load_card(title, subtitle, body, *, accent='blue'):
         body,
     ], className=f'load-card{accent_cls}')
 
+
+def _probe_table(rows, columns, *, max_rows=40, empty='Compute a ranking to fill this table.'):
+    """Simple HTML table from list-of-dict rows and ``(key, header, fmt)`` columns."""
+    if not rows:
+        return html.P(empty, className='kosma-muted', style={'margin': '0', 'fontSize': '13px'})
+    body = []
+    for row in rows[:max_rows]:
+        cells = []
+        for key, _hdr, fmt in columns:
+            val = row.get(key)
+            if fmt == 'score':
+                text = pr.format_score(val)
+            elif fmt == 'phys':
+                text = pr.format_phys(val)
+            elif fmt == 'pct':
+                text = '—' if val is None or not np.isfinite(val) else f'{100.0 * val:.0f}%'
+            elif fmt == 'int':
+                text = '—' if val is None else str(int(val))
+            elif fmt == 'bool':
+                text = 'yes' if val else 'no'
+            else:
+                text = '—' if val is None or val == '' else str(val)
+            cells.append(html.Td(text))
+        body.append(html.Tr(cells))
+    head = html.Thead(html.Tr([html.Th(hdr) for _k, hdr, _f in columns]))
+    note = ''
+    if len(rows) > max_rows:
+        note = html.P(f'Showing {max_rows} of {len(rows)} rows.',
+                      className='kosma-muted',
+                      style={'fontSize': '12px', 'margin': '6px 0 0'})
+    return html.Div([
+        html.Div(html.Table([head, html.Tbody(body)]), className='probe-table-wrap'),
+        note,
+    ])
+
+
+def _probe_ranking_page():
+    """Layout for the Probe ranking tab."""
+    info = html.Div(className='probe-info', children=[
+        html.Div([
+            html.Strong('How the score works'),
+            html.P(
+                'At each fixed environment (typically n_H × G₀) the selected quantity is '
+                'read along the cosmic-ray axis ζ.  The axis is split into CRIR regimes '
+                'so a high score always belongs to a specific cosmic-ray range rather than '
+                'an average over the whole grid.',
+                style={'margin': '6px 0 10px'},
+            ),
+            html.Div(className='probe-math', children=[
+                html.Div([html.Span('S = F × V', className='probe-eq'),
+                          html.Span('probe score in [0, 1]', className='kosma-muted')]),
+                html.Div([html.Span('R = Δlog₁₀(y) / log₁₀(R_cap)', className='probe-eq'),
+                          html.Span('dynamic range, default R_cap = 100', className='kosma-muted')]),
+                html.Div([html.Span('V = R/(1+R)  (or min(R, 1) if R ≤ 1)', className='probe-eq'),
+                          html.Span('variation factor', className='kosma-muted')]),
+                html.Div([html.Span('F = (active log-ζ span) / (total log-ζ span)', className='probe-eq'),
+                          html.Span('functional factor; halved if > 1 reversal', className='kosma-muted')]),
+                html.Div([html.Span('|d log y / d log ζ| < log₁₀(f)', className='probe-eq'),
+                          html.Span('plateau (uninformative); default f = 3 per decade', className='kosma-muted')]),
+            ]),
+            html.P(
+                'Relative quartiles colour tracers within one environment.  Absolute bands '
+                'are S ≥ 0.59 (strong), ≥ 0.39 (good), ≥ 0.20 (moderate), else weak.  '
+                'Clump-integrated X uses ∫ 4π r² n dr / ∫ 4π r² n_H dr.',
+                style={'margin': '10px 0 0'},
+            ),
+        ]),
+    ])
+
+    scoring = _advanced_details(
+        'Scoring parameters',
+        html.Div([
+            html.Div([
+                html.Label('Plateau factor f (per decade)', style=_CTRL_LABEL),
+                dcc.Input(id='pr-plateau-factor', type='number', value=3.0,
+                          min=1.05, max=20, step=0.25,
+                          className='kosma-input', style={'width': '100%'}),
+            ], style={**_CTRL_BOX, 'minWidth': '160px'}),
+            html.Div([
+                html.Label('Min observable value', style=_CTRL_LABEL),
+                dcc.Input(id='pr-min-abund', type='number', value=1e-15,
+                          className='kosma-input', style={'width': '100%'}),
+            ], style={**_CTRL_BOX, 'minWidth': '150px'}),
+            html.Div([
+                html.Label('Min CRIR points', style=_CTRL_LABEL),
+                dcc.Input(id='pr-min-points', type='number', value=4,
+                          min=2, max=50, step=1,
+                          className='kosma-input', style={'width': '100%'}),
+            ], style={**_CTRL_BOX, 'minWidth': '120px'}),
+            html.Div([
+                html.Label('Min log₁₀ ζ span', style=_CTRL_LABEL),
+                dcc.Input(id='pr-min-span', type='number', value=0.5,
+                          min=0.1, max=4, step=0.1,
+                          className='kosma-input', style={'width': '100%'}),
+            ], style={**_CTRL_BOX, 'minWidth': '130px'}),
+            html.Div([
+                html.Label('Variation cap R_cap', style=_CTRL_LABEL),
+                dcc.Input(id='pr-var-cap', type='number', value=100.0,
+                          min=2, max=1e6, step=1,
+                          className='kosma-input', style={'width': '100%'}),
+            ], style={**_CTRL_BOX, 'minWidth': '130px'}),
+            html.Div([
+                html.Label('“Good” score threshold', style=_CTRL_LABEL),
+                dcc.Input(id='pr-good-score', type='number', value=0.3,
+                          min=0, max=1, step=0.05,
+                          className='kosma-input', style={'width': '100%'}),
+            ], style={**_CTRL_BOX, 'minWidth': '150px'}),
+            html.Div([
+                html.Label('KoSens-style interpolation', style=_CTRL_LABEL),
+                dcc.Checklist(
+                    id='pr-interp-enable',
+                    options=[{'label': ' resample grid before ranking (KoSens 3-D)', 'value': 'on'}],
+                    value=['on'],
+                    **_RADIO,
+                ),
+                html.Label('Resample size n×n×n', style={**_CTRL_LABEL, 'marginTop': '8px'}),
+                dcc.Input(
+                    id='pr-interp-n',
+                    type='number',
+                    value=60,
+                    min=2,
+                    max=200,
+                    step=1,
+                    className='kosma-input',
+                    style={'width': '100%'},
+                ),
+                html.Span(
+                    'On by default to match KoSens3D: interpolate n × G₀ × ζ '
+                    'to n×n×n, score, then snap to native nodes (median). '
+                    'Turn off only for a fast native-grid preview.',
+                    className='kosma-muted',
+                    style={'fontSize': '11px', 'display': 'block', 'marginTop': '4px'},
+                ),
+            ], style={**_CTRL_BOX, 'minWidth': '240px', 'flex': '1.5'}),
+            html.Div([
+                html.Label('CRIR regime edges (s⁻¹)', style=_CTRL_LABEL),
+                dcc.Input(id='pr-regime-edges', type='text', value='1e-16',
+                          placeholder='1e-16   or  1e-17, 1e-15   or  full',
+                          className='kosma-input', style={'width': '100%'}),
+                html.Span('Interior splits only; grid min/max bound the outer regimes. '
+                          'Use “full” for a single regime.',
+                          className='kosma-muted',
+                          style={'fontSize': '11px', 'display': 'block', 'marginTop': '4px'}),
+            ], style={'flex': '1.6', 'minWidth': '220px', 'marginRight': '0'}),
+        ], style=_PANEL_ROW),
+    )
+
+    return [
+        html.P(
+            'Rank species, column densities or line intensities as cosmic-ray probes '
+            'on the loaded 3-D grid (n_H × G₀ × ζ, with mass, metallicity and attenuation '
+            'held at the current sliders).  Choose tracers and scoring, compute once, '
+            'then inspect the environment ranking, score heatmaps, and the '
+            'response curves that the score is based on — three complementary views, '
+            'not duplicate plots.',
+            style=_PAGE_INTRO,
+        ),
+        info,
+        html.Div([
+            html.Div([
+                html.Label('Quantity', style=_CTRL_LABEL),
+                dcc.RadioItems(id='pr-quantity', options=PROBE_QUANTITY_OPTIONS,
+                               value='rel_abund', **_RADIO),
+            ], style={'flex': '1.2', 'minWidth': '180px', 'marginRight': '18px'}),
+            html.Div([
+                html.Label('Tracers', style=_CTRL_LABEL),
+                dcc.Dropdown(id='pr-tracers', options=[], value=[], multi=True,
+                             placeholder='Load a grid… then pick species or lines',
+                             style={'fontSize': '13px'}),
+            ], style={'flex': '2.4', 'minWidth': '260px', 'marginRight': '8px'}),
+            html.Button('Typical', id='pr-btn-typical', n_clicks=0,
+                        className='btn btn-ghost btn-sm', style=_ALL_BTN_STYLE),
+            html.Button('Add all', id='pr-btn-all', n_clicks=0,
+                        className='btn btn-primary btn-sm',
+                        style={**_ALL_BTN_STYLE, 'marginLeft': '6px'}),
+            html.Div([
+                html.Label('Ratios', style=_CTRL_LABEL),
+                dcc.Checklist(id='pr-include-ratios',
+                              options=[{'label': ' include pairs', 'value': 'on'}],
+                              value=[], **_RADIO),
+            ], style={**_CTRL_BOX, 'minWidth': '130px', 'marginLeft': '12px'}),
+            html.Div(id='pr-idef-wrap', children=[
+                html.Label('Intensity units', style=_CTRL_LABEL),
+                dcc.RadioItems(id='pr-idef', options=SIMLINE_MAPFIT_IDEF_OPTIONS,
+                               value=SIMLINE_DEFAULT_IDEF, **_RADIO),
+            ], style={**_CTRL_BOX, 'minWidth': '160px', 'display': 'none'}),
+        ], className='kosma-panel', style=_PANEL_ROW),
+        scoring,
+        html.Div([
+            html.Button('Compute ranking', id='pr-btn-compute', n_clicks=0,
+                        className='btn btn-primary',
+                        style={'marginRight': '12px'}),
+            html.Div(id='pr-status', className='load-status',
+                     style={'display': 'inline-block'}),
+        ], style={'padding': '0 4px 12px'}),
+        html.Div(id='pr-progress-wrap', className='probe-progress',
+                 style={'display': 'none'}, children=[
+            html.Div(className='probe-progress-track', children=[
+                html.Div(id='pr-progress-fill', className='probe-progress-fill',
+                         style={'width': '0%'}),
+            ]),
+            html.Div(id='pr-progress-label',
+                     className='kosma-muted probe-progress-label'),
+        ]),
+        dcc.Store(id='pr-state', data=0),
+        dcc.Interval(id='pr-progress-interval', interval=400, disabled=True,
+                     n_intervals=0),
+        dcc.Tabs(id='pr-subtabs', value='pr-env',
+                 style={'marginTop': '4px'},
+                 content_style={'paddingTop': '16px'}, children=[
+                dcc.Tab(label='Environment ranking', value='pr-env',
+                        style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
+                        children=[
+                    html.P('Top tracers at selected (n_H, G₀) nodes.  Each selected CRIR '
+                           'regime is its own figure so low- and high-ζ rankings stay '
+                           'independent.  Density is labelled to the left of each row.  '
+                           'Green / Q1 colours only appear when at least one tracer has S > 0; '
+                           'a note is shown when a regime or panel has nothing informative.',
+                           style=_PAGE_INTRO),
+                    html.Div([
+                        html.Div([
+                            html.Label(id='pr-n-label',
+                                       children=_math_label(r'$n_{\mathrm{H}}$'),
+                                       style=_CTRL_LABEL),
+                            dcc.Dropdown(id='pr-n-values', options=[], value=[],
+                                         multi=True, style={'fontSize': '13px'}),
+                        ], style={'flex': '1.4', 'minWidth': '180px', 'marginRight': '12px'}),
+                        html.Div([
+                            html.Label(id='pr-fuv-label',
+                                       children=_math_label(r'$G_0$'),
+                                       style=_CTRL_LABEL),
+                            dcc.Dropdown(id='pr-fuv-values', options=[], value=[],
+                                         multi=True, style={'fontSize': '13px'}),
+                        ], style={'flex': '1.4', 'minWidth': '180px', 'marginRight': '12px'}),
+                        html.Div([
+                            html.Label('CRIR regime', style=_CTRL_LABEL),
+                            dcc.Dropdown(id='pr-regime', options=[], value=[],
+                                         multi=True, style={'fontSize': '13px'}),
+                        ], style={'flex': '1.6', 'minWidth': '200px', 'marginRight': '12px'}),
+                        html.Div([
+                            html.Label('Top N per panel', style=_CTRL_LABEL),
+                            dcc.Input(id='pr-top-n', type='number', value=8,
+                                      min=3, max=30, step=1,
+                                      className='kosma-input', style={'width': '90px'}),
+                        ], style={**_CTRL_BOX, 'minWidth': '110px'}),
+                        html.Div([
+                            html.Label('Show', style=_CTRL_LABEL),
+                            dcc.RadioItems(id='pr-tracer-filter',
+                                           options=PROBE_FILTER_OPTIONS,
+                                           value='both', **_SEG),
+                        ], style={**_CTRL_BOX, 'minWidth': '200px'}),
+                        html.Div([
+                            html.Label('Bar colours', style=_CTRL_LABEL),
+                            dcc.RadioItems(id='pr-color-mode',
+                                           options=PROBE_COLOR_OPTIONS,
+                                           value='quartile', **_RADIO),
+                        ], style={**_CTRL_BOX, 'minWidth': '220px', 'marginRight': '0'}),
+                    ], className='kosma-panel', style=_PANEL_ROW),
+                    html.Div(id='pr-env-note', className='probe-empty-note'),
+                    html.Div(id='pr-plot-env'),
+                ]),
+                dcc.Tab(label='Tables', value='pr-tables',
+                        style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
+                        children=[
+                    html.P('KoSens3D-style ranking tables.  Each sub-tab shows a '
+                           'different view of the last computed ranking; use the '
+                           'Environment ranking tab for bar charts at selected '
+                           '(n_H, G₀) nodes.',
+                           style=_PAGE_INTRO),
+                    dcc.Tabs(id='pr-table-subtabs', value='pr-tbl-env',
+                             style={'marginTop': '4px'},
+                             content_style={'paddingTop': '12px'},
+                             children=[
+                        dcc.Tab(label='Environment ranking', value='pr-tbl-env',
+                                style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
+                                children=[html.Div(id='pr-table-env')]),
+                        dcc.Tab(label='Summary', value='pr-tbl-summary',
+                                style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
+                                children=[html.Div(id='pr-table-summary')]),
+                        dcc.Tab(label='Robustness', value='pr-tbl-robust',
+                                style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
+                                children=[html.Div(id='pr-table-robust')]),
+                        dcc.Tab(label='Regime leaders', value='pr-tbl-regime-top',
+                                style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
+                                children=[html.Div(id='pr-table-regime-top')]),
+                        dcc.Tab(label='Slice scores', value='pr-tbl-slice',
+                                style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
+                                children=[html.Div(id='pr-table-slice')]),
+                    ]),
+                ]),
+                dcc.Tab(label='Score heatmap', value='pr-heat',
+                        style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
+                        children=[
+                    html.P('One figure per tracer, as in KoSens3D: median probe score '
+                           'on the native (n_H, G₀) plane after interpolating the cube '
+                           '(default 60³).  CRIR regimes sit side by side.  Q1 (green) '
+                           'is the top 25% by median score in a regime.',
+                           style=_PAGE_INTRO),
+                    html.Div([
+                        html.Div([
+                            html.Label('Tracers', style=_CTRL_LABEL),
+                            dcc.Dropdown(id='pr-hm-species', options=[], value=[],
+                                         multi=True, style={'fontSize': '13px'}),
+                        ], style={'flex': '2', 'minWidth': '220px', 'marginRight': '8px'}),
+                        html.Button('Q1 (green)', id='pr-hm-btn-typical', n_clicks=0,
+                                    className='btn btn-ghost btn-sm', style=_ALL_BTN_STYLE),
+                        html.Button('Add all', id='pr-hm-btn-all', n_clicks=0,
+                                    className='btn btn-primary btn-sm',
+                                    style={**_ALL_BTN_STYLE, 'marginLeft': '6px',
+                                           'marginRight': '12px'}),
+                        html.Div([
+                            html.Label('Colour metric', style=_CTRL_LABEL),
+                            dcc.Dropdown(id='pr-hm-metric', options=PROBE_METRIC_OPTIONS,
+                                         value='probe_score', clearable=False,
+                                         style={'fontSize': '13px'}),
+                        ], style={'flex': '1.2', 'minWidth': '160px', 'marginRight': '12px'}),
+                        html.Div([
+                            html.Label('Colormap', style=_CTRL_LABEL),
+                            dcc.Dropdown(id='pr-hm-colorscale',
+                                         options=GRID_COLORMAP_OPTIONS,
+                                         value=DEFAULT_GRID_COLORMAP, clearable=False,
+                                         style={'fontSize': '13px'}),
+                        ], style={'flex': '1', 'minWidth': '130px', 'marginRight': '12px'}),
+                        html.Div([
+                            html.Label('Regime', style=_CTRL_LABEL),
+                            dcc.Dropdown(id='pr-hm-regime', options=[], value='all',
+                                         clearable=False, style={'fontSize': '13px'}),
+                        ], style={'flex': '1.4', 'minWidth': '180px', 'marginRight': '12px'}),
+                        html.Div([
+                            html.Label('Colour scale', style=_CTRL_LABEL),
+                            dcc.Checklist(id='pr-hm-log',
+                                          options=[{'label': ' log colour', 'value': 'on'}],
+                                          value=[], **_RADIO),
+                        ], style={**_CTRL_BOX, 'minWidth': '120px', 'marginRight': '0'}),
+                    ], className='kosma-panel', style=_PANEL_ROW),
+                    html.Div(id='pr-hm-note', className='probe-empty-note'),
+                    html.Div(id='pr-plot-heatmap'),
+                ]),
+                dcc.Tab(label='Response vs CRIR', value='pr-trends',
+                        style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
+                        children=[
+                    html.P('The curves behind the score: quantity versus ζ on the original '
+                           'n × G₀ × ζ grid (not the interpolated cube).  Coloured lines are '
+                           'G₀ values; grey bands mark local plateaus; dashed vertical lines '
+                           'are regime boundaries.',
+                           style=_PAGE_INTRO),
+                    html.Div([
+                        html.Div([
+                            html.Label('Species / lines', style=_CTRL_LABEL),
+                            dcc.Dropdown(id='pr-tr-species', options=[], value=[],
+                                         multi=True, style={'fontSize': '13px'}),
+                        ], style={'flex': '2', 'minWidth': '220px', 'marginRight': '12px'}),
+                        html.Div([
+                            html.Label(id='pr-tr-n-label',
+                                       children=_math_label(r'$n_{\mathrm{H}}$'),
+                                       style=_CTRL_LABEL),
+                            dcc.Dropdown(id='pr-tr-n', options=[], value=None,
+                                         clearable=False, style={'fontSize': '13px'}),
+                        ], style={'flex': '1', 'minWidth': '140px', 'marginRight': '12px'}),
+                        html.Div([
+                            html.Label(id='pr-tr-fuv-label',
+                                       children=_math_label(r'$G_0$'),
+                                       style=_CTRL_LABEL),
+                            dcc.Dropdown(id='pr-tr-fuv', options=[], value=[],
+                                         multi=True, style={'fontSize': '13px'}),
+                        ], style={'flex': '1.3', 'minWidth': '160px', 'marginRight': '12px'}),
+                        html.Div([
+                            html.Label('Y scale', style=_CTRL_LABEL),
+                            dcc.RadioItems(id='pr-tr-yscale', options=_SCALE_OPTIONS,
+                                           value='log', **_SEG),
+                        ], style={**_CTRL_BOX, 'minWidth': '140px'}),
+                        html.Div([
+                            html.Label('Panels / row', style=_CTRL_LABEL),
+                            dcc.Input(id='pr-tr-ncol', type='number', value=3,
+                                      min=1, max=4, step=1,
+                                      className='kosma-input', style={'width': '80px'}),
+                        ], style={**_CTRL_BOX, 'minWidth': '110px'}),
+                        html.Div([
+                            html.Label('Plateaus', style=_CTRL_LABEL),
+                            dcc.Checklist(id='pr-tr-plateau',
+                                          options=[{'label': ' shade', 'value': 'on'}],
+                                          value=['on'], **_RADIO),
+                        ], style={**_CTRL_BOX, 'minWidth': '110px', 'marginRight': '0'}),
+                    ], className='kosma-panel', style=_PANEL_ROW),
+                    dcc.Graph(id='pr-plot-trends',
+                              figure=placeholder_fig('Compute a ranking, then pick tracers'),
+                              config=_GRAPH_CFG, mathjax=True, style={'height': '480px'}),
+                ]),
+        ]),
+    ]
 
 
 def _slider_block(d):
@@ -8250,8 +9671,11 @@ app.layout = html.Div(
                 children=[
             html.Div(style={'paddingTop': '14px'}, children=[
                 html.P('Load model grids and SIMLINE directories to explore PDR models. '
-                       'Primary grids drive the parameter sliders; overlay grids appear as '
-                       'dashed lines for comparison (e.g. attenuated vs. unattenuated models).',
+                       'Click Browse to open a file window on this computer and pick any '
+                       'model file in the folder you want (the folder is filled in for you), '
+                       'or paste a path. Primary grids drive the parameter sliders; overlay '
+                       'grids appear as dashed lines for comparison (e.g. attenuated vs. '
+                       'unattenuated models).',
                        style=_PAGE_INTRO),
 
                 html.Div(className='load-grid', children=[
@@ -8273,9 +9697,10 @@ app.layout = html.Div(
                                 html.Div([
                                     dcc.Input(
                                         id='dir-input', type='text', value=args.dir,
-                                        placeholder='/path/to/pdrgrid_hdf5  or  /path/to/model.hdf5',
+                                        placeholder='Browse or paste /path/to/pdrgrid_hdf5',
                                         className='kosma-input',
                                     ),
+                                    _browse_btn('btn-browse-dir'),
                                     dcc.Checklist(
                                         id='recursive-check',
                                         options=[{'label': ' recursive', 'value': 'rec'}],
@@ -8297,9 +9722,10 @@ app.layout = html.Div(
                                 html.Div([
                                     dcc.Input(
                                         id='chem-dir-input', type='text', value='',
-                                        placeholder='/path/to/chemistrygrid  or  /path/to/chem_model.hdf5',
+                                        placeholder='Browse or paste /path/to/chemistrygrid',
                                         className='kosma-input',
                                     ),
+                                    _browse_btn('btn-browse-chem'),
                                     dcc.Checklist(
                                         id='chem-recursive-check',
                                         options=[{'label': ' recursive', 'value': 'rec'}],
@@ -8324,9 +9750,10 @@ app.layout = html.Div(
                                 html.Div([
                                     dcc.Input(
                                         id='simline-dir-input', type='text', value='',
-                                        placeholder='/path/to/simlineoutput',
+                                        placeholder='Browse or paste /path/to/simlineoutput',
                                         className='kosma-input',
                                     ),
+                                    _browse_btn('btn-browse-simline'),
                                     dcc.Checklist(
                                         id='simline-recursive-check',
                                         options=[{'label': ' recursive', 'value': 'rec'}],
@@ -8369,9 +9796,10 @@ app.layout = html.Div(
                                 html.Div([
                                     dcc.Input(
                                         id='overlay-dir-input', type='text', value='',
-                                        placeholder='/path/to/attenuated_grid_hdf5  or  /path/to/model.hdf5',
+                                        placeholder='Browse or paste /path/to/attenuated_grid_hdf5',
                                         className='kosma-input',
                                     ),
+                                    _browse_btn('btn-browse-overlay'),
                                     dcc.Checklist(
                                         id='overlay-recursive-check',
                                         options=[{'label': ' recursive', 'value': 'rec'}],
@@ -8396,9 +9824,10 @@ app.layout = html.Div(
                                 html.Div([
                                     dcc.Input(
                                         id='chem-overlay-dir-input', type='text', value='',
-                                        placeholder='/path/to/attenuated_chemistrygrid  or  /path/to/chem_model.hdf5',
+                                        placeholder='Browse or paste /path/to/attenuated_chemistrygrid',
                                         className='kosma-input',
                                     ),
+                                    _browse_btn('btn-browse-chem-overlay'),
                                     dcc.Checklist(
                                         id='chem-overlay-recursive-check',
                                         options=[{'label': ' recursive', 'value': 'rec'}],
@@ -8424,9 +9853,10 @@ app.layout = html.Div(
                                 html.Div([
                                     dcc.Input(
                                         id='simline-overlay-dir-input', type='text', value='',
-                                        placeholder='/path/to/attenuated/simlineoutput',
+                                        placeholder='Browse or paste /path/to/attenuated/simlineoutput',
                                         className='kosma-input',
                                     ),
+                                    _browse_btn('btn-browse-simline-overlay'),
                                     dcc.Checklist(
                                         id='simline-overlay-recursive-check',
                                         options=[{'label': ' recursive', 'value': 'rec'}],
@@ -8874,6 +10304,12 @@ app.layout = html.Div(
             ]),
         ]),
 
+        # --- Probe ranking ---------------------------------------------------
+        dcc.Tab(label='Probe ranking', value='proberank', style=_TAB_STYLE,
+                selected_style=_TAB_SEL, children=[
+            html.Div(style={'paddingTop': '10px'}, children=_probe_ranking_page()),
+        ]),
+
         # --- Page 6: SIMLINE intensities ------------------------------------
         dcc.Tab(label='Intensities', value='intensities', style=_TAB_STYLE,
                 selected_style=_TAB_SEL, children=[
@@ -9055,9 +10491,11 @@ app.layout = html.Div(
                     html.Div([
                         html.Div([
                             html.Label('FITS file path', style=_CTRL_LABEL),
-                            dcc.Input(id='obs-fits-path', type='text', value='',
-                                      placeholder='/path/to/cube.fits or matrix table',
-                                      style={'width': '100%', 'fontSize': '13px'}),
+                            _path_browse_row(
+                                'obs-fits-path', 'btn-browse-obs-fits',
+                                placeholder='Browse or paste /path/to/cube.fits',
+                                browse_title='Open a file window and pick a FITS cube or CLASS MATRIX file',
+                            ),
                         ], style={'flex': '3', 'minWidth': '280px', 'marginRight': '18px'}),
                         html.Div([
                             html.Label('HDU index', style=_CTRL_LABEL),
@@ -9117,25 +10555,32 @@ app.layout = html.Div(
                             style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
                             children=[
                 html.P('CARTA-like view of an observational spectral cube. CLASS/GILDAS '
-                       'MATRIX tables are gridded as-is; '
-                       'missing cells stay blank. Spectrum can be a clicked pixel, a '
-                       'box/lasso region average, or the mean of every filled cell on '
-                       'the map (same spatial-mean option as the SimLine observational '
-                       'overlay). LINE in the FITS header is ignored — the species label '
-                       'comes from the filename and RESTFREQ.',
+                       'MATRIX tables are gridded as-is (missing cells stay blank). '
+                       'CASA image cubes (``*.image.fits``, ``*.pbcor.fits``, 3-D or 4-D '
+                       'with a Stokes axis) load from the image HDU; extra BEAMS tables '
+                       'are ignored. Use the channel slider to step through spectral '
+                       'planes (Map → Channel), or collapse a moment / peak map. A '
+                       'downsampled 3-D position–position–velocity volume sits below, '
+                       'with intensity on the colorbar. Spectrum can be a clicked pixel, '
+                       'a box/lasso region average, or the mean of every filled cell. '
+                       'LINE in the FITS header is ignored — the species label comes from '
+                       'the filename and RESTFREQ / RESTFRQ.',
                        style=_PAGE_INTRO),
                 dcc.Store(id='cv-selection', data=None),
                 html.Div([
                     html.Div([
                         html.Label('FITS file or directory', style=_CTRL_LABEL),
-                        dcc.Input(id='cv-path', type='text', value='',
-                                  placeholder='/path/to/cube.fits or /path/to/IRAM/cube',
-                                  style={'width': '100%', 'fontSize': '13px'}),
+                            _path_browse_row(
+                            'cv-path', 'btn-browse-cv-path',
+                            placeholder='Browse or paste /path/to/cube.fits or folder',
+                            browse_title='Open a file window and pick any FITS cube '
+                                         'in the folder you want to load',
+                        ),
                     ], style={'flex': '2.4', 'minWidth': '260px', 'marginRight': '18px'}),
                     html.Div([
                         html.Label('Cube', style=_CTRL_LABEL),
                         dcc.Dropdown(id='cv-file', options=[], value=None,
-                                     placeholder='Paste a path above\u2026',
+                                     placeholder='Browse or paste a path above\u2026',
                                      style={'fontSize': '13px'}),
                     ], style={'flex': '2.2', 'minWidth': '240px', 'marginRight': '18px'}),
                     html.Div([
@@ -9155,6 +10600,39 @@ app.layout = html.Div(
                     ], style={'flex': '1.3', 'minWidth': '180px'}),
                 ], className='kosma-panel',
                    style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
+                          'padding': '12px 18px', 'marginBottom': '12px'}),
+                html.Div([
+                    html.Div([
+                        html.Label('Spectral channel', style=_CTRL_LABEL),
+                        html.Div(id='cv-channel-label',
+                                 children='Load a cube to browse channels',
+                                 style={'fontSize': '13px', 'fontWeight': '600',
+                                        'marginBottom': '4px'}),
+                        html.Div([
+                            html.Button('◀', id='cv-chan-prev', n_clicks=0,
+                                        className='btn btn-ghost btn-sm',
+                                        title='Previous channel',
+                                        style={'minWidth': '40px', 'marginRight': '10px'}),
+                            html.Div(
+                                dcc.Slider(
+                                    id='cv-channel', min=0, max=0, step=1, value=0,
+                                    marks={0: '0'}, disabled=True,
+                                    updatemode='drag',
+                                    tooltip={'placement': 'bottom',
+                                             'always_visible': False},
+                                ),
+                                style={'flex': '1', 'minWidth': '200px',
+                                       'paddingTop': '6px'},
+                            ),
+                            html.Button('▶', id='cv-chan-next', n_clicks=0,
+                                        className='btn btn-ghost btn-sm',
+                                        title='Next channel',
+                                        style={'minWidth': '40px', 'marginLeft': '10px'}),
+                        ], style={'display': 'flex', 'alignItems': 'center',
+                                  'width': '100%'}),
+                    ], style={'flex': '1', 'minWidth': '280px'}),
+                ], className='kosma-panel',
+                   style={'display': 'flex', 'alignItems': 'flex-end',
                           'padding': '12px 18px', 'marginBottom': '12px'}),
                 html.Div([
                     html.Div([
@@ -9249,6 +10727,12 @@ app.layout = html.Div(
                                   'flexDirection': 'column'}),
                     ], style={'display': 'flex', 'gap': '12px',
                               'alignItems': 'stretch', 'flexWrap': 'wrap'}),
+                    dcc.Graph(id='plot-cv-ppv',
+                              figure=placeholder_fig(
+                                  '3-D position–position–velocity volume'),
+                              config=_GRAPH_CFG,
+                              style={'height': f'{_CV_PPV_HEIGHT}px',
+                                     'marginTop': '12px'}),
                     html.Div(id='cv-line-table', className='kosma-panel',
                              style={'padding': '14px 18px', 'marginTop': '12px',
                                     'maxHeight': '420px', 'overflowY': 'auto'}),
@@ -9411,11 +10895,11 @@ app.layout = html.Div(
                     ], style={'flex': '1', 'minWidth': '120px', 'marginRight': '18px'}),
                     html.Div([
                         html.Label('Output directory', style=_CTRL_LABEL),
-                        dcc.Input(id='fit-output-dir', type='text', value='',
-                                  placeholder='./map_fit_output (default)',
-                                  style={'width': '100%', 'padding': '7px 9px',
-                                         'fontSize': '13px', 'border': '1px solid #bbc',
-                                         'borderRadius': '6px'}),
+                        _path_browse_row(
+                            'fit-output-dir', 'btn-browse-fit-output',
+                            placeholder='./map_fit_output (default)',
+                            browse_title='Open a folder window and pick where map-fit output is written',
+                        ),
                     ], style={'flex': '2', 'minWidth': '220px'}),
                 ], className='kosma-panel',
                 style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
@@ -10290,6 +11774,36 @@ def _grid_sync_from_axis_tokens(axis_tokens):
         species, species_idx)
     return ([True] + slider_cfg + _interleave_slice_tab_cfgs(slice_cfg)
             + [sp_opts, defaults, cq_opts, cq_val, cd_opts, cd_val, ie_cq_opts, ie_cq_val])
+
+
+@app.callback(
+    [Output(spec['input'], 'value') for spec in _PATH_BROWSE],
+    [Input(spec['button'], 'n_clicks') for spec in _PATH_BROWSE],
+    [State(spec['input'], 'value') for spec in _PATH_BROWSE],
+    prevent_initial_call=True,
+)
+def handle_path_browse(*args):
+    """Open a native file or folder window and fill the matching path field."""
+    n = len(_PATH_BROWSE)
+    trig = getattr(dash.callback_context, 'triggered_id', None)
+    idx = next((i for i, spec in enumerate(_PATH_BROWSE)
+                if spec['button'] == trig), None)
+    if idx is None:
+        raise PreventUpdate
+    spec = _PATH_BROWSE[idx]
+    current = args[n + idx]
+    if spec.get('mode') == 'directory':
+        picked = _native_pick_folder(spec['title'], current)
+    else:
+        picked = _native_pick_file(spec['title'], current, spec.get('filetypes'))
+    if not picked:
+        raise PreventUpdate
+    path = _resolve_browse_path(picked, spec.get('keep', 'folder'))
+    if not path:
+        raise PreventUpdate
+    out = [dash.no_update] * n
+    out[idx] = path
+    return out
 
 
 @app.callback(
@@ -11569,10 +13083,11 @@ def update_cv_hdu(path):
     State('cv-v-low', 'value'),
     State('cv-v-high', 'value'),
     State('cv-map-metric', 'value'),
+    State('cv-channel', 'value'),
     prevent_initial_call=True,
 )
 def update_cv_selection(path, hdu, click_data, selected_data,
-                        v_low, v_high, metric):
+                        v_low, v_high, metric, channel_index):
     trig = dash.callback_context.triggered[0]['prop_id'] if dash.callback_context.triggered else ''
     cube, err = _load_cv_cube(path, hdu)
     if cube is None:
@@ -11580,8 +13095,12 @@ def update_cv_selection(path, hdu, click_data, selected_data,
 
     if trig.startswith('cv-file') or trig.startswith('cv-hdu'):
         try:
-            lo, hi = _cv_velocity_window(v_low, v_high)
-            map2d = cv.collapse_map(cube, lo, hi, metric=metric or DEFAULT_CUBE_MAP_METRIC)
+            if _cv_map_metric(metric) in ('channel', 'chan', 'plane'):
+                map2d = cv.channel_map(cube, channel_index)
+            else:
+                lo, hi = _cv_velocity_window(v_low, v_high)
+                map2d = cv.collapse_map(
+                    cube, lo, hi, metric=metric or DEFAULT_CUBE_MAP_METRIC)
             peak = cv.peak_cell(cube, map2d)
         except Exception:
             peak = None
@@ -11613,6 +13132,47 @@ def update_cv_selection(path, hdu, click_data, selected_data,
 
 
 @app.callback(
+    Output('cv-channel', 'max'),
+    Output('cv-channel', 'value'),
+    Output('cv-channel', 'marks'),
+    Output('cv-channel', 'disabled'),
+    Input('cv-file', 'value'),
+    Input('cv-hdu', 'value'),
+    Input('cv-chan-prev', 'n_clicks'),
+    Input('cv-chan-next', 'n_clicks'),
+    State('cv-channel', 'value'),
+)
+def update_cv_channel(path, hdu, n_prev, n_next, current):
+    cube, err = _load_cv_cube(path, hdu)
+    if cube is None or cube.nchan < 1:
+        return 0, 0, {0: '0'}, True
+    last = cube.nchan - 1
+    trig = getattr(dash.callback_context, 'triggered_id', None)
+    if trig in ('cv-chan-prev', 'cv-chan-next') and cube.nchan > 1:
+        cur = cv.clamp_channel(cube, current)
+        if trig == 'cv-chan-prev':
+            val = (cur - 1) % cube.nchan
+        else:
+            val = (cur + 1) % cube.nchan
+    else:
+        val = cv.default_channel_index(cube)
+    return last, val, _cv_channel_marks(cube.nchan), cube.nchan <= 1
+
+
+@app.callback(
+    Output('cv-channel-label', 'children'),
+    Input('cv-file', 'value'),
+    Input('cv-hdu', 'value'),
+    Input('cv-channel', 'value'),
+)
+def update_cv_channel_label(path, hdu, channel_index):
+    cube, err = _load_cv_cube(path, hdu)
+    if cube is None:
+        return err or 'Load a cube to browse channels'
+    return cv.channel_label(cube, channel_index)
+
+
+@app.callback(
     Output('plot-cv-map', 'figure'),
     Input('cv-file', 'value'),
     Input('cv-hdu', 'value'),
@@ -11623,14 +13183,30 @@ def update_cv_selection(path, hdu, click_data, selected_data,
     Input('cv-zscale', 'value'),
     Input('cv-selection', 'data'),
     Input('cv-spec-mode', 'value'),
+    Input('cv-channel', 'value'),
     Input('plot-theme', 'value'),
 )
 def update_cv_map(path, hdu, metric, v_low, v_high, colorscale, zscale,
-                  selection, spec_mode, plot_theme):
+                  selection, spec_mode, channel_index, plot_theme):
     return fig_cube_map(
         path, hdu, metric, v_low, v_high,
         _parse_grid_colorscale(colorscale), zscale or 'linear',
         selection=selection, spec_mode=spec_mode or DEFAULT_CUBE_SPEC_MODE,
+        theme=_parse_plot_theme(plot_theme),
+        channel_index=channel_index,
+    )
+
+
+@app.callback(
+    Output('plot-cv-ppv', 'figure'),
+    Input('cv-file', 'value'),
+    Input('cv-hdu', 'value'),
+    Input('cv-colorscale', 'value'),
+    Input('plot-theme', 'value'),
+)
+def update_cv_ppv(path, hdu, colorscale, plot_theme):
+    return fig_cube_ppv(
+        path, hdu, _parse_grid_colorscale(colorscale),
         theme=_parse_plot_theme(plot_theme),
     )
 
@@ -11667,12 +13243,13 @@ def update_cv_gauss_rows(n, amps, centers, fwhms):
     Input('cv-mark-lines', 'value'),
     Input('cv-v-source', 'value'),
     Input('cv-eu-max', 'value'),
+    Input('cv-channel', 'value'),
     Input('plot-theme', 'value'),
 )
 def update_cv_spectrum(path, hdu, selection, spec_mode, v_low, v_high, n_gauss, do_fit,
                        gauss_amps, gauss_centers, gauss_fwhms, gauss_lock,
                        xaxis, linecat, mark_lines, v_source, eu_max,
-                       plot_theme):
+                       channel_index, plot_theme):
     fig, summary, line_table = fig_cube_spectrum(
         path, hdu, selection, v_low, v_high, n_gauss,
         do_fit='on' in (do_fit or []),
@@ -11685,6 +13262,7 @@ def update_cv_spectrum(path, hdu, selection, spec_mode, v_low, v_high, n_gauss, 
         v_source=v_source if v_source is not None else 0.0,
         eu_max=eu_max if eu_max is not None else 150.0,
         spec_mode=spec_mode or DEFAULT_CUBE_SPEC_MODE,
+        channel_index=channel_index,
     )
     return (fig,
             summary if summary is not None else html.Div(),
@@ -12970,6 +14548,562 @@ def update_cr_atten_plot(profiles, active, x_axis, options, stop_rate, plot_them
         stopping_rate=stop_rate,
         show_threshold='threshold' in opts,
         theme=_parse_plot_theme(plot_theme),
+    )
+
+
+def _probe_available_tracers(quantity, idef):
+    if quantity == 'intensity':
+        return gf.list_simline_line_keys(_simline, idef or SIMLINE_DEFAULT_IDEF)
+    return list((_grid or {}).get('species') or [])
+
+
+def _probe_typical_tracers(names, quantity):
+    names = list(names or [])
+    if quantity == 'intensity':
+        picked = [n for n in names if n.split('(')[0] in PROBE_TYPICAL_SPECIES]
+        return picked[:12] or names[:8]
+    picked = [s for s in PROBE_TYPICAL_SPECIES if s in names]
+    return picked or names[:8]
+
+
+def _probe_filter_flags(filter_value):
+    if filter_value == 'species':
+        return True, False
+    if filter_value == 'ratios':
+        return False, True
+    return False, False
+
+
+def _probe_regime_options(ranking):
+    regimes = sorted((ranking or {}).get('crir_regimes') or [],
+                     key=lambda r: (r.get('lo', 0.0), r.get('name', '')))
+    opts = []
+    for r in regimes:
+        lo, hi = r.get('lo'), r.get('hi')
+        if lo is not None and hi is not None:
+            label = pr.crir_regime_label(lo, hi, wrap=False)
+        else:
+            label = r.get('label') or r['name']
+        opts.append({'label': label, 'value': r['name']})
+    return opts, [o['value'] for o in opts]
+
+
+_PR_ENV_COLUMNS = [
+    ('Rank', 'Rank', 'int'),
+    ('Species', 'Tracer', 'str'),
+    ('Regime', 'CRIR regime', 'str'),
+    ('n', 'n_H', 'phys'),
+    ('fuv', 'G₀', 'phys'),
+    ('probe_score', 'S', 'score'),
+    ('functional_factor', 'F', 'score'),
+    ('variation_factor', 'V', 'score'),
+    ('trend', 'Trend', 'str'),
+    ('n_reversals', 'Reversals', 'int'),
+    ('log_dynamic_range', 'Δlog y', 'score'),
+    ('Quartile', 'Relative Q', 'str'),
+    ('Absolute_Quartile', 'Absolute Q', 'str'),
+    ('Is_Ratio', 'Ratio?', 'bool'),
+]
+_PR_ROBUST_COLUMNS = [
+    ('Species', 'Tracer', 'str'),
+    ('Regime', 'CRIR regime', 'str'),
+    ('Peak_Probe_Score', 'Peak S', 'score'),
+    ('Median_Probe_Score', 'Median S', 'score'),
+    ('Best_n', 'Best n_H', 'phys'),
+    ('Best_fuv', 'Best G₀', 'phys'),
+    ('Frac_Good_Environments', 'Good env.', 'pct'),
+    ('N_Good_Environments', 'N good', 'int'),
+    ('N_Environments', 'N env.', 'int'),
+    ('Is_Ratio', 'Ratio?', 'bool'),
+]
+_PR_SUMMARY_COLUMNS = [
+    ('Rank', 'Rank', 'int'),
+    ('Species', 'Tracer', 'str'),
+    ('Regime', 'CRIR regime', 'str'),
+    ('Median_Probe_Score', 'Median S', 'score'),
+    ('Mean_Probe_Score', 'Mean S', 'score'),
+    ('P25_Probe_Score', 'P25 S', 'score'),
+    ('P75_Probe_Score', 'P75 S', 'score'),
+    ('Max_Probe_Score', 'Max S', 'score'),
+    ('Median_Functional', 'Median F', 'score'),
+    ('Median_Variation', 'Median V', 'score'),
+    ('Median_Spearman_Rho', 'Median ρ', 'score'),
+    ('Median_Net_Log_Slope', 'Median slope', 'score'),
+    ('Median_Log_Dynamic_Range', 'Median Δlog y', 'score'),
+    ('Frac_Strong_Environments', 'Strong env.', 'pct'),
+    ('Frac_Good_Environments', 'Good env.', 'pct'),
+    ('Frac_Observable', 'Observable', 'pct'),
+    ('Frac_Monotonic', 'Monotonic', 'pct'),
+    ('Quartile', 'Quartile', 'str'),
+    ('N_Environments', 'N env.', 'int'),
+    ('Is_Ratio', 'Ratio?', 'bool'),
+]
+_PR_SLICE_COLUMNS = [
+    ('Species', 'Tracer', 'str'),
+    ('Regime', 'CRIR regime', 'str'),
+    ('n', 'n_H', 'phys'),
+    ('fuv', 'G₀', 'phys'),
+    ('probe_score', 'S', 'score'),
+    ('functional_factor', 'F', 'score'),
+    ('variation_factor', 'V', 'score'),
+    ('trend', 'Trend', 'str'),
+    ('n_reversals', 'Reversals', 'int'),
+    ('log_dynamic_range', 'Δlog y', 'score'),
+    ('observable', 'Observable', 'bool'),
+    ('score_status', 'Status', 'str'),
+]
+
+
+@app.callback(
+    Output('pr-tracers', 'options'),
+    Output('pr-tracers', 'value'),
+    Output('pr-idef-wrap', 'style'),
+    Input('grid-loaded', 'data'),
+    Input('simline-state', 'data'),
+    Input('pr-quantity', 'value'),
+    Input('pr-idef', 'value'),
+    Input('pr-btn-typical', 'n_clicks'),
+    Input('pr-btn-all', 'n_clicks'),
+    State('pr-tracers', 'value'),
+)
+def sync_probe_tracers(_loaded, _sim_state, quantity, idef, n_typ, n_all, current):
+    quantity = quantity or 'rel_abund'
+    names = _probe_available_tracers(quantity, idef)
+    opts = [{'label': n, 'value': n} for n in names]
+    trigger = (dash.callback_context.triggered[0]['prop_id'].split('.')[0]
+               if dash.callback_context.triggered else '')
+    valid = set(names)
+    kept = [v for v in _as_str_list(current) if v in valid]
+    if trigger == 'pr-btn-all':
+        value = names
+    elif trigger == 'pr-btn-typical' or trigger in (
+            'pr-quantity', 'grid-loaded', 'simline-state', 'pr-idef', ''):
+        value = _probe_typical_tracers(names, quantity)
+    else:
+        value = kept or _probe_typical_tracers(names, quantity)
+    idef_style = dict(_CTRL_BOX)
+    idef_style['minWidth'] = '160px'
+    if quantity != 'intensity':
+        idef_style['display'] = 'none'
+    return opts, value, idef_style
+
+
+@app.callback(
+    Output('pr-status', 'children', allow_duplicate=True),
+    Output('pr-progress-interval', 'disabled', allow_duplicate=True),
+    Output('pr-progress-wrap', 'style', allow_duplicate=True),
+    Output('pr-progress-fill', 'style', allow_duplicate=True),
+    Output('pr-progress-label', 'children', allow_duplicate=True),
+    Output('pr-btn-compute', 'disabled', allow_duplicate=True),
+    Input('pr-btn-compute', 'n_clicks'),
+    State('pr-quantity', 'value'),
+    State('pr-tracers', 'value'),
+    State('pr-include-ratios', 'value'),
+    State('pr-idef', 'value'),
+    State('pr-plateau-factor', 'value'),
+    State('pr-min-abund', 'value'),
+    State('pr-min-points', 'value'),
+    State('pr-min-span', 'value'),
+    State('pr-var-cap', 'value'),
+    State('pr-good-score', 'value'),
+    State('pr-regime-edges', 'value'),
+    State('pr-interp-enable', 'value'),
+    State('pr-interp-n', 'value'),
+    *[State(f'slider-{d}', 'value') for d in range(N_PARAMS)],
+    prevent_initial_call=True,
+)
+def handle_probe_ranking(n_clicks, quantity, tracers, include_ratios, idef,
+                         plateau_factor, min_abund, min_points, min_span,
+                         var_cap, good_score, regime_edges,
+                         interp_enable, interp_n, *slider_values):
+    if not n_clicks:
+        raise PreventUpdate
+    with _probe_job_lock:
+        if _probe_progress['running']:
+            return (
+                html.Span('Ranking already running…', className='kosma-muted'),
+                False,
+                {'display': 'block'},
+                {'width': f'{int(100 * _probe_progress["frac"])}%'},
+                _probe_progress['message'] or 'Working…',
+                True,
+            )
+        _probe_progress['running'] = True
+        _probe_progress['frac'] = 0.0
+        _probe_progress['message'] = 'Starting…'
+        _probe_progress['error'] = None
+    kwargs = dict(
+        quantity=quantity,
+        tracers=tracers,
+        include_ratios='on' in (include_ratios or []),
+        slider_values=list(slider_values),
+        idef=idef,
+        plateau_factor=plateau_factor,
+        min_abundance=min_abund,
+        min_points=min_points,
+        min_span=min_span,
+        var_cap=var_cap,
+        good_score=good_score,
+        regime_edges_text=regime_edges,
+    )
+    interp_target_shape = None
+    if 'on' in (interp_enable or []):
+        try:
+            n = int(interp_n)
+        except (TypeError, ValueError):
+            n = 60
+        interp_target_shape = (n, n, n)
+    kwargs['interp_target_shape'] = interp_target_shape
+    threading.Thread(
+        target=_run_probe_ranking_worker, args=(kwargs,), daemon=True,
+    ).start()
+    return (
+        html.Span([
+            html.Span('Computing', className='status-chip'),
+            html.Span('  Reading the grid and scoring tracers…',
+                      className='kosma-muted', style={'marginLeft': '10px'}),
+        ]),
+        False,
+        {'display': 'block'},
+        {'width': '0%'},
+        'Starting…',
+        True,
+    )
+
+
+@app.callback(
+    Output('pr-progress-fill', 'style', allow_duplicate=True),
+    Output('pr-progress-label', 'children', allow_duplicate=True),
+    Output('pr-progress-wrap', 'style', allow_duplicate=True),
+    Output('pr-progress-interval', 'disabled', allow_duplicate=True),
+    Output('pr-status', 'children', allow_duplicate=True),
+    Output('pr-state', 'data'),
+    Output('pr-btn-compute', 'disabled', allow_duplicate=True),
+    Input('pr-progress-interval', 'n_intervals'),
+    State('pr-state', 'data'),
+    prevent_initial_call=True,
+)
+def poll_probe_ranking_progress(_n, state):
+    snap = _probe_snapshot()
+    pct = int(round(100.0 * float(snap.get('frac') or 0.0)))
+    fill = {'width': f'{pct}%'}
+    label = snap.get('message') or ''
+    if label:
+        label = f'{pct}%  ·  {label}'
+    else:
+        label = f'{pct}%'
+    wrap = {'display': 'block'}
+    if snap.get('running'):
+        return fill, label, wrap, False, dash.no_update, dash.no_update, True
+
+    if snap.get('token') == snap.get('seen_token'):
+        raise PreventUpdate
+
+    with _probe_job_lock:
+        _probe_progress['seen_token'] = snap['token']
+
+    if snap.get('error'):
+        err = html.Span(f'\u2717  {snap["error"]}',
+                        style={'color': '#d62728', 'fontWeight': '600'})
+        return fill, label, wrap, True, err, (state or 0) + 1, False
+
+    ranking = (_probe_results or {}).get('ranking') or {}
+    status = _probe_ranked_status(ranking) if ranking else html.Span(
+        'Ranking finished.', className='kosma-muted')
+    return {'width': '100%'}, '100%  ·  Done', wrap, True, status, (state or 0) + 1, False
+
+
+@app.callback(
+    Output('pr-n-values', 'options'),
+    Output('pr-n-values', 'value'),
+    Output('pr-fuv-values', 'options'),
+    Output('pr-fuv-values', 'value'),
+    Output('pr-regime', 'options'),
+    Output('pr-regime', 'value'),
+    Output('pr-hm-species', 'options'),
+    Output('pr-hm-species', 'value', allow_duplicate=True),
+    Output('pr-hm-regime', 'options'),
+    Output('pr-hm-regime', 'value'),
+    Output('pr-tr-species', 'options'),
+    Output('pr-tr-species', 'value'),
+    Output('pr-tr-n', 'options'),
+    Output('pr-tr-n', 'value'),
+    Output('pr-tr-fuv', 'options'),
+    Output('pr-tr-fuv', 'value'),
+    Output('pr-n-label', 'children'),
+    Output('pr-fuv-label', 'children'),
+    Output('pr-tr-n-label', 'children'),
+    Output('pr-tr-fuv-label', 'children'),
+    Input('pr-state', 'data'),
+    State('pr-n-values', 'value'),
+    State('pr-fuv-values', 'value'),
+    State('pr-hm-species', 'value'),
+    State('pr-tr-species', 'value'),
+    prevent_initial_call=True,
+)
+def sync_probe_display_options(_state, cur_n, cur_fuv, cur_hm, cur_tr):
+    ranking = (_probe_results or {}).get('ranking') or {}
+    n_levels = ranking.get('n_levels') or []
+    fuv_levels = ranking.get('fuv_levels') or []
+    n_opts = pr.level_options(n_levels)
+    fuv_opts = pr.level_options(fuv_levels)
+    n_default = pr.default_kosens_env_values(n_levels, pr.KOSENS_DEFAULT_N_ENV)
+    fuv_default = pr.default_kosens_env_values(fuv_levels, pr.KOSENS_DEFAULT_FUV_ENV)
+    n_valid = {o['value'] for o in n_opts}
+    fuv_valid = {o['value'] for o in fuv_opts}
+    n_val = [v for v in (cur_n or []) if v in n_valid] or n_default
+    fuv_val = [v for v in (cur_fuv or []) if v in fuv_valid] or fuv_default
+
+    reg_opts, reg_val = _probe_regime_options(ranking)
+    hm_reg_opts = [{'label': 'All regimes', 'value': 'all'}] + reg_opts
+
+    species = ranking.get('species_list') or []
+    sp_opts = [{'label': s, 'value': s} for s in species]
+    sp_valid = set(species)
+    hm_kept = [s for s in _as_str_list(cur_hm) if s in sp_valid]
+    hm_val = hm_kept or _probe_heatmap_default_species(ranking)
+
+    summary = ranking.get('summary') or []
+    top = []
+    seen = set()
+    for row in sorted(summary, key=lambda r: -(r.get('Median_Probe_Score') or -1)):
+        if row['Species'] in seen:
+            continue
+        seen.add(row['Species'])
+        top.append(row['Species'])
+        if len(top) >= 6:
+            break
+    tr_kept = [s for s in _as_str_list(cur_tr) if s in sp_valid]
+    tr_val = tr_kept or top or species[:6]
+    n_mid = n_default[len(n_default) // 2] if n_default else None
+
+    n_lab = _math_label(pr.axis_display_label(
+        ranking.get('density_key', 'densities'), log=False, html=False))
+    fuv_lab = _math_label(pr.axis_display_label(
+        ranking.get('fuv_key', 'fuv_values'), log=False, html=False))
+    return (
+        n_opts, n_val, fuv_opts, fuv_val,
+        reg_opts, reg_val,
+        sp_opts, hm_val,
+        hm_reg_opts, 'all',
+        sp_opts, tr_val,
+        n_opts, n_mid,
+        fuv_opts, fuv_val,
+        n_lab, fuv_lab, n_lab, fuv_lab,
+    )
+
+
+@app.callback(
+    Output('pr-hm-species', 'value', allow_duplicate=True),
+    Input('pr-hm-btn-all', 'n_clicks'),
+    Input('pr-hm-btn-typical', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def pick_heatmap_species(_n_all, _n_typ):
+    ranking = (_probe_results or {}).get('ranking') or {}
+    species = ranking.get('species_list') or []
+    if not species:
+        raise PreventUpdate
+    trigger = (dash.callback_context.triggered[0]['prop_id'].split('.')[0]
+               if dash.callback_context.triggered else '')
+    if trigger == 'pr-hm-btn-all':
+        return species
+    return _probe_heatmap_default_species(ranking)
+
+
+@app.callback(
+    Output('pr-plot-env', 'children'),
+    Output('pr-env-note', 'children'),
+    Output('pr-table-env', 'children'),
+    Output('pr-table-summary', 'children'),
+    Output('pr-table-robust', 'children'),
+    Output('pr-table-regime-top', 'children'),
+    Output('pr-table-slice', 'children'),
+    Output('pr-plot-heatmap', 'children'),
+    Output('pr-hm-note', 'children'),
+    Output('pr-plot-trends', 'figure'),
+    Output('pr-plot-trends', 'style'),
+    Input('pr-state', 'data'),
+    Input('pr-n-values', 'value'),
+    Input('pr-fuv-values', 'value'),
+    Input('pr-regime', 'value'),
+    Input('pr-top-n', 'value'),
+    Input('pr-tracer-filter', 'value'),
+    Input('pr-color-mode', 'value'),
+    Input('pr-hm-species', 'value'),
+    Input('pr-hm-metric', 'value'),
+    Input('pr-hm-colorscale', 'value'),
+    Input('pr-hm-regime', 'value'),
+    Input('pr-hm-log', 'value'),
+    Input('pr-tr-species', 'value'),
+    Input('pr-tr-n', 'value'),
+    Input('pr-tr-fuv', 'value'),
+    Input('pr-tr-yscale', 'value'),
+    Input('pr-tr-ncol', 'value'),
+    Input('pr-tr-plateau', 'value'),
+    Input('plot-theme', 'value'),
+    Input('grid-colorscale', 'value'),
+)
+def render_probe_ranking(
+        _state, n_values, fuv_values, regime, top_n, tracer_filter, color_mode,
+        hm_species, hm_metric, hm_cscale, hm_regime, hm_log,
+        tr_species, tr_n, tr_fuv, tr_yscale, tr_ncol, tr_plateau,
+        plot_theme, grid_colorscale):
+    theme = _parse_plot_theme(plot_theme)
+    t = _theme_colors(theme)
+    empty_env = placeholder_fig('Compute a ranking', theme=theme)
+    empty_hm = placeholder_fig('Compute a ranking, then pick tracers', theme=theme)
+    empty_tr = placeholder_fig('Compute a ranking, then pick tracers', theme=theme)
+    empty_tbl = _probe_table([], [])
+    empty_tr_style = _probe_graph_style(empty_tr, 480)
+    empty_env_children = [_probe_env_figure_block(empty_env)]
+    empty_hm_children = html.Div(
+        [_probe_env_figure_block(empty_hm)], className='probe-heatmap-empty',
+    )
+    cached = _probe_results or {}
+    ranking = cached.get('ranking')
+    grids = cached.get('grids') or {}
+    grids_native = cached.get('grids_native') or grids
+    if not ranking:
+        return (empty_env_children, '', empty_tbl, empty_tbl, empty_tbl,
+                empty_tbl, empty_tbl, empty_hm_children, '', empty_tr,
+                empty_tr_style)
+
+    species_only, ratios_only = _probe_filter_flags(tracer_filter)
+    try:
+        top_n = int(top_n or 8)
+    except (TypeError, ValueError):
+        top_n = 8
+    regime_names = _as_str_list(regime)
+    n_sel = _probe_float_list(n_values)
+    fuv_sel = _probe_float_list(fuv_values)
+    env_blocks = []
+    for spec in pr._ordered_regimes(ranking, regime_names or None):
+        env_fig = pr.fig_environment_ranking(
+            ranking,
+            regime=spec['name'],
+            n_values=n_sel,
+            fuv_values=fuv_sel,
+            species_only=species_only,
+            ratios_only=ratios_only,
+            top_n=max(3, top_n),
+            color_mode=color_mode or 'quartile',
+            theme=t,
+        ) or empty_env
+        env_blocks.append(_probe_env_figure_block(
+            env_fig, pr.explain_regime_plot(ranking, spec['name']),
+        ))
+    if not env_blocks:
+        env_blocks = empty_env_children
+
+    env_rows = pr.ranking_at_environments(
+        ranking,
+        n_values=n_sel,
+        fuv_values=fuv_sel,
+        all_environments=True,
+        species_only=species_only,
+        ratios_only=ratios_only,
+    )
+    if regime_names:
+        env_rows = [r for r in env_rows if r.get('Regime') in regime_names]
+    env_table = _probe_table(
+        env_rows, _PR_ENV_COLUMNS, max_rows=200,
+        empty='No environment ranking rows for this selection.')
+
+    regime_top_rows = pr.top_tracers_per_regime(
+        env_rows, top_n=5, species_only=species_only, ratios_only=ratios_only,
+    )
+    regime_top_table = _probe_table(
+        regime_top_rows, _PR_ENV_COLUMNS, max_rows=200,
+        empty='No regime leader rows.')
+
+    slice_rows = list(ranking.get('slice_scores') or [])
+    if regime_names:
+        slice_rows = [r for r in slice_rows if r.get('Regime') in regime_names]
+    if species_only:
+        slice_rows = [r for r in slice_rows if '/' not in r.get('Species', '')]
+    elif ratios_only:
+        slice_rows = [r for r in slice_rows if '/' in r.get('Species', '')]
+    slice_table = _probe_table(
+        slice_rows, _PR_SLICE_COLUMNS, max_rows=200,
+        empty='No per-environment slice scores.')
+
+    hm_list = _as_str_list(hm_species)
+    hm_regime_arg = None if hm_regime in (None, 'all') else hm_regime
+    hm_notes = []
+    hm_blocks = empty_hm_children
+    if hm_list:
+        pairs = pr.score_heatmap_figures(
+            ranking, hm_list,
+            regime=hm_regime_arg,
+            value_col=hm_metric or 'probe_score',
+            theme=t,
+            colorscale=_parse_grid_colorscale(hm_cscale or grid_colorscale),
+            use_log_colorbar='on' in (hm_log or []),
+        )
+        cards = []
+        for sp, fig in pairs:
+            msgs = []
+            for spec in pr._ordered_regimes(ranking, hm_regime_arg):
+                msg = pr.explain_regime_plot(ranking, spec['name'], species=[sp])
+                if msg:
+                    msgs.append(f'{sp}: {msg}')
+            cards.append(_probe_heatmap_card(
+                sp, fig, ' '.join(msgs) if msgs else None,
+            ))
+        if cards:
+            hm_blocks = _probe_heatmap_grid(cards)
+        else:
+            hm_notes.append(
+                'No heatmap to draw. Typical / Q1 (green) only includes tracers '
+                'that reach the top quartile of median score in a CRIR regime.'
+            )
+    robust_rows = ranking.get('robustness') or []
+    if regime_names:
+        robust_show = [r for r in robust_rows if r.get('Regime') in regime_names]
+    else:
+        robust_show = robust_rows
+    if species_only:
+        robust_show = [r for r in robust_show if not r.get('Is_Ratio')]
+    elif ratios_only:
+        robust_show = [r for r in robust_show if r.get('Is_Ratio')]
+    robust_table = _probe_table(
+        robust_show, _PR_ROBUST_COLUMNS, max_rows=200,
+        empty='No robustness rows.')
+
+    try:
+        ncol = int(tr_ncol or 3)
+    except (TypeError, ValueError):
+        ncol = 3
+    tr_fig = pr.fig_response_curves(
+        grids_native, ranking,
+        species_list=_as_str_list(tr_species),
+        n_level=float(tr_n) if tr_n not in (None, '') else None,
+        fuv_values=_probe_float_list(tr_fuv),
+        grid_type=ranking.get('quantity', 'rel_abund'),
+        y_scale=tr_yscale or 'log',
+        shade_plateaus='on' in (tr_plateau or []),
+        ncol=max(1, min(4, ncol)),
+        theme=t,
+    ) or empty_tr
+    summary_rows = ranking.get('summary') or []
+    if regime_names:
+        summary_show = [r for r in summary_rows if r.get('Regime') in regime_names]
+    else:
+        summary_show = summary_rows
+    if species_only:
+        summary_show = [r for r in summary_show if not r.get('Is_Ratio')]
+    elif ratios_only:
+        summary_show = [r for r in summary_show if r.get('Is_Ratio')]
+    summary_table = _probe_table(
+        summary_show, _PR_SUMMARY_COLUMNS, max_rows=200,
+        empty='No summary rows.')
+
+    return (
+        env_blocks, '', env_table, summary_table, robust_table,
+        regime_top_table, slice_table,
+        hm_blocks, _probe_note_children(hm_notes),
+        tr_fig, _probe_graph_style(tr_fig, 480),
     )
 
 

@@ -1,10 +1,14 @@
 """
-CARTA-like spectral-cube viewer for CLASS/GILDAS MATRIX tables and image cubes.
+CARTA-like spectral-cube viewer for CLASS/GILDAS MATRIX tables and image cubes
+(CASA ``.image.fits`` / ``.pbcor.fits``, 3-D or 4-D with a dummy Stokes axis).
 
 IRAM 30 m OTF maps are often exported as CLASS binary tables (one spectrum per
 row, spatial offsets in CDELT2/CDELT3), not NAXIS=3 FITS images.  This module
 grids those rows onto the regular offset lattice, collapses a moment / peak
-map, and extracts the spectrum of a clicked pixel or a selected region.
+map or a single spectral channel, and extracts the spectrum of a clicked pixel
+or a selected region.  CASA image cubes are read from the primary image HDU
+(the ``BEAMS`` table is skipped).  A downsampled position–position–velocity
+volume is built for a 3-D Plotly view.
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ except ImportError:  # pragma: no cover
 FWHM_SIGMA = 2.0 * np.sqrt(2.0 * np.log(2.0))  # ≈ 2.3548
 _DEFAULT_GRID_ARCSEC = 15.0
 _CACHE_MAX = 4
+PPV_MAX_SIDE = 40  # max samples per PPV axis (~40³ voxels for Plotly Volume)
 _cube_cache: Dict[Tuple[str, int], Tuple[float, 'SpectralCube']] = {}
 
 _FILE_SPEC_RE = re.compile(
@@ -160,10 +165,23 @@ def list_cube_fits(path: str) -> List[Dict[str, str]]:
 
 
 def default_hdu_index(path: str) -> int:
-    """CLASS MATRIX tables live in HDU 1; image cubes usually in HDU 0."""
+    """Prefer an image cube (CASA primary), then a CLASS MATRIX table."""
     if fits is None:
-        return 1
+        return 0
     with fits.open(os.path.expanduser(path), memmap=False) as hdul:
+        image_i = None
+        matrix_i = None
+        for i, hdu in enumerate(hdul):
+            if _is_class_matrix_hdu(hdu):
+                if matrix_i is None:
+                    matrix_i = i
+            elif _is_image_cube_hdu(hdu):
+                if image_i is None:
+                    image_i = i
+        if image_i is not None:
+            return image_i
+        if matrix_i is not None:
+            return matrix_i
         if len(hdul) > 1 and getattr(hdul[0], 'data', None) is None:
             return 1
         return 0
@@ -248,11 +266,42 @@ def _assign_grid(ra_off: np.ndarray, dec_off: np.ndarray
     return iy, ix, ra_axis, dec_axis, row_index, step * 3600.0
 
 
+def _is_class_matrix_hdu(hdu) -> bool:
+    data = getattr(hdu, 'data', None)
+    if data is None or not hasattr(data, 'names'):
+        return False
+    names = {str(n).upper() for n in (data.names or [])}
+    return 'SPECTRUM' in names and 'CDELT2' in names and 'CDELT3' in names
+
+
+def _is_image_cube_hdu(hdu) -> bool:
+    data = getattr(hdu, 'data', None)
+    if data is None or hasattr(data, 'names'):
+        return False
+    try:
+        arr = np.asarray(data)
+    except Exception:
+        return False
+    return arr.ndim >= 2 and arr.size > 0
+
+
+def _squeeze_dummy_axes(data, header):
+    """Drop size-1 STOKES / dummy FITS axes (CASA cubes are often 4-D)."""
+    return osf.squeeze_dummy_fits_axes(data, header)
+
+
 def _spatial_axes_from_image_header(header, spectral_axis: int, ny: int, nx: int
                                     ) -> Tuple[np.ndarray, np.ndarray, Optional[float], Optional[float]]:
     """Pixel-centre offsets (deg) for the two non-spectral axes of an image cube."""
-    axes = [ax for ax in range(1, int(header.get('NAXIS', 2)) + 1)
-            if ax != int(spectral_axis)]
+    axes = []
+    naxis = int(header.get('NAXIS', 2) or 2)
+    for ax in range(1, naxis + 1):
+        if ax == int(spectral_axis):
+            continue
+        ctype = str(header.get(f'CTYPE{ax}', '') or '')
+        if osf._ctype_is_stokes(ctype):
+            continue
+        axes.append(ax)
     if len(axes) < 2:
         ra_axis = (np.arange(nx) - 0.5 * (nx - 1)) * (_DEFAULT_GRID_ARCSEC / 3600.0)
         dec_axis = (np.arange(ny) - 0.5 * (ny - 1)) * (_DEFAULT_GRID_ARCSEC / 3600.0)
@@ -261,7 +310,10 @@ def _spatial_axes_from_image_header(header, spectral_axis: int, ny: int, nx: int
     def _axis(ax, n):
         crpix = float(header.get(f'CRPIX{ax}', 1.0) or 1.0)
         crval = float(header.get(f'CRVAL{ax}', 0.0) or 0.0)
-        cdelt = float(header.get(f'CDELT{ax}', 0.0) or 0.0)
+        try:
+            cdelt = float(osf._axis_increment(header, ax))
+        except KeyError:
+            cdelt = float(header.get(f'CDELT{ax}', 0.0) or 0.0)
         cunit = str(header.get(f'CUNIT{ax}', 'deg')).strip().lower()
         pix = np.arange(n) + 1.0
         world = crval + (pix - crpix) * cdelt
@@ -353,13 +405,26 @@ def _load_class_matrix(hdu, path: str, hdu_index: int) -> SpectralCube:
 
 def _load_image_cube(hdu, path: str, hdu_index: int) -> SpectralCube:
     header = hdu.header
-    spectral_axis, v = osf._spectral_axis_from_header_kms(header)
-    cube_sl = osf._cube_spectral_last(np.asarray(hdu.data, dtype=float), spectral_axis)
+    data = osf.squeeze_dummy_fits_axes(hdu.data, header)
+    spectral_axis, v = osf._spectral_axis_from_header_kms(header, nchan=None)
+    cube_sl = osf._cube_spectral_last(np.asarray(data, dtype=float), spectral_axis)
+    while cube_sl.ndim > 3:
+        dropped = False
+        for ax in range(cube_sl.ndim - 1):
+            if cube_sl.shape[ax] == 1:
+                cube_sl = np.squeeze(cube_sl, axis=ax)
+                dropped = True
+                break
+        if not dropped:
+            cube_sl = cube_sl.reshape(-1, cube_sl.shape[-2], cube_sl.shape[-1])
+            break
     if cube_sl.ndim == 1:
         cube_sl = cube_sl.reshape(1, 1, -1)
     elif cube_sl.ndim == 2:
         cube_sl = cube_sl.reshape(1, cube_sl.shape[0], cube_sl.shape[1])
     ny, nx, nchan = cube_sl.shape
+    if v.size != nchan:
+        spectral_axis, v = osf._spectral_axis_from_header_kms(header, nchan=nchan)
     spectra = cube_sl.reshape(ny * nx, nchan)
     ra_axis, dec_axis, crval2, crval3 = _spatial_axes_from_image_header(
         header, spectral_axis, ny, nx)
@@ -376,17 +441,19 @@ def _load_image_cube(hdu, path: str, hdu_index: int) -> SpectralCube:
             row_index[iy[r], ix[r]] = -1
     rest_hz = osf.rest_frequency_hz_from_header(header)
     rest_ghz = None if rest_hz is None else rest_hz / 1e9
+    freq_ghz = osf.frequency_ghz_from_header(header, nchan=nchan)
+    if freq_ghz is not None and freq_ghz.size != nchan:
+        freq_ghz = None
     dv = np.diff(v)
     deltav = float(np.median(dv)) if dv.size else float('nan')
     step_as = float(np.median(np.abs(np.diff(ra_axis)))) * 3600.0 if ra_axis.size > 1 else _DEFAULT_GRID_ARCSEC
-    bunit = str(header.get('BUNIT', '') or 'K').strip() or 'K'
+    bunit = str(header.get('BUNIT', '') or '').strip() or 'K'
     return SpectralCube(
         path=os.path.abspath(path),
         hdu_index=hdu_index,
         spectra=spectra,
         velocity_kms=np.asarray(v, dtype=float),
-        freq_ghz=(None if rest_ghz is None else
-                  rest_ghz * (1.0 - np.asarray(v, dtype=float) / osf._C_LIGHT_KMS)),
+        freq_ghz=None if freq_ghz is None else np.asarray(freq_ghz, dtype=float),
         ra_off_deg=ra_off,
         dec_off_deg=dec_off,
         iy=iy,
@@ -404,6 +471,33 @@ def _load_image_cube(hdu, path: str, hdu_index: int) -> SpectralCube:
         is_main_beam=('_mb' in os.path.basename(path).lower()),
         source_kind='image_cube',
         grid_step_arcsec=step_as,
+        header_extras={
+            'ORIGIN': str(header.get('ORIGIN', '') or ''),
+            'SPECSYS': str(header.get('SPECSYS', '') or ''),
+            'BMAJ': _header_float(header, 'BMAJ'),
+            'BMIN': _header_float(header, 'BMIN'),
+        },
+    )
+
+
+def _select_cube_hdu(hdul, hdu_index: int):
+    """Pick a CLASS MATRIX or image-cube HDU, skipping CASA BEAMS tables."""
+    if 0 <= hdu_index < len(hdul):
+        hdu = hdul[hdu_index]
+        if _is_class_matrix_hdu(hdu) or _is_image_cube_hdu(hdu):
+            return hdu_index, hdu
+    for i, hdu in enumerate(hdul):
+        if _is_image_cube_hdu(hdu) or _is_class_matrix_hdu(hdu):
+            return i, hdu
+    n = len(hdul)
+    names = []
+    for i, hdu in enumerate(hdul):
+        data = getattr(hdu, 'data', None)
+        cols = list(getattr(data, 'names', []) or []) if data is not None else []
+        names.append(f'HDU {i}: {type(hdu).__name__} columns={cols or "image/none"}')
+    raise ValueError(
+        f'No spectral image cube or CLASS MATRIX table in this FITS file '
+        f'({n} HDU(s)). ' + '; '.join(names)
     )
 
 
@@ -424,13 +518,8 @@ def load_spectral_cube(path: str, hdu_index: Optional[int] = None,
         return _cube_cache[key][1]
 
     with fits.open(path, memmap=False) as hdul:
-        if hdu_index >= len(hdul):
-            raise IndexError(f'HDU {hdu_index} not in {path} ({len(hdul)} HDUs)')
-        hdu = hdul[hdu_index]
-        data = hdu.data
-        if data is None:
-            raise ValueError(f'HDU {hdu_index} has no data')
-        if hasattr(data, 'names'):
+        hdu_index, hdu = _select_cube_hdu(hdul, hdu_index)
+        if _is_class_matrix_hdu(hdu):
             cube = _load_class_matrix(hdu, path, hdu_index)
         else:
             cube = _load_image_cube(hdu, path, hdu_index)
@@ -454,13 +543,16 @@ def collapse_map(cube: SpectralCube, v_low: float, v_high: float,
     v = cube.velocity_kms
     chan = (v >= float(v_low)) & (v <= float(v_high))
     if not np.any(chan):
+        chan = np.isfinite(v)
+    if not np.any(chan):
         return np.full((cube.ny, cube.nx), np.nan)
     line = cube.spectra[:, chan]
     metric_l = str(metric or 'moment0').strip().lower()
     if metric_l in ('moment0', 'mom0', 'integrated'):
         values = np.nansum(line, axis=1) * abs(float(cube.deltav_kms))
     elif metric_l in ('peak', 'mom8'):
-        values = np.nanmax(line, axis=1)
+        with np.errstate(all='ignore'):
+            values = np.nanmax(line, axis=1)
     else:
         raise ValueError("metric must be 'moment0' or 'peak'")
     out = np.full((cube.ny, cube.nx), np.nan, dtype=float)
@@ -470,6 +562,122 @@ def collapse_map(cube: SpectralCube, v_low: float, v_high: float,
     rows = cube.row_index[filled]
     out[filled] = values[rows]
     return out
+
+
+def clamp_channel(cube: SpectralCube, ichan) -> int:
+    """Clip a channel index to ``[0, nchan)``; invalid values use the default."""
+    n = max(int(cube.nchan), 1)
+    try:
+        if ichan is None or ichan == '':
+            raise TypeError
+        i = int(round(float(ichan)))
+    except (TypeError, ValueError):
+        i = default_channel_index(cube)
+    return int(min(max(i, 0), n - 1))
+
+
+def default_channel_index(cube: SpectralCube) -> int:
+    """Channel nearest 0 km/s; otherwise the spectral midpoint."""
+    n = int(cube.nchan)
+    if n <= 1:
+        return 0
+    v = np.asarray(cube.velocity_kms, dtype=float)
+    absv = np.abs(v)
+    absv[~np.isfinite(v)] = np.inf
+    if not np.any(np.isfinite(absv)):
+        return n // 2
+    return int(np.argmin(absv))
+
+
+def channel_label(cube: SpectralCube, ichan) -> str:
+    """Human-readable channel index, velocity, and frequency."""
+    i = clamp_channel(cube, ichan)
+    v = float(cube.velocity_kms[i]) if i < cube.velocity_kms.size else float('nan')
+    parts = [f'ch {i + 1}/{cube.nchan}']
+    if np.isfinite(v):
+        parts.append(f'v = {v:.3g} km/s')
+    freq = cube.frequency_ghz
+    if freq is not None and i < freq.size and np.isfinite(freq[i]):
+        parts.append(f'ν = {float(freq[i]):.5f} GHz')
+    return '  ·  '.join(parts)
+
+
+def channel_map(cube: SpectralCube, ichan) -> np.ndarray:
+    """2-D intensity map of one spectral channel (ny, nx); blanks stay NaN."""
+    i = clamp_channel(cube, ichan)
+    out = np.full((cube.ny, cube.nx), np.nan, dtype=float)
+    filled = cube.row_index >= 0
+    if not np.any(filled) or cube.nchan < 1:
+        return out
+    rows = cube.row_index[filled]
+    out[filled] = cube.spectra[rows, i]
+    return out
+
+
+def _downsample_indices(n: int, max_n: int) -> np.ndarray:
+    """Evenly spaced indices in ``[0, n)``, at most ``max_n`` samples."""
+    n = max(int(n), 0)
+    max_n = max(int(max_n), 1)
+    if n <= 0:
+        return np.zeros(0, dtype=int)
+    if n <= max_n:
+        return np.arange(n, dtype=int)
+    return np.unique(np.linspace(0, n - 1, max_n).round().astype(int))
+
+
+def ppv_volume_arrays(cube: SpectralCube, max_side: int = PPV_MAX_SIDE,
+                      vmin_pct: float = 90.0, vmax_pct: float = 99.7
+                      ) -> Dict[str, Any]:
+    """Downsampled position–position–velocity cube for Plotly ``go.Volume``.
+
+    Each axis is strided to at most ``max_side`` samples so a typical
+    interferometric cube (~400×400×170) becomes ~40³ voxels.  ``isomin`` /
+    ``isomax`` are intensity percentiles so noise stays transparent.
+    """
+    iy = _downsample_indices(cube.ny, max_side)
+    ix = _downsample_indices(cube.nx, max_side)
+    iz = _downsample_indices(cube.nchan, max_side)
+    ny_s, nx_s, nz_s = int(iy.size), int(ix.size), int(iz.size)
+    vol = np.full((ny_s, nx_s, nz_s), np.nan, dtype=float)
+    if ny_s and nx_s and nz_s:
+        rows = cube.row_index[np.ix_(iy, ix)]
+        spec_sub = np.full((ny_s * nx_s, nz_s), np.nan, dtype=float)
+        flat = rows.ravel()
+        ok = flat >= 0
+        if np.any(ok):
+            spec_sub[ok] = cube.spectra[flat[ok]][:, iz]
+        vol = spec_sub.reshape(ny_s, nx_s, nz_s)
+    ra = cube.ra_axis_arcmin[ix] if nx_s else np.zeros(0, dtype=float)
+    dec = cube.dec_axis_arcmin[iy] if ny_s else np.zeros(0, dtype=float)
+    vel = (np.asarray(cube.velocity_kms, dtype=float)[iz]
+           if nz_s else np.zeros(0, dtype=float))
+    finite = vol[np.isfinite(vol)]
+    if finite.size == 0:
+        isomin = isomax = 0.0
+    else:
+        lo = float(np.clip(vmin_pct, 0.0, 100.0))
+        hi = float(np.clip(vmax_pct, 0.0, 100.0))
+        if hi < lo:
+            lo, hi = hi, lo
+        isomin = float(np.percentile(finite, lo))
+        isomax = float(np.percentile(finite, hi))
+        if not np.isfinite(isomax) or isomax <= isomin:
+            isomin = float(np.nanmin(finite))
+            isomax = float(np.nanmax(finite))
+        if not np.isfinite(isomax) or isomax <= isomin:
+            bump = abs(isomin) * 1e-6 if isomin else 1e-6
+            isomax = isomin + bump
+    return {
+        'ra_arcmin': np.asarray(ra, dtype=float),
+        'dec_arcmin': np.asarray(dec, dtype=float),
+        'velocity_kms': np.asarray(vel, dtype=float),
+        'intensity': vol,
+        'isomin': float(isomin),
+        'isomax': float(isomax),
+        'iy': iy,
+        'ix': ix,
+        'iz': iz,
+    }
 
 
 def peak_cell(cube: SpectralCube, map2d: np.ndarray

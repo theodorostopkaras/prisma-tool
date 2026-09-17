@@ -27,6 +27,7 @@ After loading a main grid on **Load grids**, the other tabs become active:
 | **Spectra** | SimLine PV FITS velocity spectra / PV diagrams, plus a CARTA-style observational cube viewer |
 | **Interpolation error** | Native vs resampled grids with decimation error maps (abundance + SIMLINE) |
 | **CR attenuation** | ζ<sub>H₂</sub> vs N<sub>H₂</sub> profiles with Padovani 𝓛/𝓗/𝓤 reference bands |
+| **Attenuation impact** | KoSens attenuation workflow: ζ error from ignoring attenuation, CR-probe quality, one verdict per tracer (single n_H or full 3-D, per environment) |
 | **Map fit** | Fit observed FITS maps to the 3-D SIMLINE model grid (KoSens3D) |
 
 ## How the grid is discovered
@@ -309,8 +310,11 @@ Pick the species, set **Top reactions / depth point** (N), and choose a
 
 | Metric | Description |
 |---|---|
-| **Fractional contribution** (default) | Volume-weighted ∫ 4π r² k n dr as % of total (matches `KOSMA_tau_READ_chem.ipynb`) |
-| **Mass-weighted rate** | Integrated rate weighted by species density |
+| **Fractional contribution** (default) | ∫ 4π r² R dr / ∫ 4π r² R_tot dr: share of the clump-integrated total rate (matches `KOSMA_tau_READ_chem.ipynb`) |
+| **Rate per X particle** | ∫ 4π r² R dr / ∫ 4π r² n(X) dr = (dN/dt) / N_X (s⁻¹); summed over all reactions it gives 1/τ |
+
+R is the volumetric reaction rate (cm⁻³ s⁻¹) from the `frate_*`/`drate_*` columns. It is
+integrated without an extra n(X) weight, because `drate_X` already contains n(X).
 
 ### Reaction selection (same union as `top_reactions_plot`)
 
@@ -351,6 +355,33 @@ tabs, overlays additionally enable the triple-panel x-shift view described above
 > The overlay assumes the same KOSMA-τ chemical network / species ordering as
 > the main grid (true for an attenuated version of the same grid).
 
+## Attenuation impact (KoSens attenuation workflow)
+
+With the attenuated grid loaded as the overlay (SIMLINE overlay for line
+intensities), this tab runs the KoSens procedure
+`plot_attenuation_shift_summary` → `plot_attenuation_fuv_response` →
+`reconcile_attenuation_species` and keeps its two questions apart: *which lines
+mislead most if attenuation is ignored* (correction priority) and *which lines
+are the cleanest CR probes* (line selection).
+
+1. **Breadth** — how many models move per |Δ| bin, median |Δ| per ζ / χ
+   (/ n_H) bin, and the winner map (who moves most where).
+2. **Magnitude & probe** — ζ error bars (median, p10–p90 spread, censored
+   fraction) and the probe plane |R| vs its environment swing.
+3. **Verdicts** — broad → honest → CR-led → matters; *Best CR probes* and
+   *Lines that mislead most*, plus, in 3-D mode, verdicts per density slice and
+   per (n_H, χ, ζ) environment.
+
+**Compute** builds both cubes and runs the per-cell shift search (the slow
+part); every threshold then applies instantly to the cached cells. Each step
+has "How to read" panels, and the **Guide** sub-tab renders
+`docs/attenuation_workflow.md`, `docs/probe_margin_explained.md` (KoSens,
+verbatim) and `docs/attenuation_good_values.md` (name mapping, 3-D mode, and
+the good value of every quantity).
+
+Implementation: `atten_compare.py` (numerics identical to KoSens —
+`tests/test_atten_compare.py` checks parity — plus Plotly figures).
+
 ## Install & run
 
 From the project directory:
@@ -374,6 +405,7 @@ pulling updates so new packages (in particular **astroquery**) are picked up.
 |---|---|
 | `dash`, `plotly` | Interactive UI and figures |
 | `numpy`, `scipy` | Arrays, interpolation, numerics |
+| `pandas` | Per-cell tables of the **Attenuation impact** workflow |
 | `h5py` | KOSMA-τ / chemistry HDF5 grids |
 | `astropy` | FITS cubes, WCS, Gaussian line fitting |
 | `astroquery` | Splatalogue (CDMS/JPL) line ID on **Spectra → Cube viewer** |
@@ -409,6 +441,7 @@ python -m pip install 'astroquery>=0.4.7'
 | `map_fit_extras.py` | Ratio grids, chi² analysis helpers for map fitting |
 | `simline_spectra.py` | SimLine PV FITS spectra and PV diagrams (local, no KoSens) |
 | `cr_attenuation.py` | CR attenuation profiles and Padovani reference bands (local, no KoSens) |
+| `atten_compare.py` | Reference vs attenuated grid comparison (KoSens attenuation workflow port, x-shift match, Plotly figures) |
 | `obs_spectrum_fits.py` | Observational FITS spectra extraction and Gaussian fitting |
 | `cube_viewer.py` | CLASS MATRIX / spectral-cube map + spectrum (CARTA-like) |
 | `line_catalog.py` | Local 3 mm line list and optional Splatalogue queries |

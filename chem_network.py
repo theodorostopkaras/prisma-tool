@@ -10,8 +10,9 @@ A separate depth-limited chemical-chain flowchart is also provided.
 
 from __future__ import annotations
 
+import math
 from collections import defaultdict, deque
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import plotly.graph_objects as go
@@ -20,7 +21,8 @@ import plotly.graph_objects as go
 # Partner class → (legend label, line color, dash style)
 PARTNER_STYLES = {
     'electron': ('+ e\u207b', '#d62728', 'solid'),
-    'photon': ('+ h\u03bd / CR', '#222222', 'solid'),
+    'photon': ('+ h\u03bd', '#222222', 'solid'),
+    'cr': ('+ CR', '#ff7f0e', 'solid'),
     'h2': ('+ H\u2082', '#1f77b4', 'solid'),
     'c': ('+ C', '#e377c2', 'solid'),
     'cp': ('+ C\u207a', '#2ca02c', 'solid'),
@@ -34,6 +36,10 @@ CHAIN_SEED_SPECIES = frozenset({
     'C', 'C+', 'O', 'O+', 'N', 'N+', 'HE', 'HE+',
     'S', 'S+', 'SI', 'SI+',
 })
+
+# Direct cosmic-ray ionisation products (H / H2 / He + CRP). A reaction with one
+# of these as a reactant ties its route to cosmic rays even without a CR token.
+CR_ION_SPECIES = frozenset({'H+', 'H2+', 'H3+', 'HE+'})
 
 DEFAULT_CHAIN_UPSTREAM = 3
 DEFAULT_CHAIN_DOWNSTREAM = 2
@@ -186,9 +192,12 @@ def parse_reaction(label: str) -> Tuple[List[str], List[str]]:
 def partner_class(reactants: Sequence[str], products: Sequence[str] = ()) -> str:
     """Classify the reaction partner for edge colouring."""
     toks = [normalize_token(t) for t in list(reactants) + list(products)]
+    # Before electrons: CR ionisation (H2 + CRP → H2+ + e-) must stay 'cr'.
+    if any(t in ('CRPHOT', 'CRP', 'CR', 'CR-DES') for t in toks):
+        return 'cr'
     if any(t == 'e-' for t in toks):
         return 'electron'
-    if any(t in ('PHOTON', 'CRPHOT', 'CRP', 'CR') for t in toks):
+    if any(t == 'PHOTON' for t in toks):
         return 'photon'
     rset = {normalize_token(t) for t in reactants}
     if 'H2' in rset or 'H2*' in rset:
@@ -379,7 +388,8 @@ def _partner_text(edge: dict) -> str:
     pclass = str(edge.get('partner') or '')
     fallback = {
         'electron': 'e\u207b',
-        'photon': 'h\u03bd / CR',
+        'photon': 'h\u03bd',
+        'cr': 'CR',
         'h2': 'H\u2082',
         'c': 'C',
         'cp': 'C\u207a',
@@ -743,14 +753,11 @@ def _sample_quadratic(
     sx: float, sy: float, cx: float, cy: float, tx: float, ty: float, n: int = 28,
 ) -> List[Tuple[float, float]]:
     """Sample a quadratic Bezier from ``(sx,sy)`` via control ``(cx,cy)`` to ``(tx,ty)``."""
-    ts = np.linspace(0.0, 1.0, max(8, int(n)))
-    pts: List[Tuple[float, float]] = []
-    for t in ts:
-        u = 1.0 - t
-        x = u * u * sx + 2.0 * u * t * cx + t * t * tx
-        y = u * u * sy + 2.0 * u * t * cy + t * t * ty
-        pts.append((float(x), float(y)))
-    return pts
+    t = np.linspace(0.0, 1.0, max(8, int(n)))
+    u = 1.0 - t
+    xs = u * u * sx + 2.0 * u * t * cx + t * t * tx
+    ys = u * u * sy + 2.0 * u * t * cy + t * t * ty
+    return list(zip(xs.tolist(), ys.tolist()))
 
 
 def _curve_route(
@@ -826,6 +833,9 @@ def _dedupe_pathway_edges(edges: Sequence[dict]) -> List[dict]:
         merged['partner'] = pclass
         merged['mid_label'] = ', '.join(labels)
         merged['raw'] = '<br>'.join(raws) if raws else str(merged.get('raw') or '')
+        weights = [e['weight'] for e in bundle if e.get('weight') is not None]
+        if weights:
+            merged['weight'] = max(weights)
         out.append(merged)
     return out
 
@@ -885,8 +895,11 @@ def _seg_hits_box(
     x0: float, y0: float, x1: float, y1: float,
     cx: float, cy: float, half, *, pad: float = 0.08,
 ) -> bool:
-    """True if the segment passes through an expanded node box."""
-    hw, hh = _as_wh(half)
+    """True if the segment passes through an expanded node box.
+
+    ``half`` is a pre-clamped ``(hw, hh)`` tuple (hot path) or a scalar.
+    """
+    hw, hh = half if isinstance(half, tuple) else _as_wh(half)
     xmin, xmax = cx - hw - pad, cx + hw + pad
     ymin, ymax = cy - hh - pad, cy + hh + pad
     # Quick reject on bounding boxes.
@@ -894,17 +907,23 @@ def _seg_hits_box(
         return False
     if max(y0, y1) < ymin or min(y0, y1) > ymax:
         return False
-    length = float(np.hypot(x1 - x0, y1 - y0))
-    n = max(3, int(length / 0.06) + 1)
-    for t in np.linspace(0.0, 1.0, n):
-        # Skip the very ends — attachments sit on src/dst faces.
-        if t < 0.02 or t > 0.98:
+    # Exact Liang–Barsky clip on t in [0.02, 0.98] — the very ends are skipped
+    # because attachments sit on the src/dst faces.
+    dx, dy = x1 - x0, y1 - y0
+    t0, t1 = 0.02, 0.98
+    for p, q in ((-dx, x0 - xmin), (dx, xmax - x0), (-dy, y0 - ymin), (dy, ymax - y0)):
+        if p == 0.0:
+            if q < 0.0:
+                return False
             continue
-        x = x0 + t * (x1 - x0)
-        y = y0 + t * (y1 - y0)
-        if xmin <= x <= xmax and ymin <= y <= ymax:
-            return True
-    return False
+        r = q / p
+        if p < 0.0:
+            t0 = max(t0, r)
+        else:
+            t1 = min(t1, r)
+        if t0 > t1:
+            return False
+    return True
 
 
 def _polyline_hits_obstacles(
@@ -917,13 +936,21 @@ def _polyline_hits_obstacles(
     """Return the name of the first obstacle a polyline crosses, else None."""
     if len(pts) < 2 or not obstacles:
         return None
-    for i in range(len(pts) - 1):
-        x0, y0 = pts[i]
-        x1, y1 = pts[i + 1]
-        for name, (cx, cy, half) in obstacles.items():
-            if name in skip:
-                continue
-            if _seg_hits_box(x0, y0, x1, y1, cx, cy, half, pad=pad):
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    bx0, bx1, by0, by1 = min(xs), max(xs), min(ys), max(ys)
+    for name, (cx, cy, half) in obstacles.items():
+        if name in skip:
+            continue
+        # build_network_figure pre-clamps halves to (hw, hh) tuples.
+        hw, hh = half if isinstance(half, tuple) else _as_wh(half)
+        # Box outside the polyline's bounding box: no segment can hit it.
+        if (cx + hw + pad < bx0 or cx - hw - pad > bx1
+                or cy + hh + pad < by0 or cy - hh - pad > by1):
+            continue
+        for i in range(len(pts) - 1):
+            if _seg_hits_box(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1],
+                             cx, cy, (hw, hh), pad=pad):
                 return name
     return None
 
@@ -1009,8 +1036,7 @@ def _polyline_length(pts: Sequence[Tuple[float, float]]) -> float:
         return 0.0
     total = 0.0
     for i in range(len(pts) - 1):
-        total += float(np.hypot(pts[i + 1][0] - pts[i][0],
-                                pts[i + 1][1] - pts[i][1]))
+        total += math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
     return total
 
 
@@ -1147,25 +1173,11 @@ def _route_avoiding_nodes(
         candidates.append(('detour', _detour_route(
             x0, y0, x1, y1, side='bottom', obstacles=obstacles, skip=skip, **kw)))
 
-    # Prefer the shortest path that misses species boxes (never a figure-wide loop).
-    straight = float(np.hypot(x1 - x0, y1 - y0)) + 0.12
-    max_len = max(2.8 * straight, straight + 2.4)
-    clear: List[Tuple[float, str, List[Tuple[float, float]]]] = []
-    fallback: Optional[Tuple[str, List[Tuple[float, float]]]] = None
-    for style, pts in candidates:
-        hit = _polyline_hits_obstacles(pts, obstacles, skip, pad=0.10)
-        if hit is not None:
-            if fallback is None:
-                fallback = (style, pts)
-            continue
-        clear.append((_polyline_length(pts), style, pts))
-    if clear:
-        clear.sort(key=lambda it: it[0])
-        short = [it for it in clear if it[0] <= max_len]
-        _, style, pts = (short or clear)[0]
-        return pts, style
-    if fallback is not None:
-        return fallback[1], fallback[0]
+    # Shortest route that misses species boxes: test in length order and stop at
+    # the first clear one. If every candidate hits a box, keep the first candidate.
+    for style, pts in sorted(candidates, key=lambda c: _polyline_length(c[1])):
+        if _polyline_hits_obstacles(pts, obstacles, skip, pad=0.10) is None:
+            return pts, style
     return candidates[0][1], candidates[0][0]
 
 
@@ -1176,41 +1188,35 @@ def _polyline_midpoint(pts: Sequence[Tuple[float, float]]) -> Tuple[float, float
     return float(pts[i][0]), float(pts[i][1])
 
 
-def _polyline_clearance(
-    pts: Sequence[Tuple[float, float]],
-    others: Sequence[Sequence[Tuple[float, float]]],
-) -> float:
-    """Minimum sampled distance from the *body* of ``pts`` to other polylines.
+def _body_samples(
+    pts: Sequence[Tuple[float, float]], *, with_end: bool = False,
+) -> np.ndarray:
+    """~10 samples from the 16–84 % body of a polyline, as an (n, 2) array.
 
     Endpoints are ignored: many arrows legitimately meet near a box face, and
     counting those tips would hide real mid-path overlaps.
     """
-    if not pts or not others:
-        return 1e9
+    if not pts:
+        return np.empty((0, 2))
     n = len(pts)
     lo = max(1, int(0.16 * (n - 1)))
     hi = min(n - 1, int(0.84 * (n - 1)) + 1)
     body = list(pts[lo:hi]) or list(pts)
-    step = max(1, len(body) // 10)
-    samples = body[::step]
-    if body[-1] not in samples:
+    samples = body[::max(1, len(body) // 10)]
+    if with_end and body[-1] not in samples:
         samples.append(body[-1])
-    best = 1e9
-    for other in others:
-        if not other:
-            continue
-        on = len(other)
-        olo = max(1, int(0.16 * (on - 1)))
-        ohi = min(on - 1, int(0.84 * (on - 1)) + 1)
-        obody = list(other[olo:ohi]) or list(other)
-        ostep = max(1, len(obody) // 10)
-        osamples = obody[::ostep]
-        for x, y in samples:
-            for ox, oy in osamples:
-                d = abs(x - ox) + abs(y - oy)
-                if d < best:
-                    best = d
-    return float(best)
+    return np.asarray(samples, dtype=float)
+
+
+def _polyline_clearance(
+    pts: Sequence[Tuple[float, float]],
+    other_samples: np.ndarray,
+) -> float:
+    """Minimum Manhattan distance from the body of ``pts`` to earlier route samples."""
+    if not pts or other_samples is None or len(other_samples) == 0:
+        return 1e9
+    a = _body_samples(pts, with_end=True)
+    return float(np.abs(a[:, None, :] - other_samples[None, :, :]).sum(axis=2).min())
 
 
 def _polyline_point(
@@ -1573,6 +1579,7 @@ def build_multihop_pathway(
     include_ice: bool = False,
     focal_formation: Optional[Sequence[str]] = None,
     focal_destruction: Optional[Sequence[str]] = None,
+    reaction_picker: Optional[Callable[[str, str], Sequence[str]]] = None,
 ) -> Tuple[Set[str], List[dict], Dict[str, int]]:
     """Multi-hop pathway graph around ``focal_species`` (form + destroy combined).
 
@@ -1580,6 +1587,9 @@ def build_multihop_pathway(
     reaction contributes one pathway edge: first-listed species as the node,
     other partners as ``mid_label`` / partner colour — so A + X → B → … → focus
     → … reads as a progressive route rather than a one-hop star.
+
+    ``reaction_picker(species, mode)`` (dominant mode) replaces the heuristic
+    channel choice for every species and disables heuristic lateral links.
     """
     focal = str(focal_species or '')
     if not focal or not labels_by_species:
@@ -1602,6 +1612,7 @@ def build_multihop_pathway(
     dn_hop: Dict[str, int] = {}
     edges: List[dict] = []
     seen: Set[Tuple[str, str, str, str]] = set()
+    weight_by_raw: Dict[str, float] = {}
 
     def _keep(name: str) -> bool:
         if not is_species_node(name):
@@ -1625,12 +1636,26 @@ def build_multihop_pathway(
         if key in seen:
             return
         seen.add(key)
+        if edge['raw'] in weight_by_raw:
+            edge['weight'] = weight_by_raw[edge['raw']]
         edges.append(edge)
         nodes.add(edge['source'])
         nodes.add(edge['target'])
 
     def _pick_reactions(sp: str, mode: str, *, limit: int = CHAIN_BRANCH_LIMIT) -> List[str]:
         """Focal species uses the tabulated channels; neighbours stay capped."""
+        if reaction_picker is not None:
+            # Items are labels or (label, % contribution) tuples.
+            out = []
+            for item in reaction_picker(sp, mode) or []:
+                raw, w = item if isinstance(item, tuple) else (item, None)
+                raw = str(raw)
+                if not raw.strip():
+                    continue
+                if w is not None and np.isfinite(w):
+                    weight_by_raw[raw] = max(float(w), weight_by_raw.get(raw, 0.0))
+                out.append(raw)
+            return out
         if sp == focal:
             forced = focal_formation if mode == 'formation' else focal_destruction
             if forced:
@@ -1693,7 +1718,9 @@ def build_multihop_pathway(
             if pre not in up_hop or hop < up_hop[pre]:
                 up_hop[pre] = hop
             upstream.add(pre)
-            if pre in CHAIN_SEED_SPECIES:
+            # Dominant mode walks through seed ions (H3+, He+, H+ are CR products);
+            # depth + top-k already bound the tree.
+            if pre in CHAIN_SEED_SPECIES and reaction_picker is None:
                 visited_up.add(pre)
                 continue
             # Ice counterparts stay as leaves unless the focus itself is ice.
@@ -1732,20 +1759,22 @@ def build_multihop_pathway(
 
     # Also attach direct top-path edges among already-kept nodes via formation
     # of intermediates (fills lateral links like CH+ → CH2+ → CH3+).
-    for sp in list(nodes):
-        if sp == focal:
-            continue
-        for raw in _select_chain_reactions(
-            _labels_for(labels_by_species, sp, 'formation'), sp,
-            mode='formation', limit=3,
-            include_isotopes=keep_iso, include_ice=keep_ice,
-        ):
-            edge = pathway_edge_from_reaction(
-                raw, sp, 'formation', known_species=known_keys)
-            if not edge:
+    # Heuristic, so skipped in dominant (reaction_picker) mode.
+    if reaction_picker is None:
+        for sp in list(nodes):
+            if sp == focal:
                 continue
-            if edge['source'] in nodes and edge['target'] in nodes:
-                _add_edge(edge)
+            for raw in _select_chain_reactions(
+                _labels_for(labels_by_species, sp, 'formation'), sp,
+                mode='formation', limit=3,
+                include_isotopes=keep_iso, include_ice=keep_ice,
+            ):
+                edge = pathway_edge_from_reaction(
+                    raw, sp, 'formation', known_species=known_keys)
+                if not edge:
+                    continue
+                if edge['source'] in nodes and edge['target'] in nodes:
+                    _add_edge(edge)
 
     if len(nodes) > max_nodes:
         scored = []
@@ -1832,6 +1861,67 @@ def _resolve_hidden_species(
     return out
 
 
+_CR_ION_KEYS = frozenset(_species_match_key(s) for s in CR_ION_SPECIES)
+
+
+def _raw_reactions(raw: str) -> List[str]:
+    """Split a (possibly ``<br>``-merged, see ``_dedupe_pathway_edges``) edge label."""
+    return [p for p in str(raw or '').split('<br>') if p.strip()]
+
+
+def cr_ions_in(raw: str) -> List[str]:
+    """CR-ion reactants (H⁺, H₂⁺, H₃⁺, He⁺) of an edge's reaction label(s)."""
+    out = []
+    for part in _raw_reactions(raw):
+        reactants, _products = parse_reaction(part)
+        out += [t for t in reactants if _species_match_key(t) in _CR_ION_KEYS]
+    return out
+
+
+def is_cr_edge(edge: dict) -> bool:
+    """Direct CR step (CRP / CRPHOT / CR-DES) or a reaction driven by a CR ion."""
+    if edge.get('partner') == 'cr' or cr_ions_in(edge.get('raw', '')):
+        return True
+    # Merged arrows keep the majority class; a bundled CR reaction still counts.
+    return any(partner_class(*parse_reaction(p)) == 'cr'
+               for p in _raw_reactions(edge.get('raw', '')))
+
+
+def cr_path_edges(edges: Sequence[dict], focal: str) -> List[dict]:
+    """Edges on a directed route linking a cosmic-ray reaction with ``focal``.
+
+    Upstream: CR edge → … → focal.  Downstream: focal → … → CR edge.
+    A CR edge is a direct CR step or a CR-ion-driven reaction (``is_cr_edge``).
+    """
+    succ: Dict[str, Set[str]] = defaultdict(set)
+    pred: Dict[str, Set[str]] = defaultdict(set)
+    for e in edges:
+        succ[e['source']].add(e['target'])
+        pred[e['target']].add(e['source'])
+
+    def _reach(start: Set[str], nbrs: Dict[str, Set[str]]) -> Set[str]:
+        seen, stack = set(start), list(start)
+        while stack:
+            for m in nbrs.get(stack.pop(), ()):
+                if m not in seen:
+                    seen.add(m)
+                    stack.append(m)
+        return seen
+
+    to_focal = _reach({focal}, pred)
+    from_focal = _reach({focal}, succ)
+    cr = [e for e in edges if is_cr_edge(e)]
+    up_cr = [e for e in cr if e['target'] in to_focal]
+    dn_cr = [e for e in cr if e['source'] in from_focal]
+    after_up = _reach({e['target'] for e in up_cr}, succ)
+    before_dn = _reach({e['source'] for e in dn_cr}, pred)
+    keep = {id(e) for e in up_cr + dn_cr}
+    return [e for e in edges
+            if id(e) in keep
+            or (up_cr and e['source'] in after_up and e['target'] in to_focal)
+            or (dn_cr and e['source'] in from_focal and e['target'] in before_dn)]
+
+
 def build_network_figure(
     labels_by_species: Dict[str, dict],
     focal_species: str,
@@ -1848,6 +1938,8 @@ def build_network_figure(
     hidden_species: Optional[Sequence[str]] = None,
     partner_label_size: Optional[float] = None,
     species_label_size: Optional[float] = None,
+    reaction_picker: Optional[Callable[[str, str], Sequence[str]]] = None,
+    cr_only: bool = False,
 ) -> Tuple[go.Figure, dict]:
     """Combined multi-hop pathway network (formation + destruction) for one species.
 
@@ -1888,8 +1980,15 @@ def build_network_figure(
         include_ice=include_ice,
         focal_formation=focal_formation,
         focal_destruction=focal_destruction,
+        reaction_picker=reaction_picker,
     )
     edges = _dedupe_pathway_edges(edges)
+    if cr_only:
+        focal_key = _match_known_species(
+            str(focal_species or ''), (labels_by_species or {}).keys())
+        edges = cr_path_edges(edges, focal_key)
+        nodes = {e['source'] for e in edges} | {e['target'] for e in edges}
+        rank = {n: r for n, r in rank.items() if n in nodes}
     hidden_set = _resolve_hidden_species(
         hidden_species, nodes, str(focal_species or ''))
     if hidden_set:
@@ -1915,6 +2014,13 @@ def build_network_figure(
         include_ice=bool(include_ice),
         highlight=hl or '',
         hidden=sorted(hidden_set),
+        dominant=reaction_picker is not None,
+        cr_only=bool(cr_only),
+        n_cr_edges=sum(1 for e in edges if e.get('partner') == 'cr'),
+        n_ion_edges=sum(1 for e in edges
+                        if e.get('partner') != 'cr' and cr_ions_in(e.get('raw', ''))),
+        cr_ions=(sorted({i for e in edges for i in cr_ions_in(e.get('raw', ''))})
+                 if cr_only else []),
         ok=bool(nodes) and bool(focal_species),
     )
     fig = go.Figure()
@@ -1925,7 +2031,10 @@ def build_network_figure(
             autosize=True,
             height=PAGE_FIG_HEIGHT,
             annotations=[dict(
-                text='Select a species to build its reaction pathway network',
+                text=(f'No cosmic-ray-driven route among the dominant reactions '
+                      f'(upstream {up}, downstream {down})'
+                      if cr_only and focal_species else
+                      'Select a species to build its reaction pathway network'),
                 xref='paper', yref='paper', x=0.5, y=0.5, showarrow=False,
                 font=dict(size=14, color=t.get('placeholder', '#888')),
             )],
@@ -2023,11 +2132,15 @@ def build_network_figure(
     n_curve = 0
     n_ortho = 0
     n_detour = 0
-    used_routes: List[List[Tuple[float, float]]] = []
+    # Body samples of already-routed arrows (sampled once, for clearance checks).
+    used_samples = np.empty((0, 2))
+    # (color, dash, width, legend) -> (xs, ys, hovertexts): one trace per style.
+    line_groups: Dict[Tuple[str, str, float, str], Tuple[list, list, list]] = {}
 
     # Node boxes used as routing obstacles (avoid crossing intermediate species).
+    # Halves pre-clamped once via _as_wh: the collision tests unpack them directly.
     obstacles: Dict[str, Tuple[float, float, Tuple[float, float]]] = {
-        n: (pos[n][0], pos[n][1], node_half[n]) for n in nodes if n in pos
+        n: (pos[n][0], pos[n][1], _as_wh(node_half[n])) for n in nodes if n in pos
     }
 
     # Clicked species + direct neighbours (fully solid when highlighting).
@@ -2139,8 +2252,8 @@ def build_network_figure(
             x0, y0, x1, y1,
             lane=lane, bend=bend, prefer_curve=use_curve, **route_kw,
         )
-        if used_routes:
-            best_c = _polyline_clearance(pts, used_routes)
+        if len(used_samples):
+            best_c = _polyline_clearance(pts, used_samples)
             base_len = _polyline_length(pts)
             if best_c < min_clear:
                 for extra in (0.28, -0.28, 0.50, -0.50, 0.78, -0.78, 1.05, -1.05):
@@ -2151,12 +2264,12 @@ def build_network_figure(
                     )
                     if _polyline_length(alt) > max(base_len * 1.85, base_len + 1.3):
                         continue
-                    c = _polyline_clearance(alt, used_routes)
+                    c = _polyline_clearance(alt, used_samples)
                     if c > best_c:
                         pts, style, best_c = alt, alt_style, c
                     if best_c >= min_clear:
                         break
-        used_routes.append(pts)
+        used_samples = np.vstack([used_samples, _body_samples(pts)])
         if style == 'curve':
             n_curve += 1
         elif style == 'detour':
@@ -2168,6 +2281,14 @@ def build_network_figure(
             route_xs.append(px)
             route_ys.append(py)
         width = edge_width + (1.4 if hl else 0.0)
+        # Dominant mode: width follows % contribution (sqrt keeps minor links visible).
+        w_pct = e.get('weight')
+        if w_pct is not None:
+            frac = max(0.0, min(100.0, float(w_pct))) / 100.0
+            width = round(4 * width * (0.6 + 1.4 * math.sqrt(frac))) / 4
+        # CR-ion-driven steps (H+, H2+, H3+, He+) dotted; direct CR stays solid orange.
+        if pclass != 'cr' and cr_ions_in(e.get('raw', '')):
+            dash = 'dot'
         if len(pts) >= 2:
             ax0, ay0 = pts[-2]
             tip_x, tip_y = pts[-1]
@@ -2221,12 +2342,21 @@ def build_network_figure(
                 xanchor='center', yanchor='middle',
             ))
         hover = str(e.get('raw') or f"{e['source']} → {e['target']}")
+        if w_pct is not None:
+            hover += f' ({float(w_pct):.1f} % contribution)'
+        gx, gy, gh = line_groups.setdefault((color, dash, width, _leg), ([], [], []))
+        gx.extend([p[0] for p in pts] + [None])
+        gy.extend([p[1] for p in pts] + [None])
+        gh.extend([hover] * len(pts) + [None])
+
+    # One trace per line style (not per edge) keeps the browser responsive.
+    for (color, dash, width, leg), (gx, gy, gh) in line_groups.items():
         fig.add_trace(go.Scatter(
-            x=[p[0] for p in pts], y=[p[1] for p in pts], mode='lines',
+            x=gx, y=gy, mode='lines',
             line=dict(color=color, width=width, dash=dash),
             opacity=1.0,
-            hoverinfo='text', hovertext=hover,
-            name=_leg, showlegend=False,
+            hoverinfo='text', hovertext=gh,
+            name=leg, showlegend=False,
         ))
 
     # Keep routing mix available for tests / status (not shown in UI).
@@ -2341,6 +2471,8 @@ def build_network_panels(
     hidden_species: Optional[Sequence[str]] = None,
     partner_label_size: Optional[float] = None,
     species_label_size: Optional[float] = None,
+    reaction_picker: Optional[Callable[[str, str], Sequence[str]]] = None,
+    cr_only: bool = False,
 ) -> Tuple[go.Figure, dict]:
     """Build the combined pathway network figure + status."""
     return build_network_figure(
@@ -2357,17 +2489,32 @@ def build_network_panels(
         hidden_species=hidden_species,
         partner_label_size=partner_label_size,
         species_label_size=species_label_size,
+        reaction_picker=reaction_picker,
+        cr_only=cr_only,
     )
 
 
 def status_message(status: dict) -> str:
     """Human-readable status line for the Chemistry tab."""
+    if status and status.get('cr_only') and status.get('species') and not status.get('ok'):
+        return (f'No cosmic-ray-driven route among the dominant reactions of '
+                f'{status["species"]} (upstream {status.get("upstream_depth")}, '
+                f'downstream {status.get("downstream_depth")}). Increase the depths '
+                f'or reactions / species, or untick cosmic-ray paths only.')
     if not status or not status.get('ok'):
         return ('Load a chemistry grid and select a species — the pathway network '
                 'walks formation routes into the species and destruction routes out. '
                 'Reaction partners are labelled on the arrows. '
                 'Hover a link for its full reaction; click a species to highlight its links.')
     extras = []
+    if status.get('dominant'):
+        extras.append('dominant reactions only, width = % contribution')
+    if status.get('n_ion_edges'):
+        extras.append('dotted = driven by H⁺/H₂⁺/H₃⁺/He⁺')
+    if status.get('cr_only'):
+        via = ', '.join(status.get('cr_ions') or [])
+        extras.append(f'cosmic-ray paths only ({status.get("n_cr_edges", 0)} direct CR steps'
+                      + (f'; via CR ions {via}' if via else '') + ')')
     if status.get('include_isotopes'):
         extras.append('isotopes on')
     if status.get('include_ice'):
@@ -2435,7 +2582,7 @@ def _chain_partner_score(
     """Lower is better — prefer seed / H₂ / C⁺ / photon channels over clutter."""
     pclass = partner_class(reactants, products)
     class_rank = {
-        'h2': 0, 'cp': 1, 'c': 2, 'electron': 3, 'photon': 4, 'other': 5,
+        'h2': 0, 'cp': 1, 'c': 2, 'electron': 3, 'photon': 4, 'cr': 4, 'other': 5,
     }.get(pclass, 6)
     seeds = sum(1 for t in reactants if normalize_token(t) in CHAIN_SEED_SPECIES)
     toks = [t for t in list(reactants) + list(products) if is_species_node(t)]

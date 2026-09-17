@@ -1,0 +1,47 @@
+!MOLECULE
+13C  (neutral atom)
+!MOLECULAR WEIGHT
+13.0
+!NUMBER OF ENERGY LEVELS
+3
+!LEVEL + ENERGIES(cm^-1) + WEIGHT + J
+    1            0.00       1.0     1
+    2        16.41676       3.0     2 
+    3        43.40621       5.0     3 
+!NUMBER OF RADIATIVE TRANSITIONS
+3
+!TRANS + UP + LOW + EINSTEINA(s^-1) + FREQ(GHz) + E_u(K)
+    1     2     1   7.93E-08         492.1622    23.625
+    2     3     2   2.65E-07         809.1234    62.472
+    3     3     1   1.71E-14        1301.6987    62.472
+!NUMBER OF COLL PARTNERS
+2
+!COLLISIONS BETWEEN
+2 C + pH2  !  K. Schroeder et al. 1991, J. Phys. B, 24, 2487
+!NUMBER OF COLL TRANS
+3
+!NUMBER OF COLL TEMPS
+8
+!COLL TEMPS
+   10.0  20.0  50.0  100.0  200.0  500.0  1000.0  1200.0
+!TRANS + UP + LOW + COLLRATES(cm^3 s^-1)
+    1     2     1    9.6E-11 1.0E-10 7.7E-11 6.7E-11 6.7E-11 7.6E-11 8.1E-11 8.0E-11
+    2     3     1    9.6E-11 9.9E-11 9.2E-11 8.6E-11 8.5E-11 9.6E-11 1.0E-10 1.0E-10
+    3     3     2    1.8E-10 1.8E-10 1.8E-10 1.8E-10 1.9E-10 2.3E-10 2.6E-10 2.6E-10
+!COLLISIONS BETWEEN
+3 C + oH2  !  K. Schroeder et al. 1991, J. Phys. B, 24, 2487
+!NUMBER OF COLL TRANS
+3
+!NUMBER OF COLL TEMPS
+8
+!COLL TEMPS
+   10.0  20.0  50.0  100.0  200.0  500.0  1000.0  1200.0
+!TRANS + UP + LOW + COLLRATES(cm^3 s^-1)
+    1     2     1    7.3E-11 8.1E-11 7.6E-11 7.1E-11 7.1E-11 8.0E-11 8.6E-11 8.5E-11
+    2     3     1    5.2E-11 5.8E-11 6.3E-11 6.9E-11 7.9E-11 1.0E-10 1.1E-10 1.1E-10
+    3     3     2    9.2E-11 1.1E-10 1.3E-10 1.5E-10 1.8E-10 2.5E-10 2.8E-10 2.8E-10
+! NOTES:
+! A-values come from the NIST database.  Accurate transition frequencies 
+! measured by Yamamoto & Saito 1991, ApJ, 370, L103 for J=1-0 and by
+! Klein et al. 1998, ApJ, 494, L125 for J=2-1; the latter is an improvement
+! over the frequency previously measured by Cooksy et al. 1986, ApJ, 309, 828.

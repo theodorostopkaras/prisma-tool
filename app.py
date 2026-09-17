@@ -41,6 +41,8 @@ Usage:
 """
 
 import argparse
+import functools
+from fractions import Fraction
 import os
 import glob
 import re
@@ -50,6 +52,7 @@ import sys
 import threading
 
 import numpy as np
+from scipy.integrate import cumulative_trapezoid
 import h5py
 
 import dash
@@ -86,6 +89,7 @@ import chem_network
 import plot_style as ps
 import map_fit_extras as mfe
 import probe_ranking as pr
+import atten_compare as ac
 
 
 # --- CLI ----------------------------------------------------------------------
@@ -138,8 +142,7 @@ args, _ = parser.parse_known_args()
 
 MIN_AB = 1e-30                      # floor for log abundance plots
 MIN_RATE = 1e-40                    # floor for log heating/cooling rate plots
-AV_FLOOR = 1e-5                     # optional A_V display floor (mag); off by default
-DEFAULT_AV_RANGE = 'full'           # 'full' = all HDF5 A_V; 'floor' = clip below AV_FLOOR
+AV_FLOOR = 1e-5                     # default x-axis minimum when A_V is plotted (mag)
 METADATA_PATH   = 'Metadata/Metadata'
 SPECIES_PATH    = 'Additional output/species involved'
 RELDENS_PATH    = 'Local quantities/Densities/Relative densities'
@@ -156,7 +159,7 @@ CHEM_DEFAULT_SPECIES = 'CO'
 CHEM_DEFAULT_NREAC = 3                              # top-N reactions per depth point
 REACT_RANKING_OPTIONS = [
     {'label': ' Fractional contribution (% of total rate)', 'value': 'fractional_contribution'},
-    {'label': ' Mass-weighted rate', 'value': 'mass_weighted_rate'},
+    {'label': ' Rate per X particle (s⁻¹)', 'value': 'mass_weighted_rate'},
 ]
 DEFAULT_REACT_RANKING = 'fractional_contribution'
 
@@ -179,7 +182,7 @@ INT_SPAGHETTI_LINE_WIDTH = 2.5
 INT_SPAGHETTI_BAND_OPACITY = 0.35
 SIMLINE_IDEF_OPTIONS = [
     {'label': ' I [K km/s]  (jtemp)', 'value': 'jtemp'},
-    {'label': ' I [erg s\u207B\u00B9 cm\u207B\u00B2 Hz\u207B\u00B9]  (jerg)', 'value': 'jerg'},
+    {'label': ' I [erg s\u207B\u00B9 cm\u207B\u00B2 sr\u207B\u00B9]  (jerg)', 'value': 'jerg'},
     {'label': ' \u03c4  optical depth  (tau)', 'value': 'tau'},
 ]
 SIMLINE_MAPFIT_IDEF_OPTIONS = [
@@ -285,54 +288,54 @@ PLOT_THEMES = {
     'light': dict(
         paper_bg='#ffffff',
         plot_bg='#ffffff',
-        grid='#e8edf3',
-        axis_line='#cbd5e1',
-        title='#0f172a',
-        font='#1e293b',
-        muted='#64748b',
-        heading='#0f172a',
+        grid='#E4EBF5',
+        axis_line='#C2CDDD',
+        title='#0B2145',
+        font='#22314A',
+        muted='#5A6B85',
+        heading='#0B2145',
         legend_bg='rgba(255,255,255,0.92)',
-        legend_border='#e2e8f0',
-        placeholder='#94a3b8',
-        placeholder_plot='#f1f4f8',
+        legend_border='#DDE4EE',
+        placeholder='#8FA0BC',
+        placeholder_plot='#F2F5FA',
         contour_line='rgba(255,255,255,0.85)',
-        vline='rgba(60,60,60,0.45)',
+        vline='rgba(11,33,69,0.45)',
         controls_bg='#ffffff',
-        page_bg='#f1f4f8',
+        page_bg='#F2F5FA',
         card_bg='#ffffff',
-        card_border='#e2e8f0',
+        card_border='#DDE4EE',
         input_bg='#ffffff',
-        input_border='#cbd5e1',
-        tab_border='#e2e8f0',
+        input_border='#C2CDDD',
+        tab_border='#DDE4EE',
         tab_bg='#ffffff',
-        tab_sel_bg='#eff6ff',
-        accent='#2563eb',
+        tab_sel_bg='#EAF2FF',
+        accent='#1560CE',
     ),
     'dark': dict(
-        paper_bg='#1e293b',
-        plot_bg='#0f172a',
-        grid='#334155',
-        axis_line='#475569',
-        title='#f1f5f9',
-        font='#e2e8f0',
-        muted='#94a3b8',
-        heading='#f1f5f9',
-        legend_bg='rgba(30,41,59,0.94)',
-        legend_border='#475569',
-        placeholder='#94a3b8',
-        placeholder_plot='#151b24',
+        paper_bg='#0A2350',
+        plot_bg='#041538',
+        grid='#17376E',
+        axis_line='#24508F',
+        title='#EAF2FF',
+        font='#D6E4F7',
+        muted='#8FA6C8',
+        heading='#EAF2FF',
+        legend_bg='rgba(10,35,80,0.94)',
+        legend_border='#24508F',
+        placeholder='#8FA6C8',
+        placeholder_plot='#071F47',
         contour_line='rgba(255,255,255,0.35)',
-        vline='rgba(220,220,230,0.45)',
-        controls_bg='#1e293b',
-        page_bg='#0f1419',
-        card_bg='#1e293b',
-        card_border='#334155',
-        input_bg='#0f172a',
-        input_border='#475569',
-        tab_border='#334155',
-        tab_bg='#151b24',
-        tab_sel_bg='#1e293b',
-        accent='#3b82f6',
+        vline='rgba(214,228,247,0.45)',
+        controls_bg='#0A2350',
+        page_bg='#041538',
+        card_bg='#0A2350',
+        card_border='#17376E',
+        input_bg='#061A40',
+        input_border='#24508F',
+        tab_border='#17376E',
+        tab_bg='#071F47',
+        tab_sel_bg='#0A2350',
+        accent='#2B8CFF',
     ),
 }
 UI_FONT = "'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', sans-serif"
@@ -461,6 +464,7 @@ _chem = {}            # optional chemistry (reaction-rate) grid
 _chem_overlay = {}    # optional overlay chemistry grid (comparison)
 _simline = {}         # optional SIMLINE (.smli) intensity grid
 _simline_overlay = {} # optional attenuated SIMLINE grid (intensity comparison)
+_hdf5_line_angle = None  # Meudon viewing angle token ('00'..'60') for HDF5 intensities
 _fit_results = {}     # last map-fit output (parameter maps + paths)
 _probe_results = {}   # last CRIR probe-ranking output (tables + 3-D cubes)
 _probe_job_lock = threading.Lock()
@@ -472,6 +476,8 @@ _probe_progress = {
     'token': 0,
     'seen_token': 0,
 }
+_atten_results = {}   # last attenuation-impact run (pixel table, settings, workflow)
+_atten_progress = dict(_probe_progress)   # same job protocol, guarded by _probe_job_lock
 _model_config_summary = None  # scan of Models/**/config_files/*.json
 _field_map = {}       # field_key -> (hdf5_path, column_index)
 _profile_cache = {}   # filepath -> dict of profile arrays
@@ -1067,7 +1073,17 @@ def scan_directory(directory, recursive=False):
         has_hdf5=True,
     )
     configure_slice_planes(axis_tokens)
+    _load_hdf5_simline()
     return _grid
+
+
+def _load_hdf5_simline():
+    """Use intensities embedded in the main grid unless a .smli directory is loaded."""
+    global _simline, _smli_cache
+    if _simline and not _simline.get('from_hdf5'):
+        return
+    _smli_cache = {}
+    _simline = scan_simline_hdf5(_grid.get('files'), _grid.get('directory', ''))
 
 
 def scan_overlay(directory, recursive=False):
@@ -1076,7 +1092,7 @@ def scan_overlay(directory, recursive=False):
     Matching to the main grid is done on every axis *except* attenuation, so an
     attenuated counterpart (different AA tag) lines up with each main model.
     """
-    global _overlay
+    global _overlay, _simline_overlay
     source, files, axis_tokens, skipped, n_from_hdf5, phys_by_path = _scan_files(
         directory, recursive)
     # Index ignoring the attenuation token (last entry in PARAM order).
@@ -1093,12 +1109,16 @@ def scan_overlay(directory, recursive=False):
         n_from_hdf5=n_from_hdf5,
         phys_by_path=phys_by_path,
     )
+    if not _simline_overlay or _simline_overlay.get('from_hdf5'):
+        _simline_overlay = scan_simline_hdf5(files, source, build_by_non_atten=True)
     return _overlay
 
 
 def clear_overlay():
-    global _overlay
+    global _overlay, _simline_overlay
     _overlay = {}
+    if _simline_overlay.get('from_hdf5'):
+        _simline_overlay = {}
 
 
 def _tokens_from_values(values):
@@ -1344,6 +1364,9 @@ def read_smli_file(path):
     """Read one SIMLINE .smli file into a list of transition dicts."""
     if path in _smli_cache:
         return _smli_cache[path]
+    if '::' in path:
+        rows = _smli_cache[path] = _read_hdf5_simline_rows(path)
+        return rows
     rows = []
     with open(path, 'r', encoding='utf-8', errors='replace') as fh:
         for line in fh:
@@ -1450,17 +1473,7 @@ def _scan_simline_directory(directory, recursive, build_by_non_atten=False):
         chosen_tpath = _prefer_smli_path(prev_tpath, path)
         if chosen_tpath != prev_tpath:
             transition_paths[tkey] = chosen_tpath
-            rows = read_smli_file(chosen_tpath)
-            transitions[tkey] = [
-                dict(
-                    idx=i,
-                    transition=r['transition'],
-                    frequency=r['frequency'],
-                    label=_smli_transition_option_label(i, r['transition'], r['frequency']),
-                    value=str(i),
-                )
-                for i, r in enumerate(rows)
-            ]
+            transitions[tkey] = _transition_option_rows(read_smli_file(chosen_tpath))
 
     if not files:
         raise ValueError('Found .smli / .smlc files but none matched the expected '
@@ -1482,6 +1495,272 @@ def _scan_simline_directory(directory, recursive, build_by_non_atten=False):
     out['pv_tau_index'] = pv_tau_index
     out['pv_tau_transitions'] = pv_tau_transitions
     out['n_pv_files'] = len(pv_index) + len(pv_tau_index)
+    if build_by_non_atten:
+        out['by_non_atten'] = by_non_atten
+    return out
+
+
+def _transition_option_rows(rows):
+    return [
+        dict(
+            idx=i,
+            transition=r['transition'],
+            frequency=r['frequency'],
+            label=_smli_transition_option_label(i, r['transition'], r['frequency']),
+            value=str(i),
+        )
+        for i, r in enumerate(rows)
+    ]
+
+
+# Newer KOSMA-τ HDF5 files embed the SIMLINE results; the values equal the
+# jtemp_/jerg_/tau_ .smli tables, so no erg -> K km/s conversion is needed.
+_HDF5_SIMLINE_GROUP = 'SIMLINE output'
+_HDF5_SIMLINE_COLUMNS = {'jtemp': 'T_integrated', 'jerg': 'I_integrated', 'tau': 'tau_integrated'}
+
+
+def _meudon_transition(upper, lower):
+    """``v=0,J=2`` / ``v=0,J=1`` -> ``2--1`` (drops ``v=0`` and equal ``El`` fields)."""
+    up = [f.split('=', 1) for f in upper.split(',')]
+    lo = [f.split('=', 1) for f in lower.split(',')]
+    if len(up) != len(lo) or any(len(f) != 2 for f in up + lo):
+        return f'{upper}--{lower}'
+    keep = [i for i, (u, l) in enumerate(zip(up, lo))
+            if not (u == l and (u[0].lower() == 'el' or u == ['v', '0']))]
+    return '_'.join(up[i][1] for i in keep) + '--' + '_'.join(lo[i][1] for i in keep)
+
+
+# Level energies (cm⁻¹) from the SIMLINE LAMDA files give Meudon line frequencies,
+# which the Meudon HDF5 does not store.  Frequencies come from the energies, not
+# the LAMDA FREQ column (``ch+.lamda`` lists E_u/k there).  Species without a
+# LAMDA file keep their legacy KoSens ``.INP`` file.
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_LEVEL_FILES = {
+    '13CO': 'lamda_files/13co.lamda', '13C+': 'lamda_files/13c+.lamda',
+    '13C': 'lamda_files/13cI_and_h2.lamda', '13CS': 'lamda_files/13cs.lamda',
+    'C17O': 'lamda_files/c17o.lamda', 'C18O': 'lamda_files/c18o.lamda',
+    'CH+': 'lamda_files/ch+.lamda', 'C+': 'lamda_files/c+_and_h2.lamda',
+    'C': 'lamda_files/cI_and_h2.lamda', 'CO': 'lamda_files/co.lamda',
+    'CS': 'lamda_files/cs.lamda', 'H13CN': 'lamda_files/h13cn.lamda',
+    'H13CO+': 'lamda_files/h13co+.lamda', 'HC18O+': 'lamda_files/hc18o+.lamda',
+    'HC3N': 'lamda_files/hc3n-h2.lamda', 'HCL': 'lamda_files/hcl.lamda',
+    'HCN': 'lamda_files/hcn.lamda', 'HCO+': 'lamda_files/hco+_h2.lamda',
+    'HCS+': 'lamda_files/hcs+.lamda', 'HNC': 'lamda_files/hnc.lamda',
+    'N2H+': 'lamda_files/n2h+.lamda', 'OCS': 'lamda_files/ocs-h2.lamda',
+    'O-H3O+': 'lamda_files/o-h3o+-h2.lamda', 'P-H3O+': 'lamda_files/p-h3o+-h2.lamda',
+    'O-NH3': 'lamda_files/o-nh3.lamda', 'P-NH3': 'lamda_files/p-nh3.lamda',
+    'OH': 'lamda_files/oh.lamda', 'O': 'lamda_files/oI-H2.lamda',
+    'SI+': 'lamda_files/si+.lamda', 'SI': 'lamda_files/si.lamda',
+    'S': 'lamda_files/s-h.lamda', 'SIO': 'lamda_files/sio_h2.lamda',
+    'SIS': 'lamda_files/SiS.lamda', 'SO2': 'lamda_files/so2.lamda',
+    'SO': 'lamda_files/SO_lowtemp.lamda',
+    '13C18O': 'inp_files/C13O18.INP', 'O-H2CO': 'inp_files/o-H2CO.INP',
+    'P-H2CO': 'inp_files/p-H2CO.INP', 'O-SIC2': 'inp_files/o-SiC2.INP',
+}
+_GHZ_PER_CM = 29.9792458
+
+
+@functools.lru_cache(maxsize=None)
+def _level_energies_by_j(species):
+    """``{J: E [cm⁻¹]}`` from the species' LAMDA (or legacy ``.INP``) file; ``{}`` if none.
+
+    J comes from the statistical weight g = 2J+1, not the label column, whose
+    format differs per file (``13cI_and_h2.lamda`` even labels J=0 as ``1``).
+    ponytail: levels sharing g (Λ-doublets, excited terms, hyperfine) keep the
+    lowest energy, so only simple rotors / ground-term fine structure are exact;
+    match on the label column if OH, OH+ or H2O frequencies are ever needed.
+    """
+    rel = _LEVEL_FILES.get(str(species).upper())
+    if not rel:
+        return {}
+    try:
+        with open(os.path.join(_APP_DIR, rel), encoding='utf-8', errors='replace') as fh:
+            lines = fh.read().splitlines()
+        if rel.endswith('.INP'):  # name / n_levels n_trans / id g E label
+            n = int(lines[1].split()[0])
+            rows = [(l.split()[1], l.split()[2]) for l in lines[2:2 + n]]
+        else:  # LAMDA numeric rows after the name: weight / n_levels / id E g J
+            data = [l.split() for l in lines if l.strip() and not l.lstrip().startswith('!')]
+            data = [r for r in data[1:] if re.match(r'^[-+]?[\d.]', r[0])]
+            n = int(data[1][0])
+            rows = [(r[2], r[1]) for r in data[2:2 + n]]
+        energies = {}
+        for g, e in rows:
+            j, e = (float(g) - 1) / 2, float(e)
+            if j not in energies or e < energies[j]:
+                energies[j] = e
+        return energies
+    except (OSError, IndexError, ValueError):
+        return {}
+
+
+def _meudon_level(level):
+    """``v=0,J=2`` -> ``(2.0, None)``; ``El=2P,J=3/2`` -> ``(1.5, '2P')``; None if unmatched."""
+    fields = dict(f.split('=', 1) for f in level.split(',') if '=' in f)
+    if 'J' not in fields or fields.get('v', '0') != '0':
+        return None
+    if set(fields) - {'v', 'J', 'El', 'F'}:  # hyperfine F folds onto the rotational level
+        return None
+    try:
+        return float(Fraction(fields['J'])), fields.get('El')
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def _meudon_frequency(species, upper, lower):
+    """Line frequency [GHz] from molecular-data level energies, or NaN.
+
+    Only lines within one electronic term match: the data files hold the
+    J-resolved ground term, not excited terms such as C 1D.
+    """
+    up, lo = _meudon_level(upper), _meudon_level(lower)
+    if up is None or lo is None or up[1] != lo[1]:
+        return np.nan
+    energies = _level_energies_by_j(species)
+    e_up, e_lo = energies.get(up[0]), energies.get(lo[0])
+    if e_up is None or e_lo is None or e_up == e_lo:
+        return np.nan
+    return abs(e_up - e_lo) * _GHZ_PER_CM
+
+
+_MEUDON_LABEL_RE = re.compile(r'^I\((\S+) (.+)->(.+?)(?: angle \d+ deg)?\)?$')
+
+
+@functools.lru_cache(maxsize=256)
+def _meudon_line_columns(path):
+    """Meudon PDR ``Line emission A<angle>`` layout from HDF5 metadata.
+
+    Returns ``(angles, {species: [(raw_transition, column, GHz), ...]})``; every angle
+    dataset shares the same column order.  ``((), {})`` for other files.
+    """
+    angles, lines, first = set(), {}, None
+    try:
+        with h5py.File(path, 'r') as hf:
+            if METADATA_PATH not in hf:
+                return (), {}
+            md = hf[METADATA_PATH][:]
+    except OSError:
+        return (), {}
+    for row in md:
+        dset = _dec(row[1])
+        if not dset.startswith('Line emission A'):
+            continue
+        angles.add(dset[len('Line emission A'):])
+        first = first or dset
+        if dset != first:
+            continue
+        match = _MEUDON_LABEL_RE.match(_dec(row[4]).strip())
+        if not match:
+            continue
+        species = match.group(1).replace('_', '')
+        try:
+            col = int(float(_dec(row[2])))
+        except (ValueError, TypeError):
+            continue
+        upper, lower = match.group(2), match.group(3)
+        lines.setdefault(species, []).append(
+            (_meudon_transition(upper, lower), col, _meudon_frequency(species, upper, lower)))
+    return tuple(sorted(angles)), lines
+
+
+def _erg_to_k_kms(intensity, freq_ghz):
+    """erg cm⁻² s⁻¹ sr⁻¹ -> K km/s (Rayleigh-Jeans), as KoSens ``intensity_calc_to_K_km_per_s``.
+
+    ∫T dv = I c³ / (2 k ν³); NaN when the frequency is unknown.
+    """
+    c_cgs, k_cgs = 2.99792458e10, 1.380649e-16
+    nu = freq_ghz * 1e9
+    if not np.isfinite(nu) or nu <= 0:
+        return np.nan
+    return intensity * c_cgs ** 3 / (2.0 * k_cgs * nu ** 3) / 1e5
+
+
+def _read_hdf5_simline_rows(key):
+    """Transition rows for a virtual ``<hdf5 path>::<group>::<idef>`` key.
+
+    ``group`` is a KOSMA-τ ``SIMLINE output`` subgroup, or ``A<angle>/<species>``
+    for Meudon PDR line emission: erg cm⁻² s⁻¹ sr⁻¹ on disk (``jerg``), converted
+    to K km/s for ``jtemp`` with frequencies from ``lamda_files``.
+    """
+    path, grp, idef = key.rsplit('::', 2)
+    if '/' in grp:
+        angle, species = grp.split('/', 1)
+        lines = _meudon_line_columns(path)[1].get(species, [])
+        try:
+            with h5py.File(path, 'r') as hf:
+                values = np.ravel(hf[f'Integrated quantities/Intensities/Line emission {angle}'][0])
+        except (OSError, KeyError):
+            return []
+        convert = _erg_to_k_kms if idef == 'jtemp' else (lambda i, _nu: i)
+        return [dict(transition=t, frequency=nu, intensity=float(convert(values[c], nu)))
+                for t, c, nu in lines if c < values.size]
+    try:
+        with h5py.File(path, 'r') as hf:
+            ii = hf[f'{_HDF5_SIMLINE_GROUP}/{grp}/Integrated intensities']
+            labels = [_dec(x) for x in ii['transition_labels'][()]]
+            freqs = ii['frequencies'][()]
+            values = ii[_HDF5_SIMLINE_COLUMNS[idef]][()]
+    except (OSError, KeyError):
+        return []
+    return [dict(transition=t, frequency=float(f), intensity=float(v))
+            for t, f, v in zip(labels, freqs, values)]
+
+
+def scan_simline_hdf5(files, directory='', build_by_non_atten=False):
+    """SIMLINE store backed by the ``SIMLINE output`` group of grid HDF5 files.
+
+    Same shape as ``_scan_simline_directory``, so every intensity view works
+    unchanged.  Species / transitions come from one sample file (like
+    ``build_structure``); per-model rows are read lazily by ``read_smli_file``.
+    Returns ``{}`` when the files carry no intensities.
+    """
+    if not files:
+        return {}
+    sample = next(iter(files.values()))
+    groups, idefs, angles, angle = {}, tuple(_HDF5_SIMLINE_COLUMNS), (), None
+    try:
+        with h5py.File(sample, 'r') as hf:
+            if _HDF5_SIMLINE_GROUP in hf:
+                for grp, g in hf[_HDF5_SIMLINE_GROUP].items():
+                    if 'Integrated intensities' in g:
+                        groups[grp] = _dec(g.attrs.get('species', grp))
+    except OSError:
+        return {}
+    if not groups:
+        angles, lines = _meudon_line_columns(sample)
+        if lines:
+            angle = _hdf5_line_angle if _hdf5_line_angle in angles else angles[0]
+            groups = {f'A{angle}/{sp}': sp for sp in lines}
+            idefs = ('jtemp', 'jerg')  # no optical depths in Meudon output
+    if not groups:
+        return {}
+
+    out_files, by_non_atten, transitions = {}, {}, {}
+    for grp, species in groups.items():
+        for idef in idefs:
+            transitions[(species, idef)] = _transition_option_rows(
+                read_smli_file(f'{sample}::{grp}::{idef}'))
+            for tokens, path in files.items():
+                key = f'{path}::{grp}::{idef}'
+                out_files[(tuple(tokens), species, idef)] = key
+                if build_by_non_atten:
+                    by_non_atten.setdefault((tuple(tokens)[:N_PARAMS - 1], species, idef), key)
+
+    out = dict(
+        directory=directory or os.path.dirname(sample),
+        files=out_files,
+        filename_token_count=gn.N_GRID_PARAMS,
+        species=sorted(set(groups.values())),
+        transitions=transitions,
+        n_files=len(files),
+        n_skipped=0,
+        pv_index={}, pv_transitions={}, pv_tau_index={}, pv_tau_transitions={},
+        n_pv_files=0,
+        from_hdf5=True,
+        idefs=idefs,
+        angles=angles,
+        angle=angle,
+    )
     if build_by_non_atten:
         out['by_non_atten'] = by_non_atten
     return out
@@ -1758,7 +2037,7 @@ def _smli_transition_option_label(idx, transition, frequency):
 
 def _intensity_unit_label(idef):
     if idef == 'jerg':
-        return 'erg s\u207B\u00B9 cm\u207B\u00B2 Hz\u207B\u00B9'
+        return 'erg s\u207B\u00B9 cm\u207B\u00B2 sr\u207B\u00B9'
     if idef == 'tau':
         return '\u03c4'
     return 'K km/s'
@@ -2106,23 +2385,6 @@ def _integrated_x_for_species(model, species_names):
     return out
 
 
-def _integrate_rate_volume(radius_pc, rate, density):
-    """Integral of 4 pi r^2 rate(r) n_spec(r) dr (KoSens chem contribution)."""
-    radius = np.asarray(radius_pc, dtype=float)
-    rate = np.asarray(rate, dtype=float)
-    density = np.asarray(density, dtype=float)
-    n = min(radius.size, rate.size, density.size)
-    if n == 0:
-        return np.nan
-    radius, rate, density = radius[:n], rate[:n], density[:n]
-    flipped_radius = radius[::-1]
-    radius_cm = np.insert(flipped_radius, 0, 0.0) * PC_TO_CM
-    rate_cm = np.insert(rate[::-1], 0, rate[::-1][0])
-    dens_cm = np.insert(density[::-1], 0, density[::-1][0])
-    integrand = 4.0 * np.pi * radius_cm ** 2 * rate_cm * dens_cm
-    return float(np.trapezoid(integrand, radius_cm))
-
-
 def _species_density_profile(model, species):
     """Number density profile n_spec(r) from the structure grid."""
     if not _grid or model.get('dens') is None:
@@ -2150,8 +2412,13 @@ def compute_reaction_contributions(matrix, model, species):
     """KoSens ``fractional_contribution`` stats for each reaction column.
 
     Returns dict column_index -> {weighted_rate, fraction_pct}.
-    Uses volume-weighted integration (4 pi r^2 rate n dr) when radius and species
-    density are available; otherwise falls back to |rate| integrated over A_V.
+    Rates R_j are volumetric (cm^-3 s^-1), so they are volume-integrated without
+    an extra n(X) weight (drate_X already contains n(X)). When radius and species
+    density n(X) are available (same as KoSens):
+        weighted_rate = int 4 pi r^2 R_j dr / int 4 pi r^2 n(X) dr = (dN_j/dt) / N_X
+                        [s^-1], rate per X particle; summed over j it gives 1/tau
+        fraction_pct  = int 4 pi r^2 R_j dr / int 4 pi r^2 R_tot dr
+    Otherwise falls back to |rate| integrated over A_V.
     """
     matrix = np.asarray(matrix, dtype=float)
     if matrix.size == 0:
@@ -2167,13 +2434,13 @@ def compute_reaction_contributions(matrix, model, species):
     if radius is not None and density is not None:
         radius, density = _align_depth_profiles(radius, density)[:2]
         total_rate = np.sum(matrix[:radius.size], axis=1)
-        total_int = _integrate_rate_volume(radius, total_rate, density)
+        total_int = _integrate_sphere(radius, total_rate)
         mass_int = _integrate_sphere(radius, density)
         for j in range(n_reac):
             col = matrix[:radius.size, j]
             if not np.any(col != 0):
                 continue
-            num_int = _integrate_rate_volume(radius, col, density)
+            num_int = _integrate_sphere(radius, col)
             stats[j] = dict(
                 weighted_rate=(num_int / mass_int if mass_int > 0 else np.nan),
                 fraction_pct=(100.0 * num_int / total_int if total_int != 0 else 0.0),
@@ -2185,6 +2452,9 @@ def compute_reaction_contributions(matrix, model, species):
         av = np.asarray(av, dtype=float)
         n = min(av.size, matrix.shape[0])
         av, matrix = av[:n], matrix[:n]
+        # ponytail: not a KoSens metric. Without radius/n(X) the volume
+        # integrals are impossible, so rank by |rate| integrated over A_V
+        # (keeps the network picker working for chem-only models).
         abs_m = np.abs(matrix)
         total_int = float(np.trapezoid(np.sum(abs_m, axis=1), av))
         for j in range(n_reac):
@@ -3084,7 +3354,11 @@ def get_chem_model(filepath):
         with h5py.File(filepath, 'r') as hf:
             av = np.asarray(hf[CHEM_POS][:], dtype=float)[:, 0]
             model = dict(av=av)
-            fmap = _hdf5_wanted_field_map(hf, {'protdens', 'radius', 'distance'})
+            fmap = _hdf5_wanted_field_map(hf, {'protdens', 'radius', 'distance', KEY_NH2_PROFILE})
+            if KEY_NH2_PROFILE in fmap:
+                nh2 = _hdf5_column_floats(hf, *fmap[KEY_NH2_PROFILE])
+                if nh2 is not None:
+                    model['nh2_profile'] = nh2
             if 'protdens' in fmap:
                 nH = _hdf5_column_floats(hf, *fmap['protdens'])
                 if nH is not None:
@@ -3234,7 +3508,7 @@ def _title_box(text, theme, yshift=8):
         showarrow=False, align='left',
         font=dict(size=ps.PLOT_TITLE_FONT_SIZE + 2, color=t['title'],
                   family=ps.PLOT_FONT_FAMILY),
-        bgcolor=('#111c30' if dark else '#eef2ff'),
+        bgcolor=('#0E2A5C' if dark else '#EAF2FF'),
         bordercolor=t['accent'], borderwidth=1.2, borderpad=5,
     )
 
@@ -3276,32 +3550,71 @@ def _apply_layout(fig, title, xlabel, xtype, xrange, ylabel, ytype, theme='light
     _apply_title_box(fig, title, theme, yshift=6)
 
 
-def _parse_av_range(value):
-    return value if value in ('full', 'floor') else DEFAULT_AV_RANGE
+def _parse_x_min(value):
+    """Lower x-axis limit: a positive finite float, or None for the full HDF5 axis."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if np.isfinite(v) and v > 0 else None
 
 
-def _av_display_floor(av_range):
-    """Return A_V clip threshold, or None when the full HDF5 axis is requested."""
-    return AV_FLOOR if _parse_av_range(av_range) == 'floor' else None
+# xvar -> (axis title, hover name)
+_XLABELS = {
+    'Av': ('A<sub>V</sub> (mag)', 'A_V'),
+    'nH': ('n<sub>H</sub> (cm<sup>-3</sup>)', 'n_H'),
+    'depth': ('depth from surface (pc)', 'depth'),
+    'NH': ('N<sub>H</sub> (cm<sup>-2</sup>)', 'N_H'),
+    'NH2': ('N(H<sub>2</sub>) (cm<sup>-2</sup>)', 'N(H2)'),
+}
 
 
-def _xvals(model, xvar, xscale, av_range=DEFAULT_AV_RANGE):
+def _x_raw(model, xvar):
+    """Unmasked x-axis values for ``xvar``, or None when the model lacks the column.
+
+    ``depth`` = r_max − r (pc); ``NH`` = ∫ n_H dl from the surface (cm⁻²).
+    """
+    if xvar in ('depth', 'NH'):
+        radius = model.get('radius')
+        if radius is None or not np.size(radius):
+            return None
+        radius = np.asarray(radius, dtype=float)
+        if np.nanmax(radius) > 1e15:          # stored in cm
+            radius = radius / PC_TO_CM
+        depth = np.nanmax(radius) - radius
+        if xvar == 'depth':
+            return depth
+        nH = model.get('nH')
+        if nH is None or np.size(nH) != depth.size:
+            return None
+        order = np.argsort(depth)
+        col = np.empty_like(depth)
+        col[order] = cumulative_trapezoid(np.asarray(nH, dtype=float)[order],
+                                          depth[order] * PC_TO_CM, initial=0.0)
+        return col
+    key = {'nH': 'nH', 'NH2': 'nh2_profile'}.get(xvar, 'av')
+    arr = model.get(key)
+    return None if arr is None or not np.size(arr) else np.asarray(arr, dtype=float)
+
+
+def _xvals(model, xvar, xscale, x_min=None):
     """Return (x_array, x_label, x_type, x_range) with an explicit axis range.
 
     For ``type='log'`` Plotly expects ``range`` in log10 units.  For linear axes
     the range is in physical data units.
 
-    ``av_range='floor'`` hides A_V below ``AV_FLOOR``; ``'full'`` keeps every
-    HDF5 sample (log axes still omit non-positive values, which cannot be drawn).
+    ``x_min`` hides samples below it (any quantity); ``None`` keeps every HDF5
+    sample (log axes still omit non-positive values, which cannot be drawn).
+    A quantity missing from the model falls back to A_V, noted in the label.
     """
-    if xvar == 'nH':
-        xv = np.asarray(model['nH'], dtype=float)
-        xl = 'n<sub>H</sub> (cm<sup>-3</sup>)'
-    else:
+    xv = _x_raw(model, xvar)
+    xl = _XLABELS.get(xvar, _XLABELS['Av'])[0]
+    if xv is None:
         xv = np.asarray(model['av'], dtype=float)
-        xl = 'A<sub>V</sub> (mag)'
+        xl = f"{_XLABELS['Av'][0]}  ({_XLABELS.get(xvar, ('', xvar))[1]} not in this model)"
+        x_min = None
 
-    floor = _av_display_floor(av_range) if xvar == 'Av' else None
+    floor = _parse_x_min(x_min)
     if floor is not None:
         xv = np.where(xv >= floor, xv, np.nan)
 
@@ -3329,10 +3642,12 @@ def _xvals(model, xvar, xscale, av_range=DEFAULT_AV_RANGE):
     return xv, xl, xtype, xrange
 
 
-def _x_array(model, xvar, xscale, av_range=DEFAULT_AV_RANGE):
+def _x_array(model, xvar, xscale, x_min=None):
     """x-array for a model, masked consistently with ``_xvals`` (for overlays)."""
-    xv = np.asarray(model['nH'] if xvar == 'nH' else model['av'], dtype=float)
-    floor = _av_display_floor(av_range) if xvar == 'Av' else None
+    xv = _x_raw(model, xvar)
+    if xv is None:
+        return None
+    floor = _parse_x_min(x_min)
     if floor is not None:
         xv = np.where(xv >= floor, xv, np.nan)
     if xscale == 'log':
@@ -3365,7 +3680,9 @@ def find_h_h2_transition(model, xvar):
         return None
     ab_h = rel[:, idx_h].astype(float)
     ab_h2 = rel[:, idx_h2].astype(float)
-    xv = np.asarray(model['nH'] if xvar == 'nH' else model['av'], dtype=float)
+    xv = _x_raw(model, xvar)
+    if xv is None:
+        return None
 
     diff = ab_h - ab_h2
     for i in range(len(diff) - 1):
@@ -3416,9 +3733,9 @@ def _temperature(model, key, yscale):
 
 
 def fig_tgas(model, overlay, xvar, xscale, yscale, theme='light',
-             av_range=DEFAULT_AV_RANGE):
-    xv, xl, xt, xr = _xvals(model, xvar, xscale, av_range=av_range)
-    xvo = _x_array(overlay, xvar, xscale, av_range=av_range) if overlay else None
+             x_min=None):
+    xv, xl, xt, xr = _xvals(model, xvar, xscale, x_min=x_min)
+    xvo = _x_array(overlay, xvar, xscale, x_min=x_min) if overlay else None
     fig = go.Figure()
     _line(fig, xv, _temperature(model, 'tgas', yscale), COLORS[0], 'T<sub>gas</sub>')
     _line(fig, xv, _temperature(model, 'tdust', yscale), COLORS[1], 'T<sub>dust</sub>', dash='dot')
@@ -3426,14 +3743,14 @@ def fig_tgas(model, overlay, xvar, xscale, yscale, theme='light',
         _line(fig, xvo, _temperature(overlay, 'tgas', yscale), COLORS[0], 'T<sub>gas</sub>', overlay=True)
         _line(fig, xvo, _temperature(overlay, 'tdust', yscale), COLORS[1], 'T<sub>dust</sub>', overlay=True)
     _apply_layout(fig, 'Gas / Dust Temperature', xl, xt, xr, 'T (K)', yscale, theme=theme,
-                  uirevision_extra=_parse_av_range(av_range))
+                  uirevision_extra=f'{xvar}|{_parse_x_min(x_min)}')
     return fig
 
 
 def _fig_species(model, overlay, xvar, xscale, yscale, specs, title, theme='light',
-                 av_range=DEFAULT_AV_RANGE):
-    xv, xl, xt, xr = _xvals(model, xvar, xscale, av_range=av_range)
-    xvo = _x_array(overlay, xvar, xscale, av_range=av_range) if overlay else None
+                 x_min=None):
+    xv, xl, xt, xr = _xvals(model, xvar, xscale, x_min=x_min)
+    xvo = _x_array(overlay, xvar, xscale, x_min=x_min) if overlay else None
     fig = go.Figure()
     for name, color in specs:
         _line(fig, xv, species_abundance(model, name, yscale), color, format_species_html(name))
@@ -3442,29 +3759,29 @@ def _fig_species(model, overlay, xvar, xscale, yscale, specs, title, theme='ligh
             _line(fig, xvo, species_abundance(overlay, name, yscale), color,
                   format_species_html(name), overlay=True)
     _apply_layout(fig, title, xl, xt, xr, 'x(species)', yscale, theme=theme,
-                  uirevision_extra=_parse_av_range(av_range))
+                  uirevision_extra=f'{xvar}|{_parse_x_min(x_min)}')
     return fig
 
 
 def fig_h_h2(model, overlay, xvar, xscale, yscale, theme='light',
-             av_range=DEFAULT_AV_RANGE):
+             x_min=None):
     return _fig_species(model, overlay, xvar, xscale, yscale,
                         [('H', COLORS[0]), ('H2', COLORS[1])], 'H / H<sub>2</sub>',
-                        theme=theme, av_range=av_range)
+                        theme=theme, x_min=x_min)
 
 
 def fig_cplus_c_co(model, overlay, xvar, xscale, yscale, theme='light',
-                   av_range=DEFAULT_AV_RANGE):
+                   x_min=None):
     return _fig_species(model, overlay, xvar, xscale, yscale,
                         [('C+', COLORS[3]), ('C', COLORS[2]), ('CO', COLORS[0])],
-                        'C<sup>+</sup> / C / CO', theme=theme, av_range=av_range)
+                        'C<sup>+</sup> / C / CO', theme=theme, x_min=x_min)
 
 
 def fig_custom(model, overlay, xvar, xscale, yscale, sel_species, theme='light',
-               av_range=DEFAULT_AV_RANGE):
+               x_min=None):
     specs = [(sp, COLORS[k % len(COLORS)]) for k, sp in enumerate(sel_species or [])]
     return _fig_species(model, overlay, xvar, xscale, yscale, specs, 'Custom Species',
-                        theme=theme, av_range=av_range)
+                        theme=theme, x_min=x_min)
 
 
 _RATE_YLABEL = '\u0393, \u039B (erg cm<sup>-3</sup> s<sup>-1</sup>)'
@@ -3474,10 +3791,10 @@ _RATE_YLABEL_cooling = '\u039B (erg cm<sup>-3</sup> s<sup>-1</sup>)'
 
 
 def fig_thermal(model, overlay, xvar, xscale, yscale, theme='light',
-                av_range=DEFAULT_AV_RANGE):
+                x_min=None):
     """Total heating vs total cooling, with the cosmic-ray heating highlighted."""
-    xv, xl, xt, xr = _xvals(model, xvar, xscale, av_range=av_range)
-    xvo = _x_array(overlay, xvar, xscale, av_range=av_range) if overlay else None
+    xv, xl, xt, xr = _xvals(model, xvar, xscale, x_min=x_min)
+    xvo = _x_array(overlay, xvar, xscale, x_min=x_min) if overlay else None
     fig = go.Figure()
     _line(fig, xv, _rate_total(model['heat'], yscale), '#d62728', '\u0393 total (heating)')
     _line(fig, xv, _rate_total(model['cool'], yscale), '#1f77b4', '\u039B total (cooling)')
@@ -3490,7 +3807,7 @@ def fig_thermal(model, overlay, xvar, xscale, yscale, theme='light',
               '#ff7f0e', '\u0393 cosmic rays', overlay=True)
     _apply_layout(fig, 'Heating / Cooling balance  (CR highlighted)',
                   xl, xt, xr, _RATE_YLABEL, yscale, theme=theme,
-                  uirevision_extra=_parse_av_range(av_range))
+                  uirevision_extra=f'{xvar}|{_parse_x_min(x_min)}')
     return fig
 
 
@@ -3499,14 +3816,14 @@ _DASH_CYCLE = ['solid', 'dot', 'dash', 'dashdot']
 
 def _fig_rate_breakdown(model, overlay, xvar, xscale, yscale,
                         key, components, title, emphasize_idx=None, theme='light',
-                        av_range=DEFAULT_AV_RANGE):
+                        x_min=None):
     """Plot every component of a rate matrix (heating or cooling) individually.
 
     With more components than colours, the dash pattern is cycled too so all
     lines stay distinguishable.
     """
-    xv, xl, xt, xr = _xvals(model, xvar, xscale, av_range=av_range)
-    xvo = _x_array(overlay, xvar, xscale, av_range=av_range) if overlay else None
+    xv, xl, xt, xr = _xvals(model, xvar, xscale, x_min=x_min)
+    xvo = _x_array(overlay, xvar, xscale, x_min=x_min) if overlay else None
     fig = go.Figure()
     for k, (label, idx) in enumerate(components):
         emph = (emphasize_idx is not None and idx == emphasize_idx)
@@ -3520,26 +3837,26 @@ def _fig_rate_breakdown(model, overlay, xvar, xscale, yscale,
     _apply_layout(fig, title, xl, xt, xr,
                   _RATE_YLABEL_heating if key == 'heat' else _RATE_YLABEL_cooling,
                   yscale, theme=theme,
-                  uirevision_extra=_parse_av_range(av_range))
+                  uirevision_extra=f'{xvar}|{_parse_x_min(x_min)}')
     return fig
 
 
 def fig_heat_breakdown(model, overlay, xvar, xscale, yscale, theme='light',
-                       av_range=DEFAULT_AV_RANGE):
+                       x_min=None):
     """All heating-rate components; cosmic-ray heating drawn thicker."""
     return _fig_rate_breakdown(model, overlay, xvar, xscale, yscale,
                                'heat', _heat_components,
                                'Heating-rate components (all)', _cr_heat_idx,
-                               theme=theme, av_range=av_range)
+                               theme=theme, x_min=x_min)
 
 
 def fig_cool_breakdown(model, overlay, xvar, xscale, yscale, theme='light',
-                       av_range=DEFAULT_AV_RANGE):
+                       x_min=None):
     """All cooling-rate components."""
     return _fig_rate_breakdown(model, overlay, xvar, xscale, yscale,
                                'cool', _cool_components,
                                'Cooling-rate components (all)', theme=theme,
-                               av_range=av_range)
+                               x_min=x_min)
 
 
 _REACT_YLABEL = 'rate (cm<sup>-3</sup> s<sup>-1</sup>)'
@@ -3598,18 +3915,21 @@ def _reaction_contribution_table(order, labels, stats, mode, ranking_metric):
 
     vol_method = next((stats[j]['method'] for j in order if j in stats), 'volume')
     if vol_method == 'volume':
-        rate_hdr = 'Weighted rate (cm\u207B\u00B3 s\u207B\u00B9)'
-        weight_note = ('Volume integrals \u222B 4\u03C0 r\u00B2 k n dr (KoSens chem read).')
+        rate_hdr = 'Rate per X particle (s\u207B\u00B9)'
+        weight_note = ('Volume integrals \u222B 4\u03C0 r\u00B2 R dr of the volumetric rates R '
+                       '(cm\u207B\u00B3 s\u207B\u00B9); N_X = \u222B 4\u03C0 r\u00B2 n(X) dr for '
+                       'the selected species (KoSens chem read).')
     else:
         rate_hdr = 'Integrated |rate|'
         weight_note = ('Structure grid unavailable \u2014 |rate| integrated over A_V.')
 
     if ranking_metric == 'mass_weighted_rate':
-        rank_note = ('Reactions ordered by mass-weighted rate '
-                     '(\u222B 4\u03C0 r\u00B2 k n dr / \u222B 4\u03C0 r\u00B2 n dr).')
+        rank_note = ('Reactions ordered by rate per X particle '
+                     '(\u222B 4\u03C0 r\u00B2 R dr / \u222B 4\u03C0 r\u00B2 n(X) dr).')
     else:
-        rank_note = ('Reactions ordered by fractional contribution to the total '
-                     f'{rate_label} rate (\u222B 4\u03C0 r\u00B2 k n dr / total).')
+        rank_note = ('Reactions ordered by share of the total '
+                     f'{rate_label} rate (\u222B 4\u03C0 r\u00B2 R dr / '
+                     '\u222B 4\u03C0 r\u00B2 R_tot dr).')
 
     hdr_wrate = {**_REACT_TABLE_CELL, **(
         {'fontWeight': '700'} if ranking_metric == 'mass_weighted_rate' else {})}
@@ -3648,10 +3968,10 @@ def _reaction_contribution_table(order, labels, stats, mode, ranking_metric):
 
 def fig_reactions(filepath, species, mode, xscale, yscale, top_n, model=None,
                   ranking_metric=DEFAULT_REACT_RANKING, theme='light',
-                  av_range=DEFAULT_AV_RANGE, overlay_filepath=None):
-    """Top-N formation or destruction reactions for a species (vs A_V)."""
+                  x_min=None, overlay_filepath=None, xvar='Av'):
+    """Top-N formation or destruction reactions for a species (vs ``xvar``)."""
     ranking_metric = _parse_react_ranking(ranking_metric)
-    av_range = _parse_av_range(av_range)
+    x_min = _parse_x_min(x_min)
     title = f'{species}: {"formation" if mode == "formation" else "destruction"} reactions'
     if filepath is None:
         return placeholder_fig('Load a chemistry grid to see reactions', theme=theme), {}, []
@@ -3672,8 +3992,16 @@ def fig_reactions(filepath, species, mode, xscale, yscale, top_n, model=None,
     stats = compute_reaction_contributions(matrix, model, species)
     order = sort_reactions_by_ranking(order, stats, ranking_metric)
 
-    # Reuse the shared A_V axis helper (full HDF5 axis vs optional AV_FLOOR).
-    xv, _xl, xt, xr = _xvals(dict(av=av), 'Av', xscale, av_range=av_range)
+    def _react_axis(mdl, av_arr):
+        # Reaction rows share the depth grid of ``mdl`` only when the lengths agree;
+        # otherwise _xvals falls back to A_V and says so in the axis title.
+        raw = _x_raw(mdl, xvar) if mdl else None
+        ok = raw is not None and raw.size == np.size(av_arr)
+        return _xvals({**mdl, 'av': av_arr} if ok else dict(av=av_arr), xvar, xscale,
+                      x_min=x_min)
+
+    xv, xl, xt, xr = _react_axis(model, av)
+    xname = 'A_V' if 'not in this model' in xl else _XLABELS.get(xvar, _XLABELS['Av'])[1]
     x_ok = np.isfinite(xv)
 
     fig = go.Figure()
@@ -3693,8 +4021,8 @@ def fig_reactions(filepath, species, mode, xscale, yscale, top_n, model=None,
         wrate = st.get('weighted_rate', np.nan)
         legend = _reaction_legend_label(lab, st, ranking_metric)
         hover = (
-            f'{lab}<br>A_V=%{{x:.3g}}<br>rate=%{{y:.3g}}'
-            + (f'<br>weighted rate={wrate:.2e}' if np.isfinite(wrate) else '')
+            f'{lab}<br>{xname}=%{{x:.3g}}<br>rate=%{{y:.3g}}'
+            + (f'<br>rate per X particle={wrate:.2e} s⁻¹' if np.isfinite(wrate) else '')
             + (f'<br>contribution={pct:.2f}%' if np.isfinite(pct) else '')
             + '<extra></extra>'
         )
@@ -3717,14 +4045,15 @@ def fig_reactions(filepath, species, mode, xscale, yscale, top_n, model=None,
         name=total_name,
         legendrank=0,
         hovertemplate=(
-            f'{total_name}<br>A_V=%{{x:.3g}}<br>rate=%{{y:.3g}}<extra></extra>'
+            f'{total_name}<br>{xname}=%{{x:.3g}}<br>rate=%{{y:.3g}}<extra></extra>'
         ),
     ))
 
     if overlay_filepath and not _same_data_path(overlay_filepath, filepath):
         odata = get_reaction_data(overlay_filepath, species, mode)
         if odata is not None:
-            oxv, _, _, _ = _xvals(dict(av=odata['av']), 'Av', xscale, av_range=av_range)
+            omodel = get_chem_model(overlay_filepath) if xvar != 'Av' else None
+            oxv, _, _, _ = _react_axis(omodel, odata['av'])
             x_ok_o = np.isfinite(oxv)
             omatrix = odata['matrix']
             olabels = odata['labels']
@@ -3745,7 +4074,7 @@ def fig_reactions(filepath, species, mode, xscale, yscale, top_n, model=None,
                     name=legend,
                     legendrank=k + 1,
                     hovertemplate=(
-                        f'{lab}<br>A_V=%{{x:.3g}}<br>rate=%{{y:.3g}}<extra></extra>'
+                        f'{lab}<br>{xname}=%{{x:.3g}}<br>rate=%{{y:.3g}}<extra></extra>'
                     ),
                 ))
             y_ototal = np.sum(np.abs(omatrix), axis=1).astype(float)
@@ -3760,18 +4089,18 @@ def fig_reactions(filepath, species, mode, xscale, yscale, top_n, model=None,
                 name=f'{total_name} \u00B7 att',
                 legendrank=0,
                 hovertemplate=(
-                    f'{total_name}<br>A_V=%{{x:.3g}}<br>rate=%{{y:.3g}}<extra></extra>'
+                    f'{total_name}<br>{xname}=%{{x:.3g}}<br>rate=%{{y:.3g}}<extra></extra>'
                 ),
             ))
 
     yr = _reaction_y_range(displayed_ys, yscale)
-    _apply_layout(fig, title, 'A<sub>V</sub> (mag)', xt, xr, _REACT_YLABEL, yscale, theme=theme,
-                  uirevision_extra=av_range)
+    _apply_layout(fig, title, xl, xt, xr, _REACT_YLABEL, yscale, theme=theme,
+                  uirevision_extra=f'{xvar}|{x_min}')
     yr_tag = f'{yr[0]:.4g}:{yr[1]:.4g}' if yr is not None else 'auto'
     fig.update_layout(
         legend=dict(font=ps.legend_font()),
         uirevision=(
-            f'react|{xt}|{yscale}|{av_range}|{top_n}|{species}|{mode}|'
+            f'react|{xt}|{yscale}|{xvar}|{x_min}|{top_n}|{species}|{mode}|'
             f'{ranking_metric}|{yr_tag}|{_parse_plot_theme(theme)}'
         ),
     )
@@ -3784,14 +4113,19 @@ def fig_reactions(filepath, species, mode, xscale, yscale, top_n, model=None,
 
 def make_reaction_plots(values, species, xscale, yscale, top_n,
                         ranking_metric=DEFAULT_REACT_RANKING, theme='light',
-                        av_range=DEFAULT_AV_RANGE,
+                        x_min=None, xvar='Av',
                         chain_upstream=None, chain_downstream=None,
                         chain_include_isotopes=False, chain_include_ice=False,
                         network_highlight=None, network_hidden=None,
-                        partner_label_size=None, species_label_size=None):
-    """Return formation/destruction figures, tables, and pathway network."""
+                        partner_label_size=None, species_label_size=None,
+                        network_mode='full', dominant_k=3, cr_only=False):
+    """Return formation/destruction figures, tables, and pathway network.
+
+    ``network_mode='dominant'`` keeps only each species' top-``dominant_k``
+    reactions by rate contribution; ``cr_only`` then keeps cosmic-ray routes.
+    """
     ranking_metric = _parse_react_ranking(ranking_metric)
-    av_range = _parse_av_range(av_range)
+    x_min = _parse_x_min(x_min)
     empty = html.Div()
     theme = _parse_plot_theme(theme)
     tc = _theme_colors(theme)
@@ -3822,11 +4156,11 @@ def make_reaction_plots(values, species, xscale, yscale, top_n,
     if chem_path:
         fig_f, stats_f, order_f = fig_reactions(
             chem_path, species, 'formation', xscale, yscale, top_n, model=model,
-            ranking_metric=ranking_metric, theme=theme, av_range=av_range,
+            ranking_metric=ranking_metric, theme=theme, x_min=x_min, xvar=xvar,
             overlay_filepath=chem_overlay_path)
         fig_d, stats_d, order_d = fig_reactions(
             chem_path, species, 'destruction', xscale, yscale, top_n, model=model,
-            ranking_metric=ranking_metric, theme=theme, av_range=av_range,
+            ranking_metric=ranking_metric, theme=theme, x_min=x_min, xvar=xvar,
             overlay_filepath=chem_overlay_path)
         labels_f = (get_reaction_data(chem_path, species, 'formation') or {}).get('labels', [])
         labels_d = (get_reaction_data(chem_path, species, 'destruction') or {}).get('labels', [])
@@ -3841,6 +4175,23 @@ def make_reaction_plots(values, species, xscale, yscale, top_n,
         fig_f = fig_d = missing
         tbl_f = tbl_d = empty
         selected_f = selected_d = None
+    picker = None
+    if network_mode == 'dominant' and chem_path:
+        try:
+            k = max(1, int(dominant_k))
+        except (TypeError, ValueError):
+            k = 3
+
+        def picker(sp, mode):
+            """Top-k ``(label, % contribution)`` of ``sp`` by the tab's ranking metric."""
+            data = get_reaction_data(chem_path, sp, mode)
+            if not data:
+                return []
+            m = model if model and model.get('av') is not None else {
+                **(model or {}), 'av': data['av']}
+            st = compute_reaction_contributions(data['matrix'], m, sp)
+            order = sort_reactions_by_ranking(list(st), st, ranking_metric)[:k]
+            return [(data['labels'][j], st[j].get('fraction_pct')) for j in order]
     sp_html = format_species_html(species)
     fig_net, net_meta = chem_network.build_network_panels(
         _chem.get('labels') or {}, species,
@@ -3855,6 +4206,8 @@ def make_reaction_plots(values, species, xscale, yscale, top_n,
         hidden_species=network_hidden,
         partner_label_size=partner_pt,
         species_label_size=species_pt,
+        reaction_picker=picker,
+        cr_only=bool(cr_only) and picker is not None,
     )
     return (fig_f, tbl_f, fig_d, tbl_d, fig_net,
             chem_network.status_message(net_meta))
@@ -3954,17 +4307,19 @@ def _probe_pack_cubes(cubes, shape_xyz, phys, orders):
     return out
 
 
-def _probe_report(frac, message, *, error=None):
+def _probe_report(frac, message, *, error=None, state=None):
+    state = _probe_progress if state is None else state
     with _probe_job_lock:
-        _probe_progress['frac'] = float(min(1.0, max(0.0, frac)))
-        _probe_progress['message'] = str(message or '')
+        state['frac'] = float(min(1.0, max(0.0, frac)))
+        state['message'] = str(message or '')
         if error is not None:
-            _probe_progress['error'] = str(error)
+            state['error'] = str(error)
 
 
-def _probe_snapshot():
+def _probe_snapshot(state=None):
+    state = _probe_progress if state is None else state
     with _probe_job_lock:
-        return dict(_probe_progress)
+        return dict(state)
 
 
 def _copy_probe_grids(grids):
@@ -3982,12 +4337,21 @@ def _copy_probe_grids(grids):
 
 def _build_probe_grids_3d(
     quantity, tracers, slider_values, idef, progress=None, interp_target_shape=None,
-    return_native=False,
+    return_native=False, overlay=False,
 ):
-    """Native (optionally KoSens-resampled) 3-D cubes for probe ranking."""
+    """Native (optionally KoSens-resampled) 3-D cubes for probe ranking.
+
+    ``overlay=True`` reads the same models from the overlay (attenuated) grid.
+    """
     def _p(frac, msg):
         if callable(progress):
             progress(frac, msg)
+
+    def _hdf5_path(tokens):
+        return _overlay_path_for_tokens(tokens) if overlay else _grid['files'].get(tokens)
+
+    if overlay and quantity != 'intensity' and not _overlay:
+        raise RuntimeError('Load the attenuated grid as the overlay grid on the Load tab.')
 
     tok_to_ijk, shape, phys, orders = _build_probe_index(slider_values)
     nz, ny, nx = shape
@@ -4002,6 +4366,9 @@ def _build_probe_grids_3d(
     if quantity == 'intensity':
         if not _simline:
             raise RuntimeError('Load a SIMLINE directory to rank line intensities.')
+        if overlay and not _simline_overlay:
+            raise RuntimeError('Load the attenuated SIMLINE directory as the SIMLINE overlay '
+                               'on the Load tab.')
         lookup = gf._line_lookup(_simline, idef or SIMLINE_DEFAULT_IDEF)
         missing = [n for n in tracers if n not in lookup]
         if missing:
@@ -4015,7 +4382,7 @@ def _build_probe_grids_3d(
             species, tidx = lookup[name]
             for tokens, (iz, iy, ix) in tok_to_ijk.items():
                 cubes[name][iz, iy, ix] = get_smli_intensity(
-                    tokens, species, idef, tidx)
+                    tokens, species, idef, tidx, overlay=overlay)
                 done += 1
                 if done % step == 0 or done == n_work:
                     _p(0.06 + 0.70 * done / n_work,
@@ -4024,7 +4391,7 @@ def _build_probe_grids_3d(
         if not _grid_has_hdf5():
             raise RuntimeError('Load an HDF5 model grid to rank column densities.')
         for k, (tokens, (iz, iy, ix)) in enumerate(tok_to_ijk.items(), 1):
-            path = _grid['files'].get(tokens)
+            path = _hdf5_path(tokens)
             if path:
                 try:
                     with h5py.File(path, 'r') as hf:
@@ -4040,7 +4407,7 @@ def _build_probe_grids_3d(
             raise RuntimeError(
                 'Load an HDF5 model grid to rank clump-integrated abundances.')
         for k, (tokens, (iz, iy, ix)) in enumerate(tok_to_ijk.items(), 1):
-            path = _grid['files'].get(tokens)
+            path = _hdf5_path(tokens)
             if path:
                 model = get_model(path)
                 xs = _integrated_x_for_species(model, tracers)
@@ -4213,6 +4580,76 @@ def _run_probe_ranking_worker(kwargs):
         with _probe_job_lock:
             _probe_progress['running'] = False
             _probe_progress['token'] += 1
+
+
+def _atten_report(frac, message, *, error=None):
+    _probe_report(frac, message, error=error, state=_atten_progress)
+
+
+def run_atten_impact_job(quantity, tracers, include_ratios, slider_values, idef, mode,
+                         density, interp_n, scan_direction, match_rtol, obs_limit,
+                         progress=None):
+    """Reference + attenuated cubes and the per-cell shift table (the slow part).
+
+    Thresholds are *not* applied here: they act on the cached pixel table in
+    ``render_atten_impact``, so changing a gate never re-runs the shift search.
+    """
+    global _atten_results
+    quantity = quantity or 'rel_abund'
+    tracers = _as_str_list(tracers)
+    idef = idef or SIMLINE_DEFAULT_IDEF
+    p = progress if callable(progress) else (lambda f, m: None)
+    n_dens = len(_probe_axis_tokens('density'))
+    # KoSens resampling of ζ × χ; n_H keeps its native number of slices.
+    shape = (max(int(interp_n), 2),) * 2 + (n_dens,) if interp_n and n_dens >= 2 else None
+    cubes = []
+    for k, (overlay, name) in enumerate(((False, 'reference'), (True, 'attenuated'))):
+        lo = 0.02 + 0.24 * k
+        cubes.append(_build_probe_grids_3d(
+            quantity, tracers, slider_values, idef, interp_target_shape=shape,
+            overlay=overlay,
+            progress=lambda f, m, lo=lo, name=name: p(lo + 0.24 * f, f'{name} grid: {m}')))
+    ref, att = cubes
+    if include_ratios:
+        pairs = _probe_ratio_pairs(quantity, tracers)
+        pr.add_ratio_grids(ref, pairs)
+        pr.add_ratio_grids(att, pairs)
+    missing = [s for s in ref if not np.isfinite(np.asarray(att[s]['grid'], float)).any()]
+    if len(missing) == len(ref):
+        raise RuntimeError('No attenuated model matched the reference grid — check that the '
+                           'overlay directory is the attenuated twin of the main grid.')
+    densities = ac.cube_densities(next(iter(ref.values())))
+    idx = None
+    if mode == 'single':
+        target = _parse_optional_float(density) or float(np.median(densities))
+        idx = [int(np.argmin(np.abs(np.log10(densities) - np.log10(target))))]
+    pixels = ac.collect_pixels(
+        ref, att, density_indices=idx, match_rtol=match_rtol, scan_direction=scan_direction,
+        obs_limit=obs_limit if quantity == 'intensity' else None,
+        progress=lambda f, m: p(0.5 + 0.49 * f, m))
+    if pixels is None or not len(pixels):
+        raise RuntimeError('The shift search produced no cells.')
+    _atten_results = {
+        'pixels': pixels, 'quantity': quantity, 'idef': idef, 'mode': mode,
+        'densities': densities, 'missing_overlay': missing, 'workflow': None,
+        'scan_direction': scan_direction, 'interp': shape,
+    }
+    p(1.0, 'Done')
+
+
+def _run_atten_impact_worker(kwargs):
+    try:
+        _atten_report(0.01, 'Starting…')
+        run_atten_impact_job(progress=_atten_report, **kwargs)
+        with _probe_job_lock:
+            _atten_progress.update(running=False, error=None, frac=1.0, message='Done')
+            _atten_progress['token'] += 1
+    except Exception as exc:
+        _atten_report(_probe_snapshot(_atten_progress).get('frac', 0.0), f'Failed: {exc}',
+                      error=exc)
+        with _probe_job_lock:
+            _atten_progress['running'] = False
+            _atten_progress['token'] += 1
 
 
 def _model_point_tokens(slider_values=None, int_slice_indices=None):
@@ -5617,139 +6054,6 @@ def fig_interpolation_comparison(result, xdef, ydef, *, title, zscale, color_map
     return fig
 
 
-def _interpolate_segment_match(x0, x1, z0, z1, i_target, tol):
-    """Match intensity along log10(x) between two samples (KoSens convention)."""
-    if not np.all(np.isfinite([x0, x1, z0, z1, i_target])) or x0 <= 0 or x1 <= 0:
-        return np.nan
-    u0, u1 = np.log10(float(x0)), np.log10(float(x1))
-    du = u1 - u0
-    if abs(du) < 1e-15 * (abs(u0) + 1.0):
-        if abs(z0 - i_target) <= tol:
-            return float(min(x0, x1))
-        return np.nan
-    dz = z1 - z0
-    if dz == 0:
-        if abs(z0 - i_target) <= tol:
-            return float(min(x0, x1))
-        return np.nan
-    s1 = (i_target - tol - z0) / dz
-    s2 = (i_target + tol - z0) / dz
-    s_lo = max(0.0, min(s1, s2))
-    s_hi = min(1.0, max(s1, s2))
-    if s_lo > s_hi + 1e-15:
-        return np.nan
-    xb = float(10.0 ** (u0 + s_lo * du))
-    return xb if xb > 0 and np.isfinite(xb) else np.nan
-
-
-def _x_match_scan_sorted(xs_scan, zs_scan, i_target, tol):
-    if xs_scan.size == 0:
-        return np.nan
-    for xi, zi in zip(xs_scan, zs_scan):
-        if np.isfinite(zi) and abs(zi - i_target) <= tol:
-            return float(xi)
-    for k in range(len(xs_scan) - 1):
-        xb = _interpolate_segment_match(
-            xs_scan[k], xs_scan[k + 1], zs_scan[k], zs_scan[k + 1], i_target, tol)
-        if np.isfinite(xb):
-            return float(xb)
-    return np.nan
-
-
-def _x_match_intensity_to_x(x_row, z_slice, i_target, x_prefer, *,
-                            atol=0.0, rtol=0.0, scan_direction='rightward_then_leftward',
-                            skip_if_nominal_at_row_max=False, skip_if_nominal_at_row_min=False,
-                            x_edge_rtol=1e-12):
-    if not np.isfinite(i_target) or not np.isfinite(x_prefer) or x_prefer <= 0:
-        return np.nan
-
-    order = np.argsort(x_row.astype(float))
-    xs = x_row[order].astype(float)
-    zs = z_slice[order].astype(float)
-    fin = np.isfinite(xs) & np.isfinite(zs) & (xs > 0)
-    if not np.any(fin):
-        return np.nan
-    xs, zs = xs[fin], zs[fin]
-    x_min_row, x_max_row = float(np.min(xs)), float(np.max(xs))
-    span = x_max_row - x_min_row
-    edge_atol = x_edge_rtol * (span + np.finfo(float).tiny)
-
-    if skip_if_nominal_at_row_max and x_prefer >= x_max_row - edge_atol:
-        return np.nan
-    if skip_if_nominal_at_row_min and x_prefer <= x_min_row + edge_atol:
-        return np.nan
-
-    tol = float(atol) + float(rtol) * abs(float(i_target))
-    x_lo_bound = x_prefer * (1.0 - max(x_edge_rtol, 1e-12))
-    x_hi_bound = x_prefer * (1.0 + max(x_edge_rtol, 1e-12))
-
-    def _scan_half_row(*, right_half, descending=False):
-        mask = xs >= x_lo_bound if right_half else xs <= x_hi_bound
-        xs_scan, zs_scan = xs[mask], zs[mask]
-        if xs_scan.size == 0:
-            return np.nan
-        idx = np.argsort(xs_scan)[::-1] if descending else np.argsort(xs_scan)
-        return _x_match_scan_sorted(xs_scan[idx], zs_scan[idx], i_target, tol)
-
-    if scan_direction == 'rightward':
-        x_hit = _scan_half_row(right_half=True, descending=False)
-        if np.isfinite(x_hit) and x_hit + edge_atol < x_lo_bound:
-            return np.nan
-        return x_hit
-    if scan_direction == 'leftward':
-        x_hit = _scan_half_row(right_half=False, descending=False)
-        if np.isfinite(x_hit) and x_hit - edge_atol > x_hi_bound:
-            return np.nan
-        return x_hit
-
-    x_hit = _scan_half_row(right_half=True, descending=False)
-    if np.isfinite(x_hit):
-        return x_hit
-    z_good = zs[np.isfinite(zs)]
-    if z_good.size == 0:
-        return np.nan
-    if (i_target < float(np.min(z_good)) - tol - 1e-15
-            or i_target > float(np.max(z_good)) + tol + 1e-15):
-        return np.nan
-    if x_prefer <= x_min_row + edge_atol:
-        return np.nan
-    return _scan_half_row(right_half=False, descending=True)
-
-
-def horizontal_intensity_matched_x_shift_dex(g_ref, g_atten, x_mesh_phys, *,
-                                             match_atol=0.0, match_rtol=X_SHIFT_MATCH_RTOL,
-                                             scan_direction=X_SHIFT_SCAN_DIRECTION,
-                                             skip_x_nom_at_row_max=False,
-                                             skip_x_nom_at_row_min=False,
-                                             x_edge_rtol=1e-12):
-    """Per-pixel log10(x_match/x_nom) dex map (KoSens grid_functions)."""
-    g_ref = np.asarray(g_ref, dtype=float)
-    g_atten = np.asarray(g_atten, dtype=float)
-    x_mesh_phys = np.asarray(x_mesh_phys, dtype=float)
-    ny, nx = g_ref.shape
-    out = np.full((ny, nx), np.nan, dtype=float)
-    for iy in range(ny):
-        x_row = x_mesh_phys[iy, :]
-        z_ref = g_ref[iy, :]
-        z_atten = g_atten[iy, :]
-        for ix in range(nx):
-            x_nom = x_row[ix]
-            i_targ = z_ref[ix]
-            if not (np.isfinite(x_nom) and x_nom > 0 and np.isfinite(i_targ)):
-                continue
-            x_match = _x_match_intensity_to_x(
-                x_row, z_atten, i_targ, x_nom,
-                atol=match_atol, rtol=match_rtol,
-                scan_direction=scan_direction,
-                skip_if_nominal_at_row_max=skip_x_nom_at_row_max,
-                skip_if_nominal_at_row_min=skip_x_nom_at_row_min,
-                x_edge_rtol=x_edge_rtol,
-            )
-            if np.isfinite(x_match) and x_match > 0:
-                out[iy, ix] = np.log10(x_match / x_nom)
-    return out
-
-
 def _shift_panel_colorbar_title(xdef):
     if xdef['key'] == 'crir':
         return 'log<sub>10</sub>(\u03B6<sub>match</sub>/\u03B6<sub>nom</sub>) [dex]'
@@ -5784,7 +6088,7 @@ def fig_triple_atten_grid(plane, slice_title, Z_ref, Z_atten, x_phys, y_phys,
     x_mesh = np.broadcast_to(np.asarray(x_phys, dtype=float), (ny, nx)).copy()
     scan_dir = _parse_shift_scan_direction(shift_scan_direction)
     rtol = _parse_shift_rtol(shift_rtol)
-    shift = horizontal_intensity_matched_x_shift_dex(
+    shift = ac.horizontal_intensity_matched_x_shift_dex(
         Z_ref, Z_atten, x_mesh, match_rtol=rtol, scan_direction=scan_dir)
 
     x_plot = _axis_plot_coords(x_phys, xdef)
@@ -6116,53 +6420,23 @@ def make_contour_plots(quantity, zscale, slice_indices,
 def _intensity_map_combos(species_value, transition_value, idef):
     """``(species, transition_idx)`` pairs that exist in the loaded SIMLINE grid.
 
-    Transition dropdown indices come from the first selected species. Other
-    species are matched by spectroscopic transition name when possible, then
-    by row index.
+    Transitions are encoded per species as ``'species||idx'`` (one dropdown per
+    species), so an index is never applied to another species.  Order follows
+    the species selection, then the transition selection.
     """
-    combos = []
-    seen = set()
     idef = idef or SIMLINE_DEFAULT_IDEF
     species_list = _as_str_list(species_value)
-    trans_vals = _as_str_list(transition_value)
-    if not species_list or not trans_vals:
-        return combos
-
-    primary_opts = _simline_transition_options(species_list[0], idef)
-    wanted = []
-    for raw in trans_vals:
-        try:
-            tidx = int(raw)
-        except (TypeError, ValueError):
-            continue
-        tname = None
-        if 0 <= tidx < len(primary_opts):
-            tname = primary_opts[tidx].get('transition')
-        wanted.append((tidx, tname))
-
+    picked = {}
+    for raw in _as_str_list(transition_value):
+        sp, sep, idx = raw.rpartition('||')
+        if sep and idx.lstrip('-').isdigit():
+            picked.setdefault(sp, []).append(int(idx))
+    combos = []
     for sp in species_list:
-        opts = _simline_transition_options(sp, idef)
-        n = len(opts)
-        name_to_idx = {}
-        for o in opts:
-            name = o.get('transition')
-            if name is None:
-                continue
-            try:
-                name_to_idx[str(name)] = int(o.get('idx', o.get('value')))
-            except (TypeError, ValueError):
-                continue
-        for tidx, tname in wanted:
-            if tname is not None and str(tname) in name_to_idx:
-                mapped = name_to_idx[str(tname)]
-            elif 0 <= tidx < n:
-                mapped = tidx
-            else:
-                continue
-            key = (sp, mapped)
-            if key not in seen:
-                seen.add(key)
-                combos.append(key)
+        n = len(_simline_transition_options(sp, idef))
+        for tidx in dict.fromkeys(picked.get(sp, [])):
+            if 0 <= tidx < n:
+                combos.append((sp, tidx))
     return combos
 
 
@@ -6631,6 +6905,160 @@ def make_intensity_rgb_plots(line_keys, idef, transition_flags, slice_indices,
     )
 
 
+_SPECTRUM_GROUP = '/Integrated quantities/Spectrum'
+_WAVELENGTH_TO_UM = {'micron': 1.0, 'um': 1.0, 'A': 1e-4, 'nm': 1e-3, 'cm': 1e4, 'm': 1e6}
+_FREQUENCY_TO_GHZ = {'Hz': 1e-9, 'MHz': 1e-3, 'GHz': 1.0}
+_C_UM_GHZ = 2.99792458e5  # c in µm·GHz: ν[GHz] = c / λ[µm]
+
+
+def read_hdf5_spectrum(path):
+    """Spectra stored under ``Integrated quantities/Spectrum`` (KOSMA-τ and Meudon).
+
+    Column meaning and units come from the HDF5 metadata: wavelength / frequency
+    columns are recognised by unit, every other column is a series.  Returns a
+    list of ``dict(name, wavelength_um, frequency_ghz, series=[(label, unit, y)])``
+    sorted by wavelength; ``[]`` when the file has no spectrum.
+    """
+    columns = {}
+    try:
+        with h5py.File(path, 'r') as hf:
+            if METADATA_PATH not in hf:
+                return []
+            for row in hf[METADATA_PATH][:]:
+                group = _dec(row[0]).strip()
+                if not group.startswith(_SPECTRUM_GROUP):
+                    continue
+                dset = group.rstrip('/') + '/' + _dec(row[1]).strip()
+                try:
+                    col = int(float(_dec(row[2])))
+                except (ValueError, TypeError):
+                    continue
+                columns.setdefault(dset, []).append(
+                    (col, _dec(row[4]).strip(), _dec(row[6]).strip()))
+            arrays = {d: np.asarray(hf[d][()], dtype=float)
+                      for d in columns if d in hf and hf[d].ndim == 2}
+    except OSError:
+        return []
+
+    spectra = []
+    for dset, cols in columns.items():
+        arr = arrays.get(dset)
+        if arr is None:
+            continue
+        wl = nu = None
+        series = []
+        for col, label, unit in sorted(cols):
+            if col >= arr.shape[1]:
+                continue
+            values = arr[:, col]
+            if unit in _WAVELENGTH_TO_UM and wl is None:
+                wl = values * _WAVELENGTH_TO_UM[unit]
+            elif unit in _FREQUENCY_TO_GHZ and nu is None:
+                nu = values * _FREQUENCY_TO_GHZ[unit]
+            else:
+                # KOSMA-τ writes 1e-70 for "no emission".
+                y = np.where(np.abs(values) > 1e-60, values, np.nan)
+                if np.any(np.isfinite(y)):
+                    series.append((label, unit, y))
+        if wl is None and nu is None or not series:
+            continue
+        with np.errstate(divide='ignore', invalid='ignore'):
+            wl = wl if wl is not None else _C_UM_GHZ / nu
+            nu = nu if nu is not None else _C_UM_GHZ / wl
+        order = np.argsort(wl)
+        spectra.append(dict(
+            name=dset[len(_SPECTRUM_GROUP):].strip('/'),
+            wavelength_um=wl[order], frequency_ghz=nu[order],
+            series=[(label, unit, y[order]) for label, unit, y in series],
+        ))
+    return spectra
+
+
+# Spectral regimes in µm (IPAC infrared definitions; 91.2 nm = Lyman limit).
+# Edges vary between sources; these are for orientation only.
+SPECTRAL_REGIMES = (
+    ('EUV', 0.01, 0.0912), ('FUV', 0.0912, 0.2), ('NUV', 0.2, 0.4),
+    ('Vis', 0.4, 0.7), ('NIR', 0.7, 5.0), ('MIR', 5.0, 25.0),
+    ('FIR', 25.0, 350.0), ('sub-mm', 350.0, 1000.0), ('mm', 1000.0, 1e4),
+    ('cm', 1e4, 1e6),
+)
+_REGIME_FILLS = ('#7b61ff', '#1f77b4', '#17becf', '#2ca02c', '#bcbd22',
+                 '#ff7f0e', '#d62728', '#e377c2', '#8c564b', '#7f7f7f')
+
+
+def _add_spectral_regimes(fig, x_min, x_max, by_freq, theme):
+    """Shade and label spectral regimes inside the plotted x range (log x axis)."""
+    t = _theme_colors(theme)
+    for (name, lo_um, hi_um), color in zip(SPECTRAL_REGIMES, _REGIME_FILLS):
+        lo, hi = (_C_UM_GHZ / hi_um, _C_UM_GHZ / lo_um) if by_freq else (lo_um, hi_um)
+        lo, hi = max(lo, x_min), min(hi, x_max)
+        if lo >= hi:
+            continue
+        # Shapes / annotations on a log axis take log10 coordinates.
+        x0, x1 = np.log10(lo), np.log10(hi)
+        fig.add_shape(type='rect', xref='x', yref='paper', x0=x0, x1=x1, y0=0, y1=1,
+                      fillcolor=color, opacity=0.10, line_width=0, layer='below')
+        fig.add_annotation(x=(x0 + x1) / 2, y=1, xref='x', yref='paper',
+                           yanchor='top', showarrow=False, text=name,
+                           font=dict(size=11, color=t['font']))
+
+
+def fig_ir_spectrum(values, x_axis='wavelength', y_scale='log', theme='light', show_regimes=False):
+    """Emission spectrum of the selected model vs wavelength (µm) or frequency (GHz)."""
+    path = current_file(values) if _grid_has_hdf5() else None
+    if not path:
+        return placeholder_fig('Load an HDF5 grid on the Load tab', theme=theme)
+    spectra = read_hdf5_spectrum(path)
+    if not spectra:
+        return placeholder_fig('No spectrum in Integrated quantities/Spectrum for this model',
+                               theme=theme)
+    by_freq = x_axis == 'frequency'
+    t = _theme_colors(theme)
+    fig = go.Figure()
+    units = []
+    i = 0
+    x_min, x_max = np.inf, -np.inf
+    for spec in spectra:
+        x = spec['frequency_ghz'] if by_freq else spec['wavelength_um']
+        x_pos = x[np.isfinite(x) & (x > 0)]
+        if x_pos.size:
+            x_min, x_max = min(x_min, x_pos.min()), max(x_max, x_pos.max())
+        wl_a = spec['wavelength_um'] * 1e4
+        for label, unit, y in spec['series']:
+            if by_freq and 'A-1' in unit.split():
+                # I_λ [.. Å⁻¹] -> I_ν [.. Hz⁻¹]: I_ν = I_λ λ² / c, c in Å/s
+                y = y * wl_a ** 2 / 2.99792458e18
+                unit = ' '.join('Hz-1' if u == 'A-1' else u for u in unit.split())
+            name = label if len(spectra) == 1 else f'{spec["name"]}: {label}'
+            color = COLORS[i % len(COLORS)]
+            i += 1
+            units.append(unit)
+            fig.add_trace(go.Scattergl(
+                x=x, y=y, mode='lines', name=name,
+                line=dict(color=color, width=1.2),
+                hovertemplate=(f'{name}<br>'
+                               + ('\u03bd = %{x:.4g} GHz' if by_freq else '\u03bb = %{x:.4g} \u00b5m')
+                               + f'<br>%{{y:.4g}} {unit}<extra></extra>'),
+            ))
+    y_title = units[0] if len(set(units)) == 1 else ' / '.join(dict.fromkeys(units))
+    model = os.path.splitext(os.path.basename(path))[0]
+    fig.update_layout(
+        **{**_base_layout(theme), 'height': 480},
+        title=dict(text=f'Spectrum \u2014 {model}', font=ps.title_font(t['title']),
+                   x=0.02, xanchor='left'),
+        xaxis=dict(**_axis_style(theme), type='log',
+                   title=dict(text='Frequency (GHz)' if by_freq else 'Wavelength (\u00b5m)',
+                              font=ps.axis_title_font())),
+        yaxis=dict(**_axis_style(theme), type='log' if y_scale == 'log' else 'linear',
+                   title=dict(text=y_title, font=ps.axis_title_font())),
+        showlegend=True,
+        uirevision=f'{path}|{x_axis}|{y_scale}',
+    )
+    if show_regimes and x_min < x_max:
+        _add_spectral_regimes(fig, x_min, x_max, by_freq, theme)
+    return fig
+
+
 def fig_intensity_spectrum(values, species, idef, theme='light', int_slice_indices=None):
     """All SIMLINE line intensities for the selected model point.
 
@@ -6658,6 +7086,7 @@ def fig_intensity_spectrum(values, species, idef, theme='light', int_slice_indic
     fig = go.Figure()
     any_rows = False
     all_positive = True
+    by_transition = False  # no frequencies known for a species: plot vs transition
     for i, sp in enumerate(species_list):
         path = smli_file(tokens, sp, idef)
         if not path:
@@ -6672,13 +7101,16 @@ def fig_intensity_spectrum(values, species, idef, theme='light', int_slice_indic
         color = COLORS[i % len(COLORS)]
         if not np.any(ints[np.isfinite(ints)] > 0):
             all_positive = False
+        has_freq = bool(np.any(np.isfinite(freqs)))
+        by_transition = by_transition or not has_freq
+        x_hover = '\u03bd = %{x:.4g} GHz<br>' if has_freq else ''
         fig.add_trace(go.Scatter(
-            x=freqs, y=ints, mode='lines+markers',
+            x=freqs if has_freq else labels, y=ints, mode='lines+markers',
             marker=dict(size=5, color=color),
             line=dict(color=color, width=1.5),
             name=sp,
             text=labels,
-            hovertemplate=f'{sp} %{{text}}<br>\u03bd = %{{x:.4g}} GHz<br>{y_hover}<extra></extra>',
+            hovertemplate=f'{sp} %{{text}}<br>{x_hover}{y_hover}<extra></extra>',
         ))
     if not any_rows:
         return placeholder_fig('No .smli file for this model point / species', theme=theme)
@@ -6689,8 +7121,10 @@ def fig_intensity_spectrum(values, species, idef, theme='light', int_slice_indic
         title=dict(
             text=f'{names} line {qty_word}  [{unit}]',
             font=ps.title_font(t['title']), x=0.02, xanchor='left'),
-        xaxis=dict(**_axis_style(theme), title=dict(text='Frequency (GHz)', font=ps.axis_title_font()),
-                   type='linear'),
+        xaxis=dict(**_axis_style(theme),
+                   title=dict(text='Transition' if by_transition else 'Frequency (GHz)',
+                              font=ps.axis_title_font()),
+                   type='category' if by_transition else 'linear'),
         yaxis=dict(**_axis_style(theme), title=dict(text=ylab, font=ps.axis_title_font()),
                    type='log' if idef != 'tau' and all_positive else 'linear'),
         showlegend=len(species_list) > 1,
@@ -6730,7 +7164,7 @@ def _obs_fit_summary_layout(result):
         html.Th('v₀ (km/s)', style=center),
         html.Th('σ (km/s)', style=center),
         html.Th('∫I dv (K km/s)', style=center),
-    ], style={'backgroundColor': '#eef2f7'})
+    ], style={'backgroundColor': '#EAF2FF'})
 
     rows = [header_row]
     errs = result.param_errors
@@ -7506,8 +7940,8 @@ def _fmt_cv(val, unit='', decimals=3):
 
 def _cube_stats_layout(cube, sky, meas, fit_result, v_low, v_high, spec_mode='pixel'):
     """Small table of position + line measurements for the cube-viewer selection."""
-    cell = {'padding': '3px 10px', 'borderBottom': '1px solid #e2e8f0'}
-    left = {**cell, 'textAlign': 'left', 'color': '#64748b', 'whiteSpace': 'nowrap'}
+    cell = {'padding': '3px 10px', 'borderBottom': '1px solid #DDE4EE'}
+    left = {**cell, 'textAlign': 'left', 'color': '#5A6B85', 'whiteSpace': 'nowrap'}
     right = {**cell, 'textAlign': 'right', 'fontVariantNumeric': 'tabular-nums'}
 
     def row(label, value):
@@ -7578,7 +8012,7 @@ def _cube_stats_layout(cube, sky, meas, fit_result, v_low, v_high, spec_mode='pi
             html.Th('FWHM (km/s)', style=fcenter),
             html.Th('σ (km/s)', style=fcenter),
             html.Th('∫I dv (K km/s)', style=fcenter),
-        ], style={'backgroundColor': '#eef2f7'})
+        ], style={'backgroundColor': '#EAF2FF'})
         grow = [head]
         errs = fit_result.param_errors
         for j in range(fit_result.n_components):
@@ -7675,7 +8109,7 @@ def _line_id_table_layout(cube, freq_window, line_rows, error, v_source):
 
     rest0 = getattr(cube, 'restfreq_ghz', None)
     show_v = rest0 is not None and np.isfinite(rest0) and rest0 > 0
-    cell = {'padding': '3px 8px', 'borderBottom': '1px solid #e2e8f0'}
+    cell = {'padding': '3px 8px', 'borderBottom': '1px solid #DDE4EE'}
     center = {**cell, 'textAlign': 'center', 'fontVariantNumeric': 'tabular-nums'}
     heads = [
         html.Th('Species', style={**cell, 'textAlign': 'left'}),
@@ -7686,7 +8120,7 @@ def _line_id_table_layout(cube, freq_window, line_rows, error, v_source):
     if show_v:
         heads.append(html.Th('v (km/s)', style=center))
     heads.append(html.Th('E_u (K)', style=center))
-    body = [html.Tr(heads, style={'backgroundColor': '#eef2f7'})]
+    body = [html.Tr(heads, style={'backgroundColor': '#EAF2FF'})]
     for rec in line_rows:
         eu = rec.get('eu_k')
         eu_s = f'{eu:.1f}' if eu is not None and np.isfinite(eu) else '—'
@@ -8037,8 +8471,8 @@ def _load_model_pair(values):
 
 
 def make_profile_plots(values, xvar, xscale, yscale, custom_species, theme='light',
-                       av_range=DEFAULT_AV_RANGE):
-    av_range = _parse_av_range(av_range)
+                       x_min=None):
+    x_min = _parse_x_min(x_min)
     model, overlay = _load_model_pair(values)
     if model is None:
         if _grid and _grid.get('simline_only'):
@@ -8052,11 +8486,11 @@ def make_profile_plots(values, xvar, xscale, yscale, custom_species, theme='ligh
         return (bad,) * 4
     x_cross = find_h_h2_transition(model, xvar)
     figs = [
-        fig_tgas(model, overlay, xvar, xscale, yscale, theme=theme, av_range=av_range),
-        fig_h_h2(model, overlay, xvar, xscale, yscale, theme=theme, av_range=av_range),
-        fig_cplus_c_co(model, overlay, xvar, xscale, yscale, theme=theme, av_range=av_range),
+        fig_tgas(model, overlay, xvar, xscale, yscale, theme=theme, x_min=x_min),
+        fig_h_h2(model, overlay, xvar, xscale, yscale, theme=theme, x_min=x_min),
+        fig_cplus_c_co(model, overlay, xvar, xscale, yscale, theme=theme, x_min=x_min),
         fig_custom(model, overlay, xvar, xscale, yscale, custom_species, theme=theme,
-                   av_range=av_range),
+                   x_min=x_min),
     ]
     for f in figs:
         add_h_h2_vline(f, x_cross, theme=theme)
@@ -8064,8 +8498,8 @@ def make_profile_plots(values, xvar, xscale, yscale, custom_species, theme='ligh
 
 
 def make_thermal_plots(values, xvar, xscale, yscale, theme='light',
-                       av_range=DEFAULT_AV_RANGE):
-    av_range = _parse_av_range(av_range)
+                       x_min=None):
+    x_min = _parse_x_min(x_min)
     model, overlay = _load_model_pair(values)
     if model is None:
         if _grid and _grid.get('simline_only'):
@@ -8078,9 +8512,9 @@ def make_thermal_plots(values, xvar, xscale, yscale, theme='light',
             bad = placeholder_fig('No model file for this parameter combination', theme=theme)
         return (bad,) * 3
     return (
-        fig_thermal(model, overlay, xvar, xscale, yscale, theme=theme, av_range=av_range),
-        fig_heat_breakdown(model, overlay, xvar, xscale, yscale, theme=theme, av_range=av_range),
-        fig_cool_breakdown(model, overlay, xvar, xscale, yscale, theme=theme, av_range=av_range),
+        fig_thermal(model, overlay, xvar, xscale, yscale, theme=theme, x_min=x_min),
+        fig_heat_breakdown(model, overlay, xvar, xscale, yscale, theme=theme, x_min=x_min),
+        fig_cool_breakdown(model, overlay, xvar, xscale, yscale, theme=theme, x_min=x_min),
     )
 
 
@@ -8113,14 +8547,12 @@ _SCALE_OPTIONS = [
     {'label': html.Span('linear', className='seg-opt'), 'value': 'linear'},
 ]
 
-_AV_RANGE_OPTIONS = [
-    {'label': html.Span('full HDF5', className='seg-opt'), 'value': 'full'},
-    {'label': html.Span(f'floor ≥ {AV_FLOOR:g}', className='seg-opt'), 'value': 'floor'},
-]
-
 _XVAR_OPTIONS = [
     {'label': html.Span('Aᵥ (mag)', className='seg-opt'), 'value': 'Av'},
     {'label': html.Span('n_H (cm⁻³)', className='seg-opt'), 'value': 'nH'},
+    {'label': html.Span('depth (pc)', className='seg-opt'), 'value': 'depth'},
+    {'label': html.Span('N_H (cm⁻²)', className='seg-opt'), 'value': 'NH'},
+    {'label': html.Span('N(H₂) (cm⁻²)', className='seg-opt'), 'value': 'NH2'},
 ]
 
 def _math_label(tex):
@@ -8705,9 +9137,21 @@ def _probe_table(rows, columns, *, max_rows=40, empty='Compute a ranking to fill
             elif fmt == 'pct':
                 text = '—' if val is None or not np.isfinite(val) else f'{100.0 * val:.0f}%'
             elif fmt == 'int':
-                text = '—' if val is None else str(int(val))
+                text = '—' if val is None or not np.isfinite(val) else str(int(val))
             elif fmt == 'bool':
-                text = 'yes' if val else 'no'
+                missing = val is None or (isinstance(val, float) and not np.isfinite(val))
+                text = '—' if missing else ('yes' if val else 'no')
+            elif fmt == 'err':
+                # '>' = lower limit: some cells behind this median are censored.
+                cens = row.get('frac_censored')
+                mark = '>' if cens is not None and np.isfinite(cens) and cens > 0 else ''
+                text = pr.format_score(val) if val is None or not np.isfinite(val) \
+                    else f'{mark}{val:.3f}'
+            elif fmt == 'verdict':
+                text = html.Span(str(val), style={
+                    'background': ac.VERDICT_COLORS.get(str(val), '#e2e8f0'),
+                    'color': '#0f172a', 'padding': '1px 8px', 'borderRadius': '10px',
+                    'fontSize': '12px', 'whiteSpace': 'nowrap'})
             else:
                 text = '—' if val is None or val == '' else str(val)
             cells.append(html.Td(text))
@@ -8722,6 +9166,425 @@ def _probe_table(rows, columns, *, max_rows=40, empty='Compute a ranking to fill
         html.Div(html.Table([head, html.Tbody(body)]), className='probe-table-wrap'),
         note,
     ])
+
+
+# Fields in a row start at the top, and every label reserves two lines with its text
+# on the bottom line, so input boxes line up whatever the label or hint length.
+_AI_ROW = {**_PANEL_ROW, 'alignItems': 'flex-start'}
+_AI_LABEL = {**_CTRL_LABEL, 'minHeight': '34px', 'display': 'flex', 'alignItems': 'flex-end'}
+_AI_BTN_STYLE = {'marginTop': '39px'}
+
+_DOCS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'docs')
+
+
+def _doc_section(fname, heading=None):
+    """Markdown of ``docs/<fname>``, or of the section whose title starts with ``heading``.
+
+    A section runs to the next heading of the same or higher level; fenced code
+    is skipped when looking for headings.  Explainer PNGs are served from assets/.
+    """
+    try:
+        with open(os.path.join(_DOCS_DIR, fname), encoding='utf-8') as fh:
+            text = fh.read().replace('Figures/probe_margin/', '/assets/probe_margin/')
+    except OSError:
+        return f'*docs/{fname} not found.*'
+    if heading is None:
+        return text
+    lines, fenced, heads = text.splitlines(), False, []
+    for i, line in enumerate(lines):
+        if line.startswith('```'):
+            fenced = not fenced
+        elif not fenced and line.startswith('#'):
+            heads.append((i, len(line) - len(line.lstrip('#')), line.lstrip('#').strip()))
+    for k, (i, level, title) in enumerate(heads):
+        if title.startswith(heading):
+            end = next((j for j, lv, _t in heads[k + 1:] if lv <= level), len(lines))
+            return '\n'.join(lines[i:end])
+    return f'*Section “{heading}” not found in docs/{fname}.*'
+
+
+def _doc_details(summary, fname, heading=None, open_=False):
+    """Collapsible “how to read” panel rendering one docs/ section."""
+    return html.Details([
+        html.Summary(summary),
+        html.Div(dcc.Markdown(_doc_section(fname, heading)), className='kosma-details-body'),
+    ], className='kosma-details', open=open_)
+
+
+def _ai_field(label, control, hint, min_width='150px'):
+    """Label + control + one-line explanation (also the tooltip)."""
+    return html.Div([
+        html.Label(label, style=_AI_LABEL),
+        control,
+        html.Span(hint, className='kosma-muted',
+                  style={'fontSize': '11px', 'display': 'block', 'marginTop': '4px'}),
+    ], title=hint, style={**_CTRL_BOX, 'minWidth': min_width})
+
+
+def _ai_number(id_, value, **kw):
+    return dcc.Input(id=id_, type='number', value=value, debounce=True,
+                     className='kosma-input', style={'width': '100%'}, **kw)
+
+
+def _ai_text(id_, value):
+    return dcc.Input(id=id_, type='text', value=value, debounce=True,
+                     className='kosma-input', style={'width': '100%'})
+
+
+def _ai_graph(id_):
+    return dcc.Loading(type='circle', children=dcc.Graph(
+        id=id_, figure=placeholder_fig('Compute to fill this figure'), config=_GRAPH_CFG))
+
+
+def _ai_table_slot(id_):
+    return html.Div(id=id_, children=_probe_table([], [], empty='Compute to fill this table.'))
+
+
+def _atten_impact_page():
+    """Layout for the Attenuation impact tab (KoSens attenuation workflow)."""
+    def eq(expr, note):
+        return html.Div([html.Span(expr, className='probe-eq'),
+                         html.Span(note, className='kosma-muted')])
+
+    info = html.Div(className='probe-info', children=[html.Div([
+        html.Strong('What this page answers'),
+        html.P('The main grid is the constant-cosmic-ray reference; the overlay grid loaded on '
+               'the Load tab (the SIMLINE overlay for line intensities) is its attenuated twin. '
+               'Fitting a real — attenuated — source with the constant-CR grid returns the wrong '
+               'ζ. This page measures by how much, for which tracers, and why, keeping two '
+               'questions apart:', style={'margin': '6px 0 6px'}),
+        html.Ul([
+            html.Li([html.B('Which lines mislead me most if I ignore attenuation?'),
+                     ' → a correction-priority list (3 · Verdicts, “Lines that mislead most”).']),
+            html.Li([html.B('Which lines are the cleanest cosmic-ray probes?'),
+                     ' → a line-selection list (3 · Verdicts, “Best CR probes”).']),
+        ], style={'margin': '0 0 10px 18px', 'fontSize': '13px'}),
+        html.Div(className='probe-math', children=[
+            eq('Δ = log₁₀(ζ_match / ζ_nom)',
+               'shift along ζ that reproduces the attenuated value = dex error in the inferred ζ '
+               '(0.3 dex = ×2, 1 dex = ×10)'),
+            eq('S = d log₁₀ I_ref / d log₁₀ ζ',
+               'local CR sensitivity of the reference grid (dex per dex of ζ)'),
+            eq('R = log₁₀(I_atten / I_ref)',
+               'value lost at fixed ζ when attenuation is switched on (no matching needed)'),
+            eq('|Δ| ≈ |R| / |S|',
+               'on flat rows (S → 0) the shift blows up without meaning — hence the |S| gate'),
+            eq('margin = |R| − swing',
+               'response left after its own spread over the environment; > 0 → CR-led'),
+        ]),
+        html.P([html.B('Hard requirement: '),
+                'the two grids must differ only in attenuation. Any other difference is '
+                'indistinguishable from an attenuation shift in every figure below.'],
+               style={'margin': '10px 0 4px'}),
+        html.P('Read in order: 1 · Breadth (which species move, and where) → 2 · Magnitude & '
+               'probe (how wrong is ζ; is the change cosmic rays or FUV) → 3 · Verdicts (one '
+               'grade per species). The per-species maps (reference | attenuated | shift) are on '
+               'Grids / Intensities once the overlay is loaded. Every step has a “How to read” '
+               'panel; the Guide tab has the full documentation and the table of good values.',
+               className='kosma-muted', style={'margin': '0'}),
+    ])])
+
+    data_row = html.Div([
+        html.Div([
+            html.Label('Quantity', style=_AI_LABEL),
+            dcc.RadioItems(id='ai-quantity', options=PROBE_QUANTITY_OPTIONS,
+                           value='rel_abund', **_RADIO),
+            html.Span('Line intensities need a SIMLINE directory and a SIMLINE overlay; '
+                      'abundances and column densities use the HDF5 grid and its overlay.',
+                      className='kosma-muted', style={'fontSize': '11px', 'display': 'block'}),
+        ], style={'flex': '1.2', 'minWidth': '200px', 'marginRight': '18px'}),
+        html.Div([
+            html.Label('Tracers', style=_AI_LABEL),
+            dcc.Dropdown(id='ai-tracers', options=[], value=[], multi=True,
+                         placeholder='Load a grid… then pick species or lines',
+                         style={'fontSize': '13px'}),
+            html.Span('Each tracer costs one shift search per density slice. “Add all” for a '
+                      'full survey (slower) — the point of the procedure is to find the movers.',
+                      className='kosma-muted', style={'fontSize': '11px', 'display': 'block',
+                                                      'marginTop': '4px'}),
+        ], style={'flex': '2.4', 'minWidth': '260px', 'marginRight': '8px'}),
+        html.Button('Typical', id='ai-btn-typical', n_clicks=0,
+                    className='btn btn-ghost btn-sm', style=_AI_BTN_STYLE),
+        html.Button('Add all', id='ai-btn-all', n_clicks=0, className='btn btn-primary btn-sm',
+                    style={**_AI_BTN_STYLE, 'marginLeft': '6px'}),
+        _ai_field('Ratios', dcc.Checklist(id='ai-include-ratios',
+                                          options=[{'label': ' include pairs', 'value': 'on'}],
+                                          value=[], **_RADIO),
+                  'Also test ratios of the selected tracers (KoSens pairing rules). Ratios that '
+                  'share a species are capped in the rankings, and den_contrib tells when a '
+                  'ratio only restates its numerator.', '170px'),
+        html.Div(id='ai-idef-wrap', children=[
+            html.Label('Intensity units', style=_AI_LABEL),
+            dcc.RadioItems(id='ai-idef', options=SIMLINE_MAPFIT_IDEF_OPTIONS,
+                           value=SIMLINE_DEFAULT_IDEF, **_RADIO),
+        ], style={**_CTRL_BOX, 'minWidth': '160px', 'display': 'none'}),
+    ], className='kosma-panel', style=_AI_ROW)
+
+    setup_row = html.Div([
+        _ai_field('Mode', dcc.RadioItems(id='ai-mode', value='single', options=[
+            {'label': ' single n_H slice (as KoSens)', 'value': 'single'},
+            {'label': ' full 3-D grid (n_H × χ × ζ)', 'value': '3d'}], **_RADIO),
+            'Single: the (ζ, χ) plane at one density — exactly the KoSens procedure. 3-D: every '
+            'density slice, pooled, plus verdicts per density and per environment.', '230px'),
+        html.Div(id='ai-density-wrap', children=_ai_field(
+            'Density n_H [cm⁻³]',
+            dcc.Dropdown(id='ai-density', options=[], value=None, clearable=False),
+            'Slice used in single mode (the nearest native or resampled density).', '170px')),
+        _ai_field('Resample ζ × χ', html.Div([
+            dcc.Checklist(id='ai-interp-enable', options=[{'label': ' on', 'value': 'on'}],
+                          value=['on'], **_RADIO),
+            _ai_number('ai-interp-n', 60, min=2, max=200, step=1)]),
+            'KoSens interpolates each plane to n × n (60 × 60) before the shift search. Off = '
+            'native models only: faster, every cell a real model, but fractions over fewer '
+            'cells. n_H always keeps its native slices.', '200px'),
+        _ai_field('Scan direction', dcc.Dropdown(id='ai-scan-dir', value='rightward',
+                                                 options=X_SHIFT_DIRECTION_OPTIONS,
+                                                 clearable=False),
+                  'Rightward only (default) is the one that gives Δ its meaning as the ζ error: '
+                  'attenuation dims the line, so a constant-CR fit lands at a lower ζ. The '
+                  'others are diagnostics.', '210px'),
+        _ai_field('Match tolerance (rtol)', _ai_number('ai-rtol', ac.X_SHIFT_MATCH_RTOL,
+                                                       min=0, max=0.5, step=0.005),
+                  'A match needs |I − I_target| ≤ rtol · I_target. Default 0.02 (2 %). Larger = '
+                  'more matches, coarser Δ.', '150px'),
+        _ai_field('Detection limit', _ai_number('ai-obs-limit', ac.OBS_INTENSITY_LIMIT, min=0),
+                  'Line intensities only, in grid units (0.1 = 100 mK for a grid in K). A cell '
+                  'counts only where every line behind the key clears it in both grids — ratios '
+                  'are judged on their two lines. Blank = no limit.', '180px'),
+    ], className='kosma-panel', style=_AI_ROW)
+
+    env_row = html.Div(id='ai-env-wrap', style={'display': 'none'}, className='kosma-panel',
+                       children=[html.Div([
+        _ai_field('n_H edges', _ai_text('ai-env-n', 'auto'),
+                  '“auto” splits once at the log midpoint → low / high n_H; “full” = no split; '
+                  'or comma-separated values, e.g. 1e3, 1e4.', '200px'),
+        _ai_field('χ edges', _ai_text('ai-env-chi', 'auto'),
+                  'The same for the FUV field χ (Draine).', '160px'),
+        _ai_field('ζ edges', _ai_text('ai-env-zeta', 'auto'),
+                  'The same for ζ [s⁻¹]. “auto” on all three axes gives 8 environments such as '
+                  '“low n_H · high χ · high ζ”.', '220px'),
+        _ai_field('Min cells per environment', _ai_number('ai-min-env-cells', 10, min=1, step=1),
+                  'Fewer cells for a species, or fewer than two (n_H, χ) rows, grades it “too few '
+                  'models” instead of a noisy verdict.', '190px'),
+    ], style=_AI_ROW)])
+
+    thresholds = html.Details([
+        html.Summary('Thresholds — applied instantly to the computed cells (no recompute)'),
+        html.Div([
+            html.P('Each threshold is entered once and used by every step, so the steps can never '
+                   'disagree (workflow §9). Hover a field for its explanation.',
+                   className='kosma-muted', style={'margin': '0 0 8px', 'fontSize': '12px'}),
+            html.Strong('Which cells count'),
+            html.Div([
+                _ai_field('min |S| [dex/dex]', _ai_number('ai-min-slope', 0.1, min=0, step=0.05),
+                          'Cells whose reference row moves less than this per dex of ζ are not '
+                          'trusted: there |Δ| ≈ |R|/|S| blows up because the line stopped '
+                          'responding. 0.1 ≈ 26 % per decade. Counts ignore it, medians use it. '
+                          'Larger = stricter.'),
+                _ai_field('“shifted” if |Δ| ≥ [dex]',
+                          _ai_number('ai-min-abs-shift', 0.1, min=0, step=0.05),
+                          'Threshold for counting a cell as moved (n_shifted, frac_shifted). '
+                          '0.1 dex ≈ 26 % in ζ.'),
+                _ai_field('|Δ| bin edges [dex]', _ai_text('ai-shift-edges', '0.1, 0.3, 0.5, 1.0'),
+                          'Bins of the step-1 stacked bars. 0.3 dex = ×2, 0.5 = ×3, 1 = ×10 in ζ.',
+                          '180px'),
+                _ai_field('min observable fraction',
+                          _ai_number('ai-min-obs-frac', 0.5, min=0, max=1, step=0.05),
+                          'A species above the detection limit over less of the grid is not '
+                          'ranked and is graded “unobservable”. Needs a detection limit.'),
+            ], style=_AI_ROW),
+            html.Strong('Is the number measured? (honesty gates)'),
+            html.Div([
+                _ai_field('max unmatched fraction',
+                          _ai_number('ai-max-unmatched', 0.5, min=0, max=1, step=0.05),
+                          'More of the map without a match → not ranked in step 1 and graded '
+                          '“unmeasurable”: moved everywhere, measured nowhere. 1 disables. '
+                          'Smaller = stricter.'),
+                _ai_field('max censored fraction',
+                          _ai_number('ai-max-censored', 0.5, min=0, max=1, step=0.05),
+                          'Censored cells enter the ζ error at a lower bound. Above 0.5 the median '
+                          'itself is an imputed bound, not a measurement. 1 disables.'),
+            ], style=_AI_ROW),
+            html.Strong('The verdict cascade'),
+            html.Div([
+                _ai_field('min shifted fraction (broad)',
+                          _ai_number('ai-min-frac-shifted', 0.5, min=0, max=1, step=0.05),
+                          'Does attenuation touch a useful part of the grid? Below → “CR-led, '
+                          'narrow”.'),
+                _ai_field('response floor [dex]',
+                          _ai_number('ai-response-floor', 0.1, min=0, step=0.05),
+                          '|R| below this (0.1 ≈ 26 %) = the line barely responds → “no response”; '
+                          'also the dotted line of the probe plane.'),
+                _ai_field('ζ error that matters [dex]',
+                          _ai_number('ai-min-error', 0.3, min=0, step=0.05),
+                          'Is the ζ error worth correcting? 0.3 dex = factor 2. Below → “CR-led, '
+                          'small bias”. Not applied to the Best-CR-probes list.'),
+            ], style=_AI_ROW),
+            html.Strong('Display'),
+            html.Div([
+                _ai_field('species per panel', _ai_number('ai-max-species', 8, min=1, step=1),
+                          'Species drawn in step 2: largest ζ error (left), largest margin (right).'),
+                _ai_field('max per constituent', _ai_number('ai-max-per-const', 2, min=1, step=1),
+                          'At most this many drawn entries may share a species — ratios on one '
+                          'numerator with inert denominators are one finding. Tables keep all.'),
+                _ai_field('top species (step 1)', _ai_number('ai-top-summary', 12, min=1, step=1),
+                          'Species on the step-1 bars and heatmaps, by median |Δ|.'),
+                _ai_field('ζ bins', _ai_number('ai-nx-bins', 4, min=1, max=20, step=1),
+                          'Log-spaced ζ bins of the heatmaps and winner map.', '110px'),
+                _ai_field('χ bins', _ai_number('ai-ny-bins', 4, min=1, max=20, step=1),
+                          'Log-spaced χ bins of the heatmaps and winner map.', '110px'),
+                _ai_field('top models per species', _ai_number('ai-top-models', 8, min=1, step=1),
+                          'Largest-|Δ| trusted cells kept per species (Top models table).'),
+                _ai_field('probe-plane axis max [dex]',
+                          _ai_number('ai-probe-axis-max', 1.5, min=0.2, step=0.1),
+                          'Fixed, equal axes so two runs compare by eye; raised automatically so '
+                          'nothing is clipped.'),
+                _ai_field('Filters', dcc.Checklist(id='ai-filters', value=['ice'], options=[
+                    {'label': ' exclude ice (J-species)', 'value': 'ice'},
+                    {'label': ' exclude isotopologues', 'value': 'iso'}], **_RADIO),
+                    'Ice species have no line emission. Run once with and once without '
+                    'isotopologues to separate the two investigations.', '210px'),
+            ], style=_AI_ROW),
+        ], className='kosma-details-body'),
+    ], className='kosma-details', open=True)
+
+    def step_intro(text):
+        return html.P(text, style=_PAGE_INTRO)
+
+    breadth = [
+        step_intro('Which species move, and where? Species are ranked by how many models moved '
+                   '(an unmatched cell counts as movement here). Breadth, not magnitude.'),
+        _doc_details('How to read step 1', 'attenuation_workflow.md', '5. Stage 4'),
+        _doc_details('Good values for step 1', 'attenuation_good_values.md', 'Step 1'),
+        _ai_graph('ai-fig-bars'), _ai_graph('ai-fig-heat'), _ai_graph('ai-fig-winner'),
+        html.Strong('Species summary'), _ai_table_slot('ai-tbl-summary'),
+        html.Strong('Regime winners'), _ai_table_slot('ai-tbl-winners'),
+        html.Strong('Top models (largest trusted |Δ| per species)'), _ai_table_slot('ai-tbl-top'),
+        _doc_details('Column guide', 'attenuation_workflow.md',
+                     '`species_summary` and regime tables'),
+    ]
+    magnitude = [
+        step_intro('How wrong is ζ if attenuation is ignored (left), and is the change cosmic '
+                   'rays or the radiation field (right)? The two panels rank independently: the '
+                   'ideal probe has a large response on a steep row and therefore a small error.'),
+        _doc_details('How to read step 2', 'attenuation_workflow.md', '6. Stage 5'),
+        _doc_details('Reading the error panel, bar by bar', 'probe_margin_explained.md',
+                     'Reading the left panel'),
+        _doc_details('Reading the probe plane', 'probe_margin_explained.md',
+                     'Where it lands on the real plot'),
+        _doc_details('Good values for step 2', 'attenuation_good_values.md', 'Step 2'),
+        # Square figures (height fixed in atten_compare, width capped here) side by side.
+        # Probe panel is wider: its legend sits to the right of the square plot.
+        html.Div([html.Div(_ai_graph(i), style={'flex': f'1 1 {w}px', 'maxWidth': f'{mw}px'})
+                  for i, w, mw in (('ai-fig-err', 560, 680), ('ai-fig-probe', 760, 920))],
+                 style={**_AI_ROW, 'gap': '16px'}),
+        html.Strong('Response table'), _ai_table_slot('ai-tbl-response'),
+        _doc_details('Column guide', 'attenuation_workflow.md', 'Response table'),
+    ]
+    verdicts = [
+        step_intro('One verdict per species from four questions asked in order — broad, honest, '
+                   'CR-led, matters. The first failing question names the verdict.'),
+        _doc_details('How to read step 3', 'attenuation_workflow.md', '7. Stage 6'),
+        _doc_details('Good values and verdicts', 'attenuation_good_values.md', 'Step 3'),
+        html.Div(id='ai-tally', style={'display': 'flex', 'flexWrap': 'wrap', 'gap': '6px',
+                                       'margin': '10px 0 12px'}),
+        html.Div([
+            html.Div([
+                html.Strong('Best CR probes — line selection'),
+                html.P('CR-led verdicts sorted by probe margin. The “matters” cut is not applied: '
+                       'a clean probe with a small ζ error is still a clean probe.',
+                       className='kosma-muted', style={'fontSize': '12px', 'margin': '4px 0'}),
+                _ai_table_slot('ai-tbl-tracers'),
+            ], style={'flex': '1', 'minWidth': '380px', 'marginRight': '18px'}),
+            html.Div([
+                html.Strong('Lines that mislead most — correction priority'),
+                html.P('Honest species (measured, not imputed) sorted by ζ error. An FUV tracer '
+                       'can lead it: the error is real, its cause is not cosmic rays.',
+                       className='kosma-muted', style={'fontSize': '12px', 'margin': '4px 0'}),
+                _ai_table_slot('ai-tbl-problematic'),
+            ], style={'flex': '1', 'minWidth': '380px'}),
+        ], style=_AI_ROW),
+        html.Strong('All species, graded (cascade order)'), _ai_table_slot('ai-tbl-verdicts'),
+        _doc_details('Column guide', 'attenuation_workflow.md', 'Reconciliation'),
+        html.Strong('Where to follow up the CRIR probes'),
+        html.P('Step-1 regime winners restricted to species graded CRIR probe.',
+               className='kosma-muted', style={'fontSize': '12px', 'margin': '4px 0'}),
+        _ai_table_slot('ai-tbl-followup'),
+        _doc_details('Where to go next', 'attenuation_workflow.md', '8. Stage 7'),
+        html.Div(id='ai-3d-wrap', style={'display': 'none'}, children=[
+            html.H4('3-D · does the verdict depend on density?'),
+            html.P('One column per density slice (the whole procedure re-run on it) plus the '
+                   'pooled grid. A row that keeps its colour is a verdict you can quote at any '
+                   'density; a row that changes is density-specific.',
+                   className='kosma-muted', style={'fontSize': '12px'}),
+            _ai_graph('ai-fig-dens-matrix'),
+            html.H4('3-D · verdicts per environment'),
+            html.P('Each column is an environment from the edges in the setup panel: the three '
+                   'steps re-run on its cells, the swing measured only across its own (n_H, χ) '
+                   'rows. Read a row to see where a species is a good or a bad tracer; pick an '
+                   'environment below for its own lists.',
+                   className='kosma-muted', style={'fontSize': '12px'}),
+            _ai_graph('ai-fig-env-matrix'),
+            html.Div(_ai_field('Environment', dcc.Dropdown(id='ai-env-pick', options=[],
+                                                           value=None, clearable=False),
+                               'The lists below are for this environment only.', '340px'),
+                     style=_AI_ROW),
+            html.Div([
+                html.Div([html.Strong('Best CR probes here'), _ai_table_slot('ai-env-tracers')],
+                         style={'flex': '1', 'minWidth': '380px', 'marginRight': '18px'}),
+                html.Div([html.Strong('Lines that mislead most here'),
+                          _ai_table_slot('ai-env-problematic')],
+                         style={'flex': '1', 'minWidth': '380px'}),
+            ], style=_AI_ROW),
+            _doc_details('How the 3-D mode works', 'attenuation_good_values.md', '3-D mode'),
+        ]),
+    ]
+    guide = [
+        _doc_details('Good values — what to look for in every figure and table',
+                     'attenuation_good_values.md', 'Good values', open_=True),
+        _doc_details('Where the KoSens names live in this tab', 'attenuation_good_values.md',
+                     'Where the KoSens names'),
+        _doc_details('3-D mode', 'attenuation_good_values.md', '3-D mode'),
+        _doc_details('Pitfalls', 'attenuation_workflow.md', '10. Pitfalls'),
+        _doc_details('probe_margin and the ζ error, in pictures (with a worked example)',
+                     'probe_margin_explained.md'),
+        _doc_details('The full workflow (KoSens documentation)', 'attenuation_workflow.md'),
+    ]
+
+    def sub(label, value, children):
+        return dcc.Tab(label=label, value=value, style=_NESTED_TAB_STYLE,
+                       selected_style=_NESTED_TAB_SEL, children=children)
+
+    return [
+        html.P('Compare the constant-CR grid with its attenuated twin: which tracers move, how '
+               'wrong the inferred ζ gets, whether a tracer reports cosmic rays or the radiation '
+               'field, and one verdict per tracer — for one density slice or the whole 3-D grid.',
+               style=_PAGE_INTRO),
+        info, data_row, setup_row, env_row, thresholds,
+        html.Div([
+            html.Button('Compute', id='ai-btn-compute', n_clicks=0, className='btn btn-primary',
+                        style={'marginRight': '12px'}),
+            html.Div(id='ai-status', className='load-status', style={'display': 'inline-block'}),
+        ], style={'padding': '0 4px 12px'}),
+        html.Div(id='ai-progress-wrap', className='probe-progress', style={'display': 'none'},
+                 children=[
+            html.Div(className='probe-progress-track', children=[
+                html.Div(id='ai-progress-fill', className='probe-progress-fill',
+                         style={'width': '0%'})]),
+            html.Div(id='ai-progress-label', className='kosma-muted probe-progress-label'),
+        ]),
+        dcc.Store(id='ai-state', data=0),
+        dcc.Store(id='ai-render', data=0),
+        dcc.Interval(id='ai-progress-interval', interval=400, disabled=True, n_intervals=0),
+        html.Div(id='ai-notes'),
+        dcc.Tabs(id='ai-subtabs', value='ai-breadth', style={'marginTop': '4px'},
+                 content_style={'paddingTop': '16px'}, children=[
+            sub('1 · Breadth', 'ai-breadth', breadth),
+            sub('2 · Magnitude & probe', 'ai-magnitude', magnitude),
+            sub('3 · Verdicts', 'ai-verdicts', verdicts),
+            sub('Guide', 'ai-guide', guide),
+        ]),
+    ]
 
 
 def _probe_ranking_page():
@@ -9563,8 +10426,8 @@ app.layout = html.Div(
     id='app-root',
     className='theme-light',
     style={'fontFamily': UI_FONT, 'maxWidth': APP_MAX_WIDTH,
-           'margin': '0 auto', 'padding': '12px 24px 28px', 'backgroundColor': '#f1f4f8',
-           'color': '#1e293b', 'minHeight': '100vh'},
+           'margin': '0 auto', 'padding': '12px 24px 28px', 'backgroundColor': '#F2F5FA',
+           'color': '#22314A', 'minHeight': '100vh'},
     children=[
 
     # Header + compact theme toggle
@@ -9636,26 +10499,20 @@ app.layout = html.Div(
                 dcc.RadioItems(id='yscale', options=_SCALE_OPTIONS, value='log', **_SEG),
             ], style=_CTRL_BOX),
             html.Div([
-                html.Label('Aᵥ range', style=_CTRL_LABEL),
-                dcc.RadioItems(id='av-range', options=_AV_RANGE_OPTIONS,
-                               value=DEFAULT_AV_RANGE, **_SEG),
+                html.Label('X-axis min', style=_CTRL_LABEL),
+                dcc.Input(id='x-min', type='number', value=None, min=0, debounce=True,
+                          placeholder=f'full HDF5 (e.g. {AV_FLOOR:g})',
+                          style={'width': '100%', 'fontSize': '13px'}),
             ], style={**_CTRL_BOX, 'marginRight': '0'}),
         ], id='controls-axis-wrap',
            className='kosma-panel',
-           style={'display': 'flex', 'alignItems': 'flex-start',
-                  'padding': '10px 16px', 'marginTop': '8px'}),
+           style={'display': 'flex', 'flexWrap': 'wrap', 'alignItems': 'flex-start',
+                  'padding': '12px 16px', 'marginTop': '8px'}),
 
         html.Div(id='model-info', className='kosma-panel', style={
             'display': 'flex', 'flexWrap': 'wrap', 'gap': '8px', 'alignItems': 'center',
-            'padding': '7px 14px',
+            'padding': '8px 16px',
             'marginTop': '8px', 'marginBottom': '4px', 'fontSize': '13px'}),
-    ]),
-
-    html.Div(className='nav-groups', children=[
-        html.Span('Data'),
-        html.Span('Local profiles'),
-        html.Span('Grids & chemistry'),
-        html.Span('Lines & fits'),
     ]),
 
     dcc.Tabs(
@@ -9663,11 +10520,12 @@ app.layout = html.Div(
         value='load',
         className='prisma-tabs',
         style={'marginTop': '0'},
-        colors={'border': '#e2e8f0', 'primary': '#2563eb', 'background': '#ffffff'},
+        colors={'border': '#DDE4EE', 'primary': '#1560CE', 'background': '#ffffff'},
         children=[
 
         # --- Page 1: grid loaders -------------------------------------------
-        dcc.Tab(label='Load', value='load', style=_TAB_STYLE, selected_style=_TAB_SEL,
+        dcc.Tab(label='Load', value='load', className='grp-data',
+                style=_TAB_STYLE, selected_style=_TAB_SEL,
                 children=[
             html.Div(style={'paddingTop': '14px'}, children=[
                 html.P('Load model grids and SIMLINE directories to explore PDR models. '
@@ -9896,7 +10754,8 @@ app.layout = html.Div(
         ]),
 
         # --- Page 3: abundance profiles -------------------------------------
-        dcc.Tab(label='Profiles', value='profiles', style=_TAB_STYLE,
+        dcc.Tab(label='Profiles', value='profiles', className='grp-profiles',
+                style=_TAB_STYLE,
                 selected_style=_TAB_SEL, children=[
             html.Div(style={'paddingTop': '10px'}, children=[
                 html.P('Gas and dust temperatures plus H/H\u2082, C\u207A/C/CO and custom '
@@ -10021,7 +10880,8 @@ app.layout = html.Div(
         ]),
 
         # --- Page 4: 2-D grid slices --------------------------------------
-        dcc.Tab(label='Grids', value='grids', style=_TAB_STYLE, selected_style=_TAB_SEL,
+        dcc.Tab(label='Grids', value='grids', className='grp-grids',
+                style=_TAB_STYLE, selected_style=_TAB_SEL,
                 children=[
             html.Div(style={'paddingTop': '10px'}, children=[
                 html.P('Contour maps over the full model grid. Use the abundance box, the '
@@ -10179,9 +11039,15 @@ app.layout = html.Div(
                        'chemistry filenames; load an HDF5 grid for depth profiles and '
                        'abundance colormaps. Choose how reactions '
                        'are ranked: fractional contribution to the total rate, or '
-                       'mass-weighted rate (KoSens ``top_reactions_plot`` metrics). '
+                       'rate per X particle (KoSens ``top_reactions_plot`` metrics). '
                        'Below, separate formation and destruction networks show all '
-                       'partners in those same top-N reactions (reactants left, products right).',
+                       'partners in those same top-N reactions (reactants left, products right). '
+                       'Switch the network to Dominant to keep only the top reactions (by rate '
+                       'contribution) of every species on the path, and tick cosmic-ray paths '
+                       'only to see the routes started or ended by cosmic rays (CRP / CRPHOT / '
+                       'CR-DES) or by the cosmic-ray ions H⁺, H₂⁺, H₃⁺, He⁺. '
+                       'Dotted arrows are steps driven by those ions; in Dominant mode arrow '
+                       'width follows each reaction\'s % contribution.',
                        style=_PAGE_INTRO),
                 html.Div([
                     html.Div([
@@ -10261,6 +11127,35 @@ app.layout = html.Div(
                                          'border': '1px solid #bbc', 'borderRadius': '6px'}),
                     ], style={'marginRight': '22px'}),
                     html.Div([
+                        html.Label('Network', style=_CTRL_LABEL,
+                                   title='Dominant: every species keeps only its top '
+                                         'reactions by rate contribution'),
+                        dcc.RadioItems(id='react-net-mode',
+                                       options=[{'label': ' Full', 'value': 'full'},
+                                                {'label': ' Dominant', 'value': 'dominant'}],
+                                       value='full', **_RADIO),
+                    ], style={'marginRight': '18px'}),
+                    html.Div([
+                        html.Label('Reactions / species', style=_CTRL_LABEL,
+                                   title='Top formation / destruction reactions kept per '
+                                         'species in Dominant mode'),
+                        dcc.Input(id='react-dom-k', type='number',
+                                  min=1, max=10, step=1, value=3,
+                                  style={'width': '90px', 'padding': '7px 9px', 'fontSize': '13px',
+                                         'border': '1px solid #bbc', 'borderRadius': '6px'}),
+                    ], style={'marginRight': '18px'}),
+                    html.Div([
+                        html.Label(' ', style=_CTRL_LABEL),
+                        dcc.Checklist(
+                            id='react-net-cr',
+                            options=[{'label': ' cosmic-ray paths only', 'value': 'cr'}],
+                            value=[],
+                            style={'fontSize': '13px', 'whiteSpace': 'nowrap'}),
+                    ], title='Dominant mode: keep only routes that contain a '
+                             'cosmic-ray reaction (CRP / CRPHOT / CR-DES) or a '
+                             'cosmic-ray ion reactant (H+, H2+, H3+, He+)',
+                       style={'marginRight': '22px', 'alignSelf': 'flex-end'}),
+                    html.Div([
                         html.Label('Include', style=_CTRL_LABEL),
                         dcc.Checklist(
                             id='react-chain-isotopes',
@@ -10305,7 +11200,8 @@ app.layout = html.Div(
         ]),
 
         # --- Probe ranking ---------------------------------------------------
-        dcc.Tab(label='Probe ranking', value='proberank', style=_TAB_STYLE,
+        dcc.Tab(label='Probe ranking', value='proberank', className='grp-lines',
+                style=_TAB_STYLE,
                 selected_style=_TAB_SEL, children=[
             html.Div(style={'paddingTop': '10px'}, children=_probe_ranking_page()),
         ]),
@@ -10329,6 +11225,11 @@ app.layout = html.Div(
                                        value=SIMLINE_DEFAULT_IDEF, **_RADIO),
                     ], style={'flex': '1.4', 'minWidth': '220px', 'marginRight': '18px'}),
                     html.Div([
+                        html.Label('Viewing angle (Meudon)', style=_CTRL_LABEL),
+                        dcc.RadioItems(id='hdf5-angle', options=[], value=None, **_RADIO),
+                    ], id='hdf5-angle-wrap',
+                        style={'display': 'none', 'minWidth': '160px', 'marginRight': '18px'}),
+                    html.Div([
                         html.Label('Species', style=_CTRL_LABEL),
                         dcc.Dropdown(id='int-species', options=[], value=[],
                                      multi=True,
@@ -10338,20 +11239,15 @@ app.layout = html.Div(
                     html.Button('Add all species', id='btn-int-all-species', n_clicks=0,
                                 className='btn btn-primary btn-sm', style=_ALL_BTN_STYLE),
                     html.Div([
-                        html.Label('Transition (for grid maps)', style=_CTRL_LABEL),
-                        dcc.Dropdown(id='int-transition', options=[], value=[],
-                                     multi=True,
-                                     placeholder='Select species\u2026',
-                                     style={'fontSize': '13px'}),
-                    ], style={'flex': '1.4', 'minWidth': '180px', 'marginLeft': '12px',
-                              'marginRight': '8px'}),
-                    html.Button('Add all transitions', id='btn-int-all-transitions', n_clicks=0,
-                                className='btn btn-primary btn-sm', style=_ALL_BTN_STYLE),
-                    html.Div([
                         html.Label('Contour Z scale', style=_CTRL_LABEL),
                         dcc.RadioItems(id='int-zscale', options=_SCALE_OPTIONS,
                                        value='log', **_SEG),
-                    ], style={**_CTRL_BOX, 'marginRight': '0'}),
+                    ], style={**_CTRL_BOX, 'marginLeft': '12px', 'marginRight': '0'}),
+                    # One transition dropdown per selected species (for grid maps);
+                    # the flat selection ('species||idx') lives in the store.
+                    dcc.Store(id='int-transition', data=[]),
+                    html.Div(id='int-transition-rows',
+                             style={'flexBasis': '100%', 'marginTop': '10px'}),
                 ], className='kosma-panel',
                 style={'display': 'flex', 'alignItems': 'flex-start',
                        'flexWrap': 'wrap',
@@ -10425,6 +11321,43 @@ app.layout = html.Div(
                 dcc.Tabs(id='spectra-subtabs', value='sp-simline',
                          style={'marginTop': '4px'},
                          content_style={'paddingTop': '16px'}, children=[
+                    dcc.Tab(label='Model spectrum', value='sp-ir',
+                            style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
+                            children=[
+                        html.P('Emission spectrum stored in the model HDF5 '
+                               '(Integrated quantities/Spectrum) for the model selected '
+                               'with the sliders: KOSMA-\u03c4 IR continuum in Jy, Meudon '
+                               'emerging intensity (perpendicular to the cloud surface).',
+                               style=_PAGE_INTRO),
+                        html.Div([
+                            html.Div([
+                                html.Label('x axis', style=_CTRL_LABEL),
+                                dcc.RadioItems(id='ir-x-axis', value='wavelength', options=[
+                                    {'label': ' Wavelength (\u00b5m)', 'value': 'wavelength'},
+                                    {'label': ' Frequency (GHz)', 'value': 'frequency'},
+                                ], **_RADIO),
+                            ], style=_CTRL_BOX),
+                            html.Div([
+                                html.Label('y scale', style=_CTRL_LABEL),
+                                dcc.RadioItems(id='ir-y-scale', value='log', options=[
+                                    {'label': ' log', 'value': 'log'},
+                                    {'label': ' linear', 'value': 'linear'},
+                                ], **_RADIO),
+                            ], style=_CTRL_BOX),
+                            html.Div([
+                                html.Label('Overlays', style=_CTRL_LABEL),
+                                dcc.Checklist(id='ir-regimes', value=[], options=[
+                                    {'label': ' Show spectral regimes (UV \u2026 cm)',
+                                     'value': 'on'},
+                                ], **_RADIO),
+                            ], style=_CTRL_BOX),
+                        ], className='kosma-panel',
+                            style={'display': 'flex', 'flexWrap': 'wrap', 'marginBottom': '12px'}),
+                        dcc.Loading(type='circle', children=[
+                            dcc.Graph(id='plot-ir-spectrum', figure=placeholder_fig(),
+                                      config=_GRAPH_CFG),
+                        ]),
+                    ]),
                     dcc.Tab(label='SimLine PV', value='sp-simline',
                             style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
                             children=[
@@ -10743,7 +11676,8 @@ app.layout = html.Div(
         ]),
 
         # --- Page 8: interpolation error check --------------------------------
-        dcc.Tab(label='Interpolation', value='interperror', style=_TAB_STYLE,
+        dcc.Tab(label='Interpolation', value='interperror', className='grp-diag',
+                style=_TAB_STYLE,
                 selected_style=_TAB_SEL, children=[
             html.Div(style={'paddingTop': '10px'}, children=[
                 html.P('Compare native model grids with KoSens-style resampling and '
@@ -10843,6 +11777,12 @@ app.layout = html.Div(
                     dcc.Graph(id='plot-cr-atten', figure=placeholder_fig(), config=_GRAPH_CFG),
                 ]),
             ]),
+        ]),
+
+        # --- Attenuation impact (KoSens attenuation workflow) ---------------
+        dcc.Tab(label='Attenuation impact', value='attenimpact', style=_TAB_STYLE,
+                selected_style=_TAB_SEL, children=[
+            html.Div(style={'paddingTop': '10px'}, children=_atten_impact_page()),
         ]),
 
         # --- Page 10: observational map fit ---------------------------------
@@ -11823,13 +12763,30 @@ def handle_path_browse(*args):
        Output('contour-cdens', 'options'),
        Output('contour-cdens', 'value'),
        Output('ie-quantity', 'options'),
-       Output('ie-quantity', 'value')],
+       Output('ie-quantity', 'value'),
+       Output('simline-state', 'data', allow_duplicate=True),
+       Output('int-species', 'options', allow_duplicate=True),
+       Output('int-species', 'value', allow_duplicate=True),
+       Output('ie-int-species', 'options', allow_duplicate=True),
+       Output('ie-int-species', 'value', allow_duplicate=True),
+       Output('sp-species', 'options', allow_duplicate=True),
+       Output('sp-species', 'value', allow_duplicate=True),
+       Output('hdf5-angle', 'options', allow_duplicate=True),
+       Output('hdf5-angle', 'value', allow_duplicate=True),
+       Output('hdf5-angle-wrap', 'style', allow_duplicate=True),
+       Output('int-idef', 'value', allow_duplicate=True),
+       Output('ie-int-idef', 'value', allow_duplicate=True)],
     Input('btn-load', 'n_clicks'),
     State('dir-input', 'value'),
     State('recursive-check', 'value'),
+    State('simline-state', 'data'),
+    State('int-species', 'value'),
+    State('ie-int-species', 'value'),
+    State('sp-species', 'value'),
     prevent_initial_call=True,
 )
-def handle_load(n_clicks, directory, recursive):
+def handle_load(n_clicks, directory, recursive, simline_state,
+                cur_species, cur_ie_species, cur_sp_species):
     hidden, shown = _slider_wrap_styles()
     empty_slice = _empty_slice_slider_ui()
 
@@ -11839,7 +12796,7 @@ def handle_load(n_clicks, directory, recursive):
         err = html.Span(f'\u2717  {exc}', style={'color': '#d62728', 'fontWeight': '600'})
         empty = _empty_param_slider_ui(hidden)
         return ([err, False] + empty + empty_slice * 6
-                + [[], [], [], [], [], [], [], None])
+                + [[], [], [], [], [], [], [], None] + [dash.no_update] * 12)
 
     slider_cfg, slice_cfg, _ = _ui_slider_config(grid['axis_tokens'])
     sp_opts, defaults, cq_opts, cq_val, cd_opts, cd_val, ie_cq_opts, ie_cq_val = _species_dropdown_cfg(
@@ -11854,16 +12811,28 @@ def handle_load(n_clicks, directory, recursive):
     cfg_note = ''
     if _model_config_summary and not _model_config_summary.get('error'):
         cfg_note = f'   \u2014   {_model_config_summary["n_configs"]} JSON configs'
+    int_note = ''
+    if _simline.get('from_hdf5'):
+        int_note = f'   \u2014   intensities for {len(_simline["species"])} species from HDF5'
+        if _simline.get('angles'):
+            int_note += f' (Meudon, angles {", ".join(_simline["angles"])}\u00B0)'
     status = html.Span([
         html.Span('Loaded', className='status-chip ok'),
         html.Code(grid['directory'], style={'marginLeft': '8px'}),
-        html.Span(f'  {grid["n_files"]} models  —  grid: {cube}{note}{cfg_note}',
+        html.Span(f'  {grid["n_files"]} models  —  grid: {cube}{note}{cfg_note}{int_note}',
                   className='kosma-muted',
                   style={'marginLeft': '10px'}),
     ])
 
+    if _simline.get('from_hdf5'):
+        simline_ui = [(simline_state or 0) + 1] + _simline_species_ui(
+            _simline['species'], cur_species, cur_ie_species, cur_sp_species)
+        simline_ui += _hdf5_angle_ui()
+    else:
+        simline_ui = [dash.no_update] * 12
     return ([status, True] + slider_cfg + slice_cfg * 6
-            + [sp_opts, defaults, cq_opts, cq_val, cd_opts, cd_val, ie_cq_opts, ie_cq_val])
+            + [sp_opts, defaults, cq_opts, cq_val, cd_opts, cd_val, ie_cq_opts, ie_cq_val]
+            + simline_ui)
 
 
 app.clientside_callback(
@@ -11904,9 +12873,9 @@ def apply_plot_theme(theme, loaded, _simline_state):
     }
     header = {
         'display': 'flex', 'alignItems': 'center',
-        'justifyContent': 'space-between', 'gap': '16px',
-        'borderBottom': f'1px solid {t["card_border"]}',
-        'paddingBottom': '14px', 'marginBottom': '12px',
+        'justifyContent': 'space-between', 'gap': '24px',
+        'padding': '12px 16px', 'marginBottom': '12px',
+        'borderRadius': '10px',
     }
     sliders = {
         'display': 'flex', 'flexWrap': 'wrap', 'alignItems': 'flex-start',
@@ -11918,12 +12887,12 @@ def apply_plot_theme(theme, loaded, _simline_state):
     else:
         axis = {
             'display': 'flex', 'alignItems': 'flex-start',
-            'padding': '10px 16px', 'marginTop': '8px',
+            'padding': '12px 16px', 'marginTop': '8px',
             'color': t['font'],
         }
     info = {
         'display': 'flex', 'flexWrap': 'wrap', 'gap': '8px', 'alignItems': 'center',
-        'padding': '7px 14px',
+        'padding': '8px 16px',
         'marginTop': '8px', 'marginBottom': '4px', 'fontSize': '13px', 'color': t['font'],
     }
     tab_colors = {
@@ -12818,6 +13787,51 @@ def handle_chem(n_load, n_clear, directory, recursive, state, cur_species):
     return (status, state + 1, opts, value) + tuple(grid_sync)
 
 
+def _hdf5_angle_ui():
+    """[angle options, angle value, wrap style, int-idef, ie-int-idef] for HDF5 intensities."""
+    angles = _simline.get('angles') or ()
+    hidden = {'display': 'none', 'minWidth': '160px', 'marginRight': '18px'}
+    if not angles:
+        return [[], None, hidden, dash.no_update, dash.no_update]
+    opts = [{'label': f' {a}\u00B0', 'value': a} for a in angles]
+    return [opts, _simline['angle'], {**hidden, 'display': 'block'}, dash.no_update, dash.no_update]
+
+
+@app.callback(
+    Output('simline-state', 'data', allow_duplicate=True),
+    Input('hdf5-angle', 'value'),
+    State('simline-state', 'data'),
+    prevent_initial_call=True,
+)
+def handle_hdf5_angle(angle, state):
+    """Switch the Meudon viewing angle used for HDF5 line intensities."""
+    global _hdf5_line_angle, _simline_overlay
+    if not angle or not _simline.get('angles') or angle == _simline.get('angle'):
+        raise PreventUpdate
+    _hdf5_line_angle = angle
+    _load_hdf5_simline()
+    if _overlay and _simline_overlay.get('from_hdf5'):
+        _simline_overlay = scan_simline_hdf5(
+            _overlay['files'], _overlay['directory'], build_by_non_atten=True)
+    return (state or 0) + 1
+
+
+def _simline_species_ui(species, cur_species, cur_ie_species, cur_sp_species):
+    """Intensity species dropdowns: [int opts, value, ie opts, value, sp opts, value]."""
+    preferred = [s for s in ('CO', '13CO', 'C18O', 'HCO+', 'N2H+', 'CS', 'HCN', 'C+', 'CI')
+                 if s in species]
+    rest = sorted(s for s in species if s not in preferred)
+    opts = [{'label': s, 'value': s} for s in preferred + rest]
+    default_sp = (SIMLINE_DEFAULT_SPECIES if SIMLINE_DEFAULT_SPECIES in species
+                  else (species[0] if species else None))
+    kept_species = [s for s in _as_str_list(cur_species) if s in species]
+    value = kept_species or ([default_sp] if default_sp else [])
+    ie_default = value[0] if value else None
+    ie_value = cur_ie_species if cur_ie_species in species else ie_default
+    sp_value = cur_sp_species if cur_sp_species in species else ie_default
+    return [opts, value, opts, ie_value, opts, sp_value]
+
+
 @app.callback(
     [Output('simline-status', 'children'),
      Output('simline-state', 'data'),
@@ -12849,8 +13863,14 @@ def handle_simline(n_load, n_clear, directory, recursive, state,
         clear_simline()
         clear_simline_only_grid()
         grid_sync = _empty_grid_sync(loaded=False) if was_simline_only else no_grid_sync
-        return ([html.Span('SIMLINE directory cleared.', style={'color': '#888'}),
-                 state + 1, [], [], [], None, [], None]
+        msg = 'SIMLINE directory cleared.'
+        if _grid_has_hdf5():
+            _load_hdf5_simline()
+        if _simline:
+            msg += '  Using intensities from the loaded HDF5 grid.'
+        return ([html.Span(msg, style={'color': '#888'}), state + 1]
+                + _simline_species_ui(_simline.get('species', []),
+                                      cur_species, cur_ie_species, cur_sp_species)
                 + grid_sync)
 
     try:
@@ -12863,17 +13883,6 @@ def handle_simline(n_load, n_clear, directory, recursive, state,
 
     bootstrapped = bootstrap_grid_from_simline()
 
-    preferred = [s for s in ('CO', '13CO', 'C18O', 'HCO+', 'N2H+', 'CS', 'HCN', 'C+', 'CI')
-                 if s in sl['species']]
-    rest = sorted(s for s in sl['species'] if s not in preferred)
-    opts = [{'label': s, 'value': s} for s in preferred + rest]
-    default_sp = (SIMLINE_DEFAULT_SPECIES if SIMLINE_DEFAULT_SPECIES in sl['species']
-                  else (sl['species'][0] if sl['species'] else None))
-    kept_species = [s for s in _as_str_list(cur_species) if s in sl['species']]
-    value = kept_species or ([default_sp] if default_sp else [])
-    ie_default = value[0] if value else None
-    ie_value = cur_ie_species if cur_ie_species in sl['species'] else ie_default
-    sp_value = cur_sp_species if cur_sp_species in sl['species'] else ie_default
 
     note = f'  ({sl["n_skipped"]} skipped)' if sl['n_skipped'] else ''
     pv_note = ''
@@ -12896,40 +13905,81 @@ def handle_simline(n_load, n_clear, directory, recursive, state,
         html.Span(f'   {sl["n_files"]} files, {len(sl["species"])} species{pv_note}{note}{mode_note}',
                   style={'color': '#555', 'marginLeft': '10px'}),
     ])
-    return ([status, state + 1, opts, value, opts, ie_value, opts, sp_value]
+    return ([status, state + 1]
+            + _simline_species_ui(sl['species'], cur_species, cur_ie_species, cur_sp_species)
             + grid_sync)
 
 
 @app.callback(
-    Output('int-transition', 'options'),
-    Output('int-transition', 'value'),
+    Output('int-transition-rows', 'children'),
+    Input('int-species', 'value'),
+    Input('int-idef', 'value'),
+    Input('simline-state', 'data'),
+    State('int-transition', 'data'),
+)
+def build_int_transition_rows(species, idef, _state, current):
+    """One labelled transition dropdown (+ Add all) per selected species."""
+    if not _simline:
+        return []
+    idef = idef or SIMLINE_DEFAULT_IDEF
+    current = set(_as_str_list(current))
+    rows = []
+    for sp in _as_str_list(species):
+        opts = [{'label': o['label'], 'value': f"{sp}||{o['value']}"}
+                for o in _simline_transition_options(sp, idef)]
+        kept = [o['value'] for o in opts if o['value'] in current]
+        value = kept or ([opts[0]['value']] if opts else [])
+        rows.append(html.Div([
+            html.Label(f'{sp} transitions', style={**_CTRL_LABEL, 'minWidth': '140px',
+                                                   'marginBottom': '0'}),
+            dcc.Dropdown(id={'role': 'int-tr', 'sp': sp}, options=opts, value=value,
+                         multi=True, placeholder='No transitions', style={
+                             'fontSize': '13px', 'flex': '1', 'minWidth': '220px'}),
+            html.Button('Add all', id={'role': 'int-tr-all', 'sp': sp}, n_clicks=0,
+                        className='btn btn-primary btn-sm', style={'marginLeft': '8px'}),
+        ], style={'display': 'flex', 'alignItems': 'center', 'gap': '8px',
+                  'marginBottom': '6px'}))
+    return rows
+
+
+@app.callback(
+    Output('int-transition', 'data'),
+    Input({'role': 'int-tr', 'sp': ALL}, 'value'),
+)
+def collect_int_transitions(values):
+    return [v for vals in values for v in (vals or [])]
+
+
+@app.callback(
+    Output({'role': 'int-tr', 'sp': MATCH}, 'value'),
+    Input({'role': 'int-tr-all', 'sp': MATCH}, 'n_clicks'),
+    State({'role': 'int-tr', 'sp': MATCH}, 'options'),
+    prevent_initial_call=True,
+)
+def add_all_int_transitions(n_clicks, options):
+    if not n_clicks or not options:
+        raise PreventUpdate
+    return [o['value'] for o in options]
+
+
+@app.callback(
     Output('ie-int-transition', 'options'),
     Output('ie-int-transition', 'value'),
-    Input('int-species', 'value'),
     Input('ie-int-species', 'value'),
-    Input('int-idef', 'value'),
     Input('ie-int-idef', 'value'),
     Input('simline-state', 'data'),
-    State('int-transition', 'value'),
     State('ie-int-transition', 'value'),
 )
-def update_int_transition(species, ie_species, idef, ie_idef, _state, cur_trans, cur_ie_trans):
+def update_ie_int_transition(ie_species, ie_idef, _state, cur_ie_trans):
     if not _simline:
-        return [], [], [], None
-    primary = _first_str(species)
-    opts = _simline_transition_options(primary, idef or SIMLINE_DEFAULT_IDEF) if primary else []
-    dd_opts = [{'label': o['label'], 'value': o['value']} for o in opts]
-    valid = {str(o['value']) for o in opts}
-    kept = [t for t in _as_str_list(cur_trans) if t in valid]
-    value = kept or ([_default_simline_transition(primary, idef)] if opts else [])
-
+        return [], None
     ie_opts = _simline_transition_options(
         ie_species, ie_idef or SIMLINE_DEFAULT_IDEF) if ie_species else []
     ie_dd = [{'label': o['label'], 'value': o['value']} for o in ie_opts]
     ie_valid = {o['value'] for o in ie_opts}
     ie_value = cur_ie_trans if cur_ie_trans in ie_valid else _default_simline_transition(
         ie_species, ie_idef)
-    return dd_opts, value, ie_dd, ie_value
+    return ie_dd, ie_value
 
 
 @app.callback(
@@ -13342,6 +14392,21 @@ def update_ie_slice_labels(*args_in):
     return labels + fixed_labels + titles
 
 
+def _ie_analyze_slice(x_phys, y_phys, Z, xdef, ydef, ie_cfg):
+    """``(interpolation result, None)``, or ``(None, reason)`` when the slice can't be analysed."""
+    if not np.any(np.isfinite(Z)):
+        return None, None
+    try:
+        return gi.analyze_slice_interpolation(
+            x_phys, y_phys, Z,
+            x_logscale=xdef['logscale'],
+            y_logscale=ydef['logscale'],
+            **ie_cfg,
+        ), None
+    except gi.SliceTooSmallError as exc:
+        return None, str(exc)
+
+
 @app.callback(
     _ie_abund_outputs + _ie_int_outputs + _ie_abund_wrap_outputs + _ie_int_wrap_outputs,
     [Input('ie-quantity', 'value'),
@@ -13397,17 +14462,19 @@ def update_ie_panels(*args_in):
 
     for plane, sidx in zip(active_slice_planes(), slice_indices):
         xdef = ydef = None
+        if not plane.get('active'):
+            # Single model / fewer varying axes: nothing to slice for this slot.
+            abund_figs.append(placeholder_fig(theme=theme))
+            int_figs.append(placeholder_fig(theme=theme))
+            abund_wrap.append(wrap_hide)
+            int_wrap.append(wrap_hide)
+            continue
         if show_abund:
             slice_token = _ie_slice_token(plane, sidx)
             x_phys, y_phys, Z, xdef, ydef = _native_abundance_grid(
                 plane, slice_token, quantity)
-            if np.any(np.isfinite(Z)):
-                result = gi.analyze_slice_interpolation(
-                    x_phys, y_phys, Z,
-                    x_logscale=xdef['logscale'],
-                    y_logscale=ydef['logscale'],
-                    **ie_cfg,
-                )
+            result, too_small = _ie_analyze_slice(x_phys, y_phys, Z, xdef, ydef, ie_cfg)
+            if result is not None:
                 sk = plane['slice']
                 sdef = _param_def(sk)
                 slice_disp = _param_token_disp(sdef, slice_token)
@@ -13424,7 +14491,8 @@ def update_ie_panels(*args_in):
                 ))
                 abund_wrap.append(wrap_show)
             else:
-                abund_figs.append(placeholder_fig('No grid points for this slice', theme=theme))
+                abund_figs.append(placeholder_fig(too_small or 'No grid points for this slice',
+                                                  theme=theme))
                 abund_wrap.append(wrap_show)
         else:
             abund_figs.append(placeholder_fig('Load a main grid and pick a quantity', theme=theme))
@@ -13439,13 +14507,8 @@ def update_ie_panels(*args_in):
             x_phys, y_phys, Z, xdef, ydef = _native_intensity_grid(
                 plane, slice_token, ie_species, ie_idef or SIMLINE_DEFAULT_IDEF, tidx,
                 slider_values=slider_values)
-            if np.any(np.isfinite(Z)):
-                result = gi.analyze_slice_interpolation(
-                    x_phys, y_phys, Z,
-                    x_logscale=xdef['logscale'],
-                    y_logscale=ydef['logscale'],
-                    **ie_cfg,
-                )
+            result, too_small = _ie_analyze_slice(x_phys, y_phys, Z, xdef, ydef, ie_cfg)
+            if result is not None:
                 sk = plane['slice']
                 sdef = _param_def(sk)
                 slice_disp = _param_token_disp(sdef, slice_token)
@@ -13465,7 +14528,8 @@ def update_ie_panels(*args_in):
                 ))
                 int_wrap.append(wrap_show)
             else:
-                int_figs.append(placeholder_fig('No SIMLINE data for this slice', theme=theme))
+                int_figs.append(placeholder_fig(too_small or 'No SIMLINE data for this slice',
+                                                theme=theme))
                 int_wrap.append(wrap_show)
         else:
             int_figs.append(placeholder_fig('Load SIMLINE and pick species / transition',
@@ -13479,7 +14543,7 @@ def update_ie_panels(*args_in):
     _int_contour_outputs,
     [Input('int-species', 'value'),
      Input('int-idef', 'value'),
-     Input('int-transition', 'value'),
+     Input('int-transition', 'data'),
      Input('int-zscale', 'value'),
      Input('simline-state', 'data'),
      Input('simline-overlay-state', 'data'),
@@ -13545,22 +14609,9 @@ def add_all_int_species(_n, options):
 
 
 @app.callback(
-    Output('int-transition', 'value', allow_duplicate=True),
-    Input('btn-int-all-transitions', 'n_clicks'),
-    State('int-transition', 'options'),
-    prevent_initial_call=True,
-)
-def add_all_int_transitions(_n, options):
-    vals = [o['value'] for o in (options or [])]
-    if not vals:
-        raise PreventUpdate
-    return vals
-
-
-@app.callback(
     Output('int-contour-extra-rows', 'children'),
     Input('int-species', 'value'),
-    Input('int-transition', 'value'),
+    Input('int-transition', 'data'),
     Input('int-idef', 'value'),
     Input('simline-state', 'data'),
     Input('simline-overlay-state', 'data'),
@@ -13677,7 +14728,7 @@ def update_one_int_contour_extra(slice_idx, idef, zscale, _state, _ov_state,
     Output('int-ratio-selector', 'value'),
     Output('int-ratio-hint', 'children'),
     Input('int-species', 'value'),
-    Input('int-transition', 'value'),
+    Input('int-transition', 'data'),
     Input('int-idef', 'value'),
     State('int-ratio-selector', 'value'),
 )
@@ -13706,7 +14757,7 @@ def add_all_int_ratios(_n, options):
     Input('grid-loaded', 'data'),
     State('int-idef', 'value'),
     State('int-species', 'value'),
-    State('int-transition', 'value'),
+    State('int-transition', 'data'),
     State('int-zscale', 'value'),
     State('int-shift-scan-direction', 'value'),
     State('int-shift-match-rtol', 'value'),
@@ -13786,7 +14837,7 @@ def build_int_ratio_rows(pairs, _state, _ov_state, _loaded,
     Input('grid-colorscale', 'value'),
     *_slider_value_inputs,
     State('int-species', 'value'),
-    State('int-transition', 'value'),
+    State('int-transition', 'data'),
     prevent_initial_call=True,
 )
 def update_one_int_ratio(slice_idx, idef, zscale, _state, _ov_state,
@@ -13923,6 +14974,16 @@ def update_intensity_spectrum(*args_in):
 
 
 @app.callback(
+    Output('x-min', 'value'),
+    Input('xvar-choice', 'value'),
+    prevent_initial_call=True,
+)
+def reset_x_min(_xvar):
+    # Units differ between quantities, so an old limit would silently hide data.
+    return None
+
+
+@app.callback(
     Output('plot-tgas', 'figure'),
     Output('plot-h-h2', 'figure'),
     Output('plot-cco', 'figure'),
@@ -13931,7 +14992,7 @@ def update_intensity_spectrum(*args_in):
     + [Input('xvar-choice', 'value'),
        Input('xscale', 'value'),
        Input('yscale', 'value'),
-       Input('av-range', 'value'),
+       Input('x-min', 'value'),
        Input('species-selector', 'value'),
        Input('overlay-state', 'data'),
        Input('plot-theme', 'value')],
@@ -13939,11 +15000,11 @@ def update_intensity_spectrum(*args_in):
 )
 def update_profile_plots(*args_in):
     values = list(args_in[:N_PARAMS])
-    xvar, xscale, yscale, av_range, custom_species, _overlay_state, plot_theme = (
+    xvar, xscale, yscale, x_min, custom_species, _overlay_state, plot_theme = (
         args_in[N_PARAMS:])
     return make_profile_plots(values, xvar, xscale, yscale, custom_species or [],
                               theme=_parse_plot_theme(plot_theme),
-                              av_range=av_range)
+                              x_min=x_min)
 
 
 @app.callback(
@@ -13954,17 +15015,34 @@ def update_profile_plots(*args_in):
     + [Input('xvar-choice', 'value'),
        Input('xscale', 'value'),
        Input('yscale', 'value'),
-       Input('av-range', 'value'),
+       Input('x-min', 'value'),
        Input('overlay-state', 'data'),
        Input('plot-theme', 'value')],
     prevent_initial_call=True,
 )
 def update_thermal_plots(*args_in):
     values = list(args_in[:N_PARAMS])
-    xvar, xscale, yscale, av_range, _overlay_state, plot_theme = args_in[N_PARAMS:]
+    xvar, xscale, yscale, x_min, _overlay_state, plot_theme = args_in[N_PARAMS:]
     return make_thermal_plots(values, xvar, xscale, yscale,
                               theme=_parse_plot_theme(plot_theme),
-                              av_range=av_range)
+                              x_min=x_min)
+
+
+@app.callback(
+    Output('plot-ir-spectrum', 'figure'),
+    _slider_value_inputs
+    + [Input('ir-x-axis', 'value'),
+       Input('ir-y-scale', 'value'),
+       Input('ir-regimes', 'value'),
+       Input('grid-loaded', 'data'),
+       Input('plot-theme', 'value')],
+    prevent_initial_call=True,
+)
+def update_ir_spectrum(*args_in):
+    values = list(args_in[:N_PARAMS])
+    x_axis, y_scale, regimes, _loaded, plot_theme = args_in[N_PARAMS:]
+    return fig_ir_spectrum(values, x_axis, y_scale, theme=_parse_plot_theme(plot_theme),
+                           show_regimes='on' in (regimes or []))
 
 
 @app.callback(
@@ -14120,7 +15198,8 @@ def update_abundance_pdf(*args_in):
        Input('react-ranking', 'value'),
        Input('xscale', 'value'),
        Input('yscale', 'value'),
-       Input('av-range', 'value'),
+       Input('x-min', 'value'),
+       Input('xvar-choice', 'value'),
        Input('chem-state', 'data'),
        Input('chem-overlay-state', 'data'),
        Input('plot-theme', 'value'),
@@ -14131,19 +15210,23 @@ def update_abundance_pdf(*args_in):
        Input('react-species-label-size', 'value'),
        Input('react-partner-label-size', 'value'),
        Input('react-net-highlight', 'data'),
-       Input('react-net-hidden', 'data')],
+       Input('react-net-hidden', 'data'),
+       Input('react-net-mode', 'value'),
+       Input('react-dom-k', 'value'),
+       Input('react-net-cr', 'value')],
     prevent_initial_call=True,
 )
 def update_reaction_plots(*args_in):
     values = list(args_in[:N_PARAMS])
-    (species, top_n, ranking, xscale, yscale, av_range, _chem_state, _chem_overlay_state,
+    (species, top_n, ranking, xscale, yscale, x_min, xvar, _chem_state, _chem_overlay_state,
      plot_theme, chain_up, chain_down, chain_iso, chain_ice,
-     species_pt, partner_pt, net_highlight, net_hidden) = args_in[N_PARAMS:]
+     species_pt, partner_pt, net_highlight, net_hidden,
+     net_mode, dom_k, net_cr) = args_in[N_PARAMS:]
     top_n = top_n or CHEM_DEFAULT_NREAC
     return make_reaction_plots(values, species, xscale, yscale, top_n,
                                ranking_metric=ranking,
                                theme=_parse_plot_theme(plot_theme),
-                               av_range=av_range,
+                               x_min=x_min, xvar=xvar,
                                chain_upstream=chain_up,
                                chain_downstream=chain_down,
                                chain_include_isotopes=bool(chain_iso and 'iso' in chain_iso),
@@ -14151,7 +15234,10 @@ def update_reaction_plots(*args_in):
                                network_highlight=net_highlight,
                                network_hidden=net_hidden,
                                partner_label_size=partner_pt,
-                               species_label_size=species_pt)
+                               species_label_size=species_pt,
+                               network_mode=net_mode,
+                               dominant_k=dom_k,
+                               cr_only=bool(net_cr and 'cr' in net_cr))
 
 
 @app.callback(
@@ -14811,6 +15897,387 @@ def poll_probe_ranking_progress(_n, state):
     status = _probe_ranked_status(ranking) if ranking else html.Span(
         'Ranking finished.', className='kosma-muted')
     return {'width': '100%'}, '100%  ·  Done', wrap, True, status, (state or 0) + 1, False
+
+
+# --- Attenuation impact --------------------------------------------------------
+
+@app.callback(
+    Output('ai-tracers', 'options'),
+    Output('ai-tracers', 'value'),
+    Output('ai-idef-wrap', 'style'),
+    Output('ai-density', 'options'),
+    Output('ai-density', 'value'),
+    Input('grid-loaded', 'data'),
+    Input('simline-state', 'data'),
+    Input('ai-quantity', 'value'),
+    Input('ai-idef', 'value'),
+    Input('ai-btn-typical', 'n_clicks'),
+    Input('ai-btn-all', 'n_clicks'),
+    State('ai-tracers', 'value'),
+    State('ai-density', 'value'),
+)
+def sync_atten_tracers(_loaded, _sim_state, quantity, idef, _n_typ, _n_all, current, dens_now):
+    quantity = quantity or 'rel_abund'
+    names = _probe_available_tracers(quantity, idef)
+    trigger = (dash.callback_context.triggered[0]['prop_id'].split('.')[0]
+               if dash.callback_context.triggered else '')
+    kept = [v for v in _as_str_list(current) if v in set(names)]
+    if trigger == 'ai-btn-all':
+        value = names
+    elif trigger in ('ai-btn-typical', 'ai-quantity', 'grid-loaded', 'simline-state',
+                     'ai-idef', ''):
+        value = _probe_typical_tracers(names, quantity)
+    else:
+        value = kept or _probe_typical_tracers(names, quantity)
+    idef_style = {**_CTRL_BOX, 'minWidth': '160px'}
+    if quantity != 'intensity':
+        idef_style['display'] = 'none'
+    dens = []
+    if _grid:
+        for tok in _probe_axis_tokens('density'):
+            v = _physical_param_value('density', tok)
+            if v is not None and np.isfinite(v) and v > 0:
+                dens.append(float(v))
+    dens = sorted(set(dens))
+    opts = [{'label': f'{pr.format_phys(v)} cm⁻³', 'value': v} for v in dens]
+    dval = dens_now if dens_now in dens else (dens[len(dens) // 2] if dens else None)
+    return [{'label': n, 'value': n} for n in names], value, idef_style, opts, dval
+
+
+@app.callback(
+    Output('ai-density-wrap', 'style'),
+    Output('ai-env-wrap', 'style'),
+    Input('ai-mode', 'value'),
+)
+def toggle_atten_mode(mode):
+    if mode == '3d':
+        return {'display': 'none'}, {'display': 'block'}
+    return {'display': 'block'}, {'display': 'none'}
+
+
+@app.callback(
+    Output('ai-status', 'children', allow_duplicate=True),
+    Output('ai-progress-interval', 'disabled', allow_duplicate=True),
+    Output('ai-progress-wrap', 'style', allow_duplicate=True),
+    Output('ai-progress-fill', 'style', allow_duplicate=True),
+    Output('ai-progress-label', 'children', allow_duplicate=True),
+    Output('ai-btn-compute', 'disabled', allow_duplicate=True),
+    Input('ai-btn-compute', 'n_clicks'),
+    State('ai-quantity', 'value'),
+    State('ai-tracers', 'value'),
+    State('ai-include-ratios', 'value'),
+    State('ai-idef', 'value'),
+    State('ai-mode', 'value'),
+    State('ai-density', 'value'),
+    State('ai-interp-enable', 'value'),
+    State('ai-interp-n', 'value'),
+    State('ai-scan-dir', 'value'),
+    State('ai-rtol', 'value'),
+    State('ai-obs-limit', 'value'),
+    *[State(f'slider-{d}', 'value') for d in range(N_PARAMS)],
+    prevent_initial_call=True,
+)
+def handle_atten_impact(n_clicks, quantity, tracers, include_ratios, idef, mode, density,
+                        interp_enable, interp_n, scan_dir, rtol, obs_limit, *slider_values):
+    if not n_clicks:
+        raise PreventUpdate
+    with _probe_job_lock:
+        if _atten_progress['running']:
+            return (html.Span('Already running…', className='kosma-muted'), False,
+                    {'display': 'block'}, {'width': f'{int(100 * _atten_progress["frac"])}%'},
+                    _atten_progress['message'] or 'Working…', True)
+        _atten_progress.update(running=True, frac=0.0, message='Starting…', error=None)
+    kwargs = dict(
+        quantity=quantity, tracers=tracers, include_ratios='on' in (include_ratios or []),
+        slider_values=list(slider_values), idef=idef, mode=mode or 'single', density=density,
+        interp_n=_ai_val(interp_n, 60, int) if 'on' in (interp_enable or []) else None,
+        scan_direction=_parse_shift_scan_direction(scan_dir),
+        match_rtol=_parse_shift_rtol(rtol), obs_limit=_parse_optional_float(obs_limit),
+    )
+    threading.Thread(target=_run_atten_impact_worker, args=(kwargs,), daemon=True).start()
+    return (html.Span([html.Span('Computing', className='status-chip'),
+                       html.Span('  Reading both grids and running the shift search…',
+                                 className='kosma-muted', style={'marginLeft': '10px'})]),
+            False, {'display': 'block'}, {'width': '0%'}, 'Starting…', True)
+
+
+@app.callback(
+    Output('ai-progress-fill', 'style', allow_duplicate=True),
+    Output('ai-progress-label', 'children', allow_duplicate=True),
+    Output('ai-progress-wrap', 'style', allow_duplicate=True),
+    Output('ai-progress-interval', 'disabled', allow_duplicate=True),
+    Output('ai-status', 'children', allow_duplicate=True),
+    Output('ai-state', 'data'),
+    Output('ai-btn-compute', 'disabled', allow_duplicate=True),
+    Input('ai-progress-interval', 'n_intervals'),
+    State('ai-state', 'data'),
+    prevent_initial_call=True,
+)
+def poll_atten_impact_progress(_n, state):
+    snap = _probe_snapshot(_atten_progress)
+    pct = int(round(100.0 * float(snap.get('frac') or 0.0)))
+    label = f'{pct}%  ·  {snap["message"]}' if snap.get('message') else f'{pct}%'
+    wrap = {'display': 'block'}
+    if snap.get('running'):
+        return {'width': f'{pct}%'}, label, wrap, False, dash.no_update, dash.no_update, True
+    if snap.get('token') == snap.get('seen_token'):
+        raise PreventUpdate
+    with _probe_job_lock:
+        _atten_progress['seen_token'] = snap['token']
+    if snap.get('error'):
+        err = html.Span(f'✗  {snap["error"]}', style={'color': '#d62728', 'fontWeight': '600'})
+        return {'width': f'{pct}%'}, label, wrap, True, err, (state or 0) + 1, False
+    pixels = _atten_results.get('pixels')
+    n_sp = pixels['species'].nunique() if pixels is not None else 0
+    status = html.Span(f'Done — {n_sp} tracers, {len(pixels) if pixels is not None else 0} '
+                       'cells. Thresholds below now apply instantly.', className='kosma-muted')
+    return {'width': '100%'}, '100%  ·  Done', wrap, True, status, (state or 0) + 1, False
+
+
+def _ai_val(value, default, cast=float):
+    try:
+        v = cast(value)
+    except (TypeError, ValueError):
+        return default
+    return v if np.isfinite(v) else default
+
+
+def _ai_shift_edges(text):
+    try:
+        vals = sorted(float(p) for p in str(text or '').replace(';', ',').split(',') if p.strip())
+    except ValueError:
+        vals = []
+    return [v for v in vals if v > 0] or [0.1, 0.3, 0.5, 1.0]
+
+
+def _ai_table(df, columns, *, drop=(), max_rows=40, empty='Nothing to show.'):
+    rows = df.to_dict('records') if df is not None and len(df) else []
+    cols = [c for c in columns if c[0] not in drop and (not rows or c[0] in rows[0])]
+    return _probe_table(rows, cols, max_rows=max_rows, empty=empty)
+
+
+_AI_SUMMARY_COLS = [
+    ('species', 'Species', ''), ('ranked', 'Ranked', 'bool'), ('n_cells', 'Cells', 'int'),
+    ('n_affected', 'Moved or unmatched', 'int'), ('frac_shifted', 'Shifted', 'pct'),
+    ('frac_unmatched', 'Unmatched', 'pct'), ('frac_trusted', 'Trusted', 'pct'),
+    ('median_abs_shift_dex', 'median |Δ|', 'score'), ('std_abs_shift_dex', 'std |Δ|', 'score'),
+    ('max_abs_shift_dex', 'max |Δ|', 'score'), ('frac_observable', 'Observable', 'pct'),
+]
+_AI_WINNER_COLS = [
+    ('n', 'n_H', 'phys'), ('x_bin', 'ζ bin', ''), ('y_bin', 'χ bin', ''),
+    ('species', 'Winner', ''), ('median_abs_shift_dex', 'median |Δ|', 'score'),
+    ('n_models', 'Trusted cells', 'int'),
+]
+_AI_TOP_COLS = [
+    ('species', 'Species', ''), ('n', 'n_H', 'phys'), ('x', 'ζ', 'phys'), ('y', 'χ', 'phys'),
+    ('shift_dex', 'Δ [dex]', 'score'), ('slope_dex', 'S', 'score'),
+    ('value_ref', 'Reference', 'phys'), ('value_atten', 'Attenuated', 'phys'),
+]
+_AI_RESPONSE_COLS = [
+    ('species', 'Species', ''), ('error_dex', 'ζ error', 'err'), ('error_p10', 'p10', 'score'),
+    ('error_p90', 'p90', 'score'), ('frac_censored', 'Censored', 'pct'),
+    ('abs_response_dex', '|R|', 'score'), ('swing_dex', 'Swing', 'score'),
+    ('fuv_swing_dex', 'χ swing', 'score'), ('n_swing_dex', 'n_H swing', 'score'),
+    ('fuv_trend', 'Trend', 'score'), ('probe_margin', 'Margin', 'score'),
+    ('den_contrib', 'den_contrib', 'score'), ('frac_trusted', 'Trusted', 'pct'),
+    ('ranked', 'Left panel', 'bool'), ('probe_ranked', 'Right panel', 'bool'),
+]
+_AI_VERDICT_COLS = [
+    ('species', 'Species', ''), ('verdict', 'Verdict', 'verdict'), ('broad', 'b', 'bool'),
+    ('honest', 'h', 'bool'), ('cr_led', 'c', 'bool'), ('matters', 'm', 'bool'),
+    ('frac_shifted', 'Shifted', 'pct'), ('frac_unmatched', 'Unmatched', 'pct'),
+    ('error_dex', 'ζ error', 'err'), ('error_p90', 'p90', 'score'),
+    ('bound_gap', 'bound_gap', 'score'), ('frac_censored', 'Censored', 'pct'),
+    ('abs_response_dex', '|R|', 'score'), ('swing_dex', 'Swing', 'score'),
+    ('probe_margin', 'Margin', 'score'), ('n_cells', 'Cells', 'int'),
+]
+_AI_RENDER_OUTPUTS = [
+    ('ai-notes', 'children'), ('ai-fig-bars', 'figure'), ('ai-fig-heat', 'figure'),
+    ('ai-fig-winner', 'figure'), ('ai-tbl-summary', 'children'), ('ai-tbl-winners', 'children'),
+    ('ai-tbl-top', 'children'), ('ai-fig-err', 'figure'), ('ai-fig-probe', 'figure'),
+    ('ai-tbl-response', 'children'), ('ai-tally', 'children'), ('ai-tbl-tracers', 'children'),
+    ('ai-tbl-problematic', 'children'), ('ai-tbl-verdicts', 'children'),
+    ('ai-tbl-followup', 'children'), ('ai-3d-wrap', 'style'), ('ai-fig-dens-matrix', 'figure'),
+    ('ai-fig-env-matrix', 'figure'), ('ai-env-pick', 'options'), ('ai-env-pick', 'value'),
+    ('ai-render', 'data'),
+]
+
+
+@app.callback(
+    *[Output(cid, prop) for cid, prop in _AI_RENDER_OUTPUTS],
+    Input('ai-state', 'data'),
+    Input('ai-min-slope', 'value'),
+    Input('ai-min-abs-shift', 'value'),
+    Input('ai-shift-edges', 'value'),
+    Input('ai-max-unmatched', 'value'),
+    Input('ai-max-censored', 'value'),
+    Input('ai-min-obs-frac', 'value'),
+    Input('ai-response-floor', 'value'),
+    Input('ai-min-frac-shifted', 'value'),
+    Input('ai-min-error', 'value'),
+    Input('ai-max-species', 'value'),
+    Input('ai-max-per-const', 'value'),
+    Input('ai-top-summary', 'value'),
+    Input('ai-nx-bins', 'value'),
+    Input('ai-ny-bins', 'value'),
+    Input('ai-top-models', 'value'),
+    Input('ai-probe-axis-max', 'value'),
+    Input('ai-filters', 'value'),
+    Input('ai-env-n', 'value'),
+    Input('ai-env-chi', 'value'),
+    Input('ai-env-zeta', 'value'),
+    Input('ai-min-env-cells', 'value'),
+    Input('plot-theme', 'value'),
+    State('ai-env-pick', 'value'),
+    State('ai-render', 'data'),
+)
+def render_atten_impact(_state, min_slope, min_abs_shift, shift_edges, max_unmatched,
+                        max_censored, min_obs_frac, response_floor, min_frac_shifted, min_error,
+                        max_species, max_per_const, top_summary, nx_bins, ny_bins, top_models,
+                        probe_axis_max, filters, env_n, env_chi, env_zeta, min_env_cells,
+                        plot_theme, env_current, render_n):
+    theme = _parse_plot_theme(plot_theme)
+    t = _theme_colors(theme)
+    blank = placeholder_fig('Compute to fill this figure', theme=theme)
+    blank_tbl = _probe_table([], [], empty='Compute to fill this table.')
+    out = {
+        'ai-notes': [], 'ai-tally': [], 'ai-3d-wrap': {'display': 'none'},
+        'ai-env-pick.options': [], 'ai-env-pick.value': None,
+        'ai-render': (render_n or 0) + 1,
+    }
+    for cid, prop in _AI_RENDER_OUTPUTS:
+        key = cid if cid != 'ai-env-pick' else f'{cid}.{prop}'
+        out.setdefault(key, blank if prop == 'figure' else blank_tbl)
+
+    def _result():
+        return tuple(out[cid if cid != 'ai-env-pick' else f'{cid}.{prop}']
+                     for cid, prop in _AI_RENDER_OUTPUTS)
+
+    pixels = (_atten_results or {}).get('pixels')
+    if pixels is None:
+        return _result()
+
+    flags = filters or []
+    three_d = _atten_results.get('mode') == '3d'
+    summary_kw = dict(
+        shift_abs_edges=_ai_shift_edges(shift_edges),
+        min_abs_shift_dex=_ai_val(min_abs_shift, 0.1), min_slope_dex=_ai_val(min_slope, 0.1),
+        max_frac_unmatched=_ai_val(max_unmatched, 0.5),
+        exclude_ice='ice' in flags, exclude_isotopologues='iso' in flags,
+        n_x_bins=_ai_val(nx_bins, 4, int), n_y_bins=_ai_val(ny_bins, 4, int),
+        n_top_models=_ai_val(top_models, 8, int),
+        n_top_summary_species=_ai_val(top_summary, 12, int),
+        max_per_constituent=_ai_val(max_per_const, 2, int),
+        min_frac_observable=_ai_val(min_obs_frac, 0.5),
+    )
+    response_kw = dict(max_species=_ai_val(max_species, 8, int),
+                       max_frac_censored=_ai_val(max_censored, 0.5))
+    reconcile_kw = dict(min_frac_shifted=_ai_val(min_frac_shifted, 0.5),
+                        response_floor_dex=_ai_val(response_floor, 0.1),
+                        min_error_dex=_ai_val(min_error, 0.3))
+    try:
+        env_edges = None
+        if three_d:
+            env_edges = {'n': ac.parse_axis_edges(env_n, pixels['n']),
+                         'y': ac.parse_axis_edges(env_chi, pixels['y']),
+                         'x': ac.parse_axis_edges(env_zeta, pixels['x'])}
+        wf = ac.run_workflow(pixels, summary_kw=summary_kw, response_kw=response_kw,
+                             reconcile_kw=reconcile_kw, env_edges=env_edges,
+                             min_env_cells=_ai_val(min_env_cells, 10, int))
+    except ValueError as exc:
+        out['ai-notes'] = html.P(f'✗  {exc}', style={'color': '#d62728'})
+        return _result()
+    _atten_results['workflow'] = wf
+
+    fmt = format_species_html
+    summary, table = wf['summary'], wf['response']['table']
+    verdicts = wf['verdicts']
+    where =(f'3-D: {pixels["i_n"].nunique()} density slices' if three_d
+             else f'n_H = {pr.format_phys(float(pixels["n"].iloc[0]))} cm⁻³')
+    notes = [f'{pixels["species"].nunique()} tracers · {len(pixels)} cells · {where} · scan '
+             f'{_atten_results.get("scan_direction")} · '
+             f'{"isotopologues excluded" if "iso" in flags else "isotopologues included"}'
+             + ('' if _atten_results.get('interp') else ' · native models (no resampling)')]
+    if _atten_results.get('missing_overlay'):
+        notes.append('No attenuated models for: '
+                     + ', '.join(map(str, _atten_results['missing_overlay'][:12])) + '.')
+    notes += summary['notes'] + wf['response']['notes']
+    out['ai-notes'] = html.Ul([html.Li(n) for n in notes], className='kosma-muted',
+                              style={'fontSize': '12px', 'margin': '0 0 10px 18px'})
+
+    out['ai-fig-bars'] = ac.fig_shift_bars(summary, theme=t, fmt=fmt)
+    out['ai-fig-heat'] = ac.fig_regime_heatmaps(summary, theme=t, fmt=fmt)
+    out['ai-fig-winner'] = ac.fig_winner_map(summary, theme=t, fmt=fmt)
+    out['ai-tbl-summary'] = _ai_table(summary['species_summary'], _AI_SUMMARY_COLS, max_rows=60)
+    drop_n = () if three_d else ('n',)
+    out['ai-tbl-winners'] = _ai_table(summary['regime_winners'], _AI_WINNER_COLS, drop=drop_n,
+                                      max_rows=60)
+    out['ai-tbl-top'] = _ai_table(summary['top_models'], _AI_TOP_COLS, drop=drop_n,
+                                  max_rows=80)
+    out['ai-fig-err'] = ac.fig_error_bars(table, theme=t, fmt=fmt)
+    out['ai-fig-probe'] = ac.fig_probe_plane(
+        table, response_floor_dex=reconcile_kw['response_floor_dex'],
+        probe_axis_max=_ai_val(probe_axis_max, 1.5), theme=t, fmt=fmt,
+        swing_label='environment swing of R' if three_d else 'G₀ swing of R')
+    out['ai-tbl-response'] = _ai_table(
+        table, _AI_RESPONSE_COLS, max_rows=60,
+        drop=() if three_d else ('fuv_swing_dex', 'n_swing_dex'))
+
+    counts = verdicts['table']['verdict'].value_counts()
+    out['ai-tally'] = [
+        html.Span(f'{v}: {int(counts[v])}', style={
+            'background': ac.VERDICT_COLORS[v], 'color': '#0f172a', 'padding': '3px 10px',
+            'borderRadius': '12px', 'fontSize': '12px', 'fontWeight': '600'})
+        for v in ac.VERDICT_ORDER if v in counts]
+    out['ai-tbl-tracers'] = _ai_table(verdicts['tracers'], _AI_VERDICT_COLS,
+                                      empty='No CR-led species with these thresholds.')
+    out['ai-tbl-problematic'] = _ai_table(verdicts['problematic'], _AI_VERDICT_COLS,
+                                          empty='No honest species with a measured ζ error.')
+    out['ai-tbl-verdicts'] = _ai_table(verdicts['table'], _AI_VERDICT_COLS, max_rows=80)
+    probes = set(verdicts['table'].loc[verdicts['table']['verdict'] == 'CRIR probe', 'species'])
+    winners = summary['regime_winners']
+    follow = winners[winners['species'].isin(probes)] if len(winners) else winners
+    out['ai-tbl-followup'] = _ai_table(
+        follow, _AI_WINNER_COLS, drop=drop_n,
+        empty='No CRIR probe wins a step-1 regime — the winner map ranks |Δ| alone, so the '
+              'regime leaders may be FUV tracers or unmeasurable species.')
+
+    if three_d:
+        out['ai-3d-wrap'] = {'display': 'block'}
+        long, order, labels, species = ac.density_strip(wf)
+        if long is not None:
+            out['ai-fig-dens-matrix'] = ac.fig_verdict_matrix(
+                long, col_key='i_n', col_order=order, col_labels=labels, species=species,
+                theme=t, fmt=fmt, title='Verdict by density slice (+ pooled)')
+        env = wf.get('environments') or {}
+        if env.get('table') is not None and len(env['table']):
+            env_labels = [e['label'] for e in env['environments'] if e['label'] in env['views']]
+            out['ai-fig-env-matrix'] = ac.fig_verdict_matrix(
+                env['table'], col_key='environment', col_order=env_labels,
+                species=verdicts['table']['species'].tolist()[:40], theme=t, fmt=fmt,
+                title='Verdict per environment (n_H · χ · ζ)')
+            out['ai-env-pick.options'] = [{'label': e, 'value': e} for e in env_labels]
+            out['ai-env-pick.value'] = (env_current if env_current in env_labels
+                                        else (env_labels[0] if env_labels else None))
+    return _result()
+
+
+@app.callback(
+    Output('ai-env-tracers', 'children'),
+    Output('ai-env-problematic', 'children'),
+    Input('ai-env-pick', 'value'),
+    Input('ai-render', 'data'),
+)
+def render_atten_environment(env, _render):
+    wf = (_atten_results or {}).get('workflow') or {}
+    views = ((wf.get('environments') or {}).get('views') or {}).get(env)
+    if not views:
+        blank = _probe_table([], [], empty='Compute in 3-D mode, then pick an environment.')
+        return blank, blank
+    return (_ai_table(views['tracers'], _AI_VERDICT_COLS,
+                      empty='No CR-led species in this environment.'),
+            _ai_table(views['problematic'], _AI_VERDICT_COLS,
+                      empty='No honest species with a measured ζ error here.'))
 
 
 @app.callback(

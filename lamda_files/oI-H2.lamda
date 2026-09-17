@@ -1,0 +1,49 @@
+!MOLECULE
+O (neutral atom)
+!MOLECULAR WEIGHT
+16.0
+!NUMBER OF ENERGY LEVELS
+3
+!LEVEL + ENERGIES(cm^-1) + WEIGHT + Qnum
+   1    0.000000000   5.0  3_P_2  ! 2S+1  L  J = 3 P 2
+   2  158.2687410     3.0  3_P_1  ! 2S+1  L  J = 3 P 1
+   3  226.9852492     1.0  3_P_0  ! 2S+1  L  J = 3 P 0
+!NUMBER OF RADIATIVE TRANSITIONS
+3
+!TRANS + UP + LOW + EINSTEINA(s^-1) + FREQ(GHz) + E_u(K)
+    1     2     1   8.910E-05  4744.77749   227.712
+    2     3     1   1.340E-10  6804.84658   326.579
+    3     3     2   1.750E-05  2060.06909   326.579
+!NUMBER OF COLL PARTNERS
+2
+!COLLISIONS BETWEEN
+2 O + pH2  ! Lique et al. 2018, MNRAS 474, 2313 corrected, transmitted by M. Wolfire. T-points selected by E. Roueff
+!NUMBER OF COLL TRANS
+3
+!NUMBER OF COLL TEMPS
+19
+!COLL TEMPS
+   10.000      20.000      30.000      40.000      60.000      80.000      110.00      160.00      220.00      320.00      450.00      630.00      890.00      1260.0      1780.0      2510.0      3550.0      5010.0      8000.0 
+!TRANS + UP + LOW + COLLRATES(cm^3 s^-1)
+    1     2     1   1.1818e-10  1.2795e-10  1.3314e-10  1.3766e-10  1.4621e-10  1.5405e-10  1.6409e-10  1.7678e-10  1.8771e-10  2.0139e-10  2.1690e-10  2.3769e-10  2.6604e-10  3.0174e-10  3.4447e-10  3.9528e-10  4.5692e-10  5.2977e-10  6.3237e-10
+    2     3     1   8.1964e-11  1.0202e-10  1.1233e-10  1.2001e-10  1.3180e-10  1.4038e-10  1.4902e-10  1.5630e-10  1.5920e-10  1.6019e-10  1.6294e-10  1.7246e-10  1.9279e-10  2.2497e-10  2.6829e-10  3.2276e-10  3.9034e-10  4.7055e-10  5.8402e-10
+    3     3     2   7.9957e-14  1.5935e-13  2.6308e-13  3.9685e-13  6.6622e-13  8.6942e-13  1.0522e-12  1.1780e-12  1.2352e-12  1.3677e-12  1.7490e-12  2.6158e-12  4.2863e-12  7.0486e-12  1.1151e-11  1.6878e-11  2.4697e-11  3.4836e-11  5.0910e-11
+!COLLISIONS BETWEEN
+3 O + oH2  ! Lique et al. 2018, MNRAS 474, 2313 corrected, transmitted by M. Wolfire. T-points selected by E. Roueff
+!NUMBER OF COLL TRANS
+3
+!NUMBER OF COLL TEMPS
+19
+!COLL TEMPS
+   10.000      20.000      30.000      40.000      60.000      80.000      110.00      160.00      220.00      320.00      450.00      630.00      890.00      1260.0      1780.0      2510.0      3550.0      5010.0      8000.0 
+!TRANS + UP + LOW + COLLRATES(cm^3 s^-1)
+    1     2     1   1.3258e-10  1.3972e-10  1.4475e-10  1.4972e-10  1.5993e-10  1.7007e-10  1.8457e-10  2.0635e-10  2.2904e-10  2.6107e-10  2.9598e-10  3.3664e-10  3.8519e-10  4.4088e-10  5.0314e-10  5.7270e-10  6.5175e-10  7.3905e-10  8.5173e-10
+    2     3     1   6.5072e-11  7.6028e-11  8.2408e-11  8.7995e-11  9.8545e-11  1.0856e-10  1.2254e-10  1.4300e-10  1.6361e-10  1.9165e-10  2.2195e-10  2.5888e-10  3.0675e-10  3.6650e-10  4.3772e-10  5.2065e-10  6.1746e-10  7.2668e-10  8.7341e-10
+    3     3     2   2.6483e-12  3.0795e-12  3.3059e-12  3.4907e-12  3.8261e-12  4.1442e-12  4.6053e-12  5.3504e-12  6.2198e-12  7.6176e-12  9.3446e-12  1.1600e-11  1.4670e-11  1.8803e-11  2.4297e-11  3.1535e-11  4.1039e-11  5.2862e-11  7.0467e-11
+!NOTES
+! A-values are from the NIST database.
+! Accurate transition frequencies measured by Zink et al. 1991, ApJ 371, L85.
+! Transition frequencies for the 17O and 18O isotopes can be found
+! in Brown, Evenson, Zink (1993, Phys. Rev. A, 48, 3761) and in 
+! DeNatale et al. (1993, Phys. Rev. A, 48, 3757). The latter reference
+! presents more precise values.

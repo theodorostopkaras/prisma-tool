@@ -4,54 +4,94 @@
 
 :root {
   --font: 'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --mono: ui-monospace, 'IBM Plex Mono', Menlo, Consolas, monospace;
+
+  /* Spacing scale (4px base) */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 24px;
+  --s6: 32px;
+
+  /* Type scale */
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-base: 13px;
+  --fs-md: 15px;
+  --fs-lg: 18px;
+  --fs-xl: 22px;
+
+  /* Shared control height so inputs, buttons and dropdowns line up */
+  --ctl-h: 34px;
+
   --radius: 10px;
   --radius-sm: 6px;
   --radius-pill: 999px;
   --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.05);
   --shadow-md: 0 4px 14px rgba(15, 23, 42, 0.07);
-  --accent: #2563eb;
-  --accent-hover: #1d4ed8;
-  --accent-soft: rgba(37, 99, 235, 0.10);
+  --ring: 0 0 0 3px var(--accent-soft);
+  /* Brand constants, sampled from prisma_logo.png. Identical in both
+     themes -- these are the mark's colours, not the interface's. */
+  --ink: #04174B;    /* deep navy, cloud interior */
+  --deep: #0A2E69;   /* navy mid */
+  --beam: #2B8CFF;   /* the logo's neon ring */
+  --glow: #37D6F5;   /* tau cyan, the illuminated edge */
+
+  /* --accent fills surfaces and always carries white text.
+     --accent-ink is the same hue tuned to pass as text on the page. */
+  --accent: #1560CE;
+  --accent-hover: #0F58BE;
+  --accent-ink: #1560CE;
+  --accent-soft: rgba(21, 96, 206, 0.10);
   --success: #16a34a;
   --purple: #7c3aed;
   --overlay: #9a6b5a;
-  --page: #f1f4f8;
+  --page: #F2F5FA;
   --card: #ffffff;
-  --border: #e2e8f0;
-  --border-strong: #cbd5e1;
-  --text: #1e293b;
-  --text-muted: #64748b;
-  --text-heading: #0f172a;
+  --border: #DDE4EE;
+  --border-strong: #C2CDDD;
+  --text: #22314A;
+  --text-muted: #5A6B85;
+  --text-heading: #0B2145;
   --input-bg: #ffffff;
-  --input-border: #cbd5e1;
-  --seg-bg: #e8eef5;
+  --input-border: #C2CDDD;
+  --seg-bg: #E7EDF6;
   --tab-bg: transparent;
   --tab-sel: #ffffff;
   --nav-bar: #ffffff;
+  /* Recessed surface for cards nested inside a panel */
+  --sunken: #F5F8FC;
+  /* Table zebra, one mechanism for both themes */
+  --zebra: rgba(11, 33, 69, 0.028);
 }
 
 #app-root.theme-dark {
-  --accent: #3b82f6;
-  --accent-hover: #60a5fa;
-  --accent-soft: rgba(59, 130, 246, 0.16);
+  --accent: #1B6FE0;
+  --accent-hover: #2B8CFF;
+  --accent-ink: #6FB4FF;
+  --accent-soft: rgba(43, 140, 255, 0.18);
   --success: #22c55e;
   --purple: #a78bfa;
   --overlay: #c4a484;
-  --page: #0f1419;
-  --card: #1e293b;
-  --border: #334155;
-  --border-strong: #475569;
-  --text: #e2e8f0;
-  --text-muted: #94a3b8;
-  --text-heading: #f1f5f9;
-  --input-bg: #0f172a;
-  --input-border: #475569;
-  --seg-bg: #0f172a;
+  --page: #041538;
+  --card: #0A2350;
+  --border: #17376E;
+  --border-strong: #24508F;
+  --text: #D6E4F7;
+  --text-muted: #8FA6C8;
+  --text-heading: #EAF2FF;
+  --input-bg: #061A40;
+  --input-border: #24508F;
+  --seg-bg: #061A40;
   --tab-bg: transparent;
-  --tab-sel: #1e293b;
-  --nav-bar: #151b24;
+  --tab-sel: #0A2350;
+  --nav-bar: #0A2350;
+  --sunken: #071F47;
+  --zebra: rgba(255, 255, 255, 0.03);
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
   --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.4);
+  --ring: 0 0 0 3px var(--accent-soft);
 }
 
 html, body {
@@ -62,12 +102,12 @@ html, body {
 
 body:has(#app-root.theme-light) {
   background-color: var(--page);
-  color: #1e293b;
+  color: #22314A;
 }
 
 body:has(#app-root.theme-dark) {
-  background-color: #0f1419;
-  color: #e2e8f0;
+  background-color: #041538;
+  color: #D6E4F7;
 }
 
 #app-root {
@@ -75,17 +115,36 @@ body:has(#app-root.theme-dark) {
   color: var(--text);
   background-color: var(--page);
   -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
-#app-root.theme-light { color: #1e293b; }
-#app-root.theme-dark { color: #e2e8f0; }
+/* Tabular figures wherever numbers change in place or stack in columns --
+   without this, slider readouts and table columns shift as digits change
+   width. Body copy keeps proportional figures. */
+#app-root table,
+#app-root input[type="number"],
+#model-info,
+.probe-eq,
+.load-card-sub,
+.rc-slider-mark-text,
+.dash-slider-mark,
+.status-chip {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+}
+
+#app-root.theme-light { color: #22314A; }
+#app-root.theme-dark { color: #D6E4F7; }
 
 /* ---- Cards / panels ---- */
+/* Elevation language: flat surfaces are separated by a border only.
+   box-shadow is reserved for things that genuinely float (menus, the
+   selected tab chip), so nested panels stop reading as stacked boxes. */
 .kosma-panel {
   background-color: var(--card) !important;
   border: 1px solid var(--border) !important;
   border-radius: var(--radius);
-  box-shadow: var(--shadow-sm);
+  box-shadow: none;
   color: inherit;
 }
 
@@ -118,7 +177,12 @@ body:has(#app-root.theme-dark) {
 
 .btn:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 3px var(--accent-soft);
+  box-shadow: var(--ring);
+}
+
+.btn:active,
+#main-tabs .tab:active {
+  transform: translateY(1px);
 }
 
 .btn-primary {
@@ -167,7 +231,7 @@ body:has(#app-root.theme-dark) {
 .btn-ghost:hover {
   background: var(--accent-soft);
   border-color: var(--accent);
-  color: var(--accent) !important;
+  color: var(--accent-ink) !important;
 }
 
 .btn-sm {
@@ -186,9 +250,40 @@ body:has(#app-root.theme-dark) {
   color: var(--text);
   border: 1px solid var(--input-border);
   border-radius: var(--radius-sm);
-  padding: 8px 10px;
-  font-size: 13px;
+  padding: var(--s2) 10px;
+  font-size: var(--fs-base);
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+/* Single-line controls share one height so the Browse / Load rows on the
+   Load page line up instead of stepping by a pixel or two each. */
+#app-root input[type="text"],
+#app-root input[type="number"],
+#app-root input[type="search"],
+input.kosma-input {
+  height: var(--ctl-h);
+  box-sizing: border-box;
+}
+
+/* Multi-line inputs opt out of the fixed height. */
+#app-root textarea,
+textarea.kosma-input {
+  height: auto;
+}
+
+.btn {
+  min-height: var(--ctl-h);
+}
+
+.btn-sm {
+  min-height: 28px;
+}
+
+/* react-select renders its own 38px control; bring it onto the scale. */
+#app-root .Select-control,
+#app-root [class$="-control"],
+#app-root div[class*="css-"][class*="-control"] {
+  min-height: var(--ctl-h) !important;
 }
 
 #app-root input:focus,
@@ -217,10 +312,65 @@ body:has(#app-root.theme-dark) {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
-  padding: 10px 0 14px;
-  margin-bottom: 12px;
-  border-bottom: 1px solid var(--border);
+  gap: var(--s5);
+  padding: var(--s3) var(--s4);
+  margin-bottom: var(--s3);
+  border: none;
+  border-radius: var(--radius);
+  /* Deep to illuminated, running the same direction light is absorbed
+     going into a PDR. The one bold surface in the app -- everything
+     below it stays quiet. */
+  background: linear-gradient(105deg, var(--ink) 0%, var(--deep) 58%, #124A8F 100%);
+  box-shadow: inset 0 1px 0 0 rgba(55, 214, 245, 0.22);
+}
+
+/* The band carries its own colours in both themes -- it is the mark, not
+   the interface, so it does not flip with the theme toggle. */
+.app-header .app-brand-title,
+.app-header .app-brand-title .app-brand-name,
+#app-root.theme-dark .app-header .app-brand-title {
+  color: #ffffff !important;
+}
+
+.app-header .app-brand-lead,
+.app-header .app-about,
+.app-header .app-about p,
+#app-root.theme-dark .app-header .app-brand-lead,
+#app-root.theme-dark .app-header .app-about p {
+  color: #B9CCEA !important;
+}
+
+.app-header .app-about summary {
+  color: var(--glow);
+}
+
+.app-logo {
+  width: 48px;
+  height: 48px;
+  margin-right: var(--s3);
+  border-radius: 11px;
+}
+
+/* Theme toggle sits on navy, so it gets a glass pill rather than the
+   page-tinted one used elsewhere. */
+#app-root .app-header .theme-seg {
+  background: rgba(255, 255, 255, 0.10);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+#app-root .app-header .theme-seg-btn {
+  color: #B9CCEA !important;
+}
+
+#app-root .app-header .theme-seg-btn:has(input:checked) {
+  background: var(--glow) !important;
+  box-shadow: none !important;
+}
+
+#app-root .app-header .theme-seg-btn:has(input:checked),
+#app-root .app-header .theme-seg-btn:has(input:checked) .theme-opt,
+#app-root .app-header .theme-seg-btn:has(input:checked) .theme-opt-text {
+  color: var(--ink) !important;
 }
 
 .app-logo {
@@ -239,7 +389,7 @@ body:has(#app-root.theme-dark) {
 
 .app-brand-title {
   margin: 0 0 2px !important;
-  font-size: 22px !important;
+  font-size: var(--fs-xl) !important;
   font-weight: 700 !important;
   line-height: 1.2 !important;
   letter-spacing: -0.03em;
@@ -253,7 +403,7 @@ body:has(#app-root.theme-dark) {
 .app-brand-lead {
   margin: 0 !important;
   max-width: 42rem;
-  font-size: 13px !important;
+  font-size: var(--fs-base) !important;
   line-height: 1.4 !important;
   color: var(--text-muted) !important;
 }
@@ -267,7 +417,7 @@ body:has(#app-root.theme-dark) {
 .app-about summary {
   cursor: pointer;
   font-weight: 600;
-  color: var(--accent);
+  color: var(--accent-ink);
   list-style: none;
   user-select: none;
 }
@@ -434,12 +584,12 @@ body:has(#app-root.theme-dark) {
 }
 
 #app-root.theme-dark .theme-ico-sun {
-  background: #f0c14a;
+  background: #F0C14A;
   box-shadow:
-    0 -7px 0 -4px #f0c14a, 0 7px 0 -4px #f0c14a,
-    7px 0 0 -4px #f0c14a, -7px 0 0 -4px #f0c14a,
-    5px 5px 0 -4px #f0c14a, -5px 5px 0 -4px #f0c14a,
-    5px -5px 0 -4px #f0c14a, -5px -5px 0 -4px #f0c14a;
+    0 -7px 0 -4px #F0C14A, 0 7px 0 -4px #F0C14A,
+    7px 0 0 -4px #F0C14A, -7px 0 0 -4px #F0C14A,
+    5px 5px 0 -4px #F0C14A, -5px 5px 0 -4px #F0C14A,
+    5px -5px 0 -4px #F0C14A, -5px -5px 0 -4px #F0C14A;
 }
 
 /* ---- Segmented controls (axis scales etc.) ---- */
@@ -480,70 +630,141 @@ body:has(#app-root.theme-dark) {
   border-radius: var(--radius-sm) !important;
 }
 
-/* ---- Main tabs: individual chips ---- */
+/* ---- Main tabs ----------------------------------------------------------
+   Twelve chips all shouting at once made the selected one hard to find, and
+   the group names floated in their own row above, aligned to nothing.
+
+   Now: chips are quiet by default and only the selected one carries the
+   accent; each group's first tab renders its group name directly above
+   itself via ::before. The label lives in the flex row-gap, so it travels
+   with its group when the bar wraps -- no fixed widths to keep in sync.
+   Group membership comes from the grp-* classes set on each dcc.Tab.
+------------------------------------------------------------------------- */
 #main-tabs.prisma-tabs {
-  margin-top: 4px;
+  margin-top: var(--s1);
 }
 
 #main-tabs.prisma-tabs > div:first-child {
   display: flex !important;
   flex-wrap: wrap;
-  gap: 8px;
-  padding: 8px;
-  background: var(--page);
+  align-items: stretch;
+  /* row-gap leaves room for the group label above each row */
+  gap: 26px var(--s1);
+  /* top padding clears the first row's group labels */
+  padding: 26px var(--s3) var(--s3);
+  background: var(--card);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   box-shadow: none;
-  margin-bottom: 4px;
+  margin-bottom: var(--s4);
 }
 
 #main-tabs .tab {
-  border: 1px solid var(--border-strong) !important;
-  border-radius: 8px !important;
-  background: var(--card) !important;
+  position: relative;
+  border: none !important;
+  border-radius: var(--radius-sm) !important;
+  background: transparent !important;
   color: var(--text-muted) !important;
-  padding: 8px 14px !important;
+  padding: var(--s2) var(--s3) !important;
   font-weight: 600 !important;
-  font-size: 12.5px !important;
+  font-size: var(--fs-base) !important;
   font-family: var(--font) !important;
+  letter-spacing: -0.01em;
   bottom: 0 !important;
-  box-shadow: var(--shadow-sm);
-  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease,
-              box-shadow 0.12s ease;
+  box-shadow: none;
+  transition: background 0.12s ease, color 0.12s ease, box-shadow 0.12s ease;
 }
 
 #main-tabs .tab:hover {
   background: var(--accent-soft) !important;
-  color: var(--accent) !important;
-  border-color: var(--accent) !important;
+  color: var(--accent-ink) !important;
 }
 
+#main-tabs .tab:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
+}
+
+/* Selected chip is the one thing allowed to float. */
 #main-tabs .tab--selected,
 #main-tabs .tab.tab--selected {
   background: var(--accent) !important;
   color: #ffffff !important;
-  border: 1px solid var(--accent) !important;
-  border-top: 1px solid var(--accent) !important;
-  box-shadow: 0 2px 6px rgba(37, 99, 235, 0.28);
+  border: none !important;
+  border-top: none !important;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.16),
+              0 2px 8px var(--accent-soft) !important;
 }
 
+#main-tabs .tab--selected:hover,
+#main-tabs .tab.tab--selected:hover {
+  background: var(--accent-hover) !important;
+  color: #ffffff !important;
+}
+
+/* Group labels: sit above the first tab of each run, in the row gap. */
+#main-tabs .tab[class*="grp-"] {
+  margin-left: var(--s5);
+}
+
+#main-tabs .tab[class*="grp-"]:first-child {
+  margin-left: 0;
+}
+
+/* Hairline between groups, sitting in the 24px gap and running up past the
+   label so the caption reads as belonging to the run on its right. */
+#main-tabs .tab[class*="grp-"]::after {
+  content: '';
+  position: absolute;
+  right: calc(100% + 11px);
+  top: -17px;
+  bottom: 3px;
+  width: 1px;
+  background: var(--border);
+  pointer-events: none;
+}
+
+#main-tabs .tab[class*="grp-"]:first-child::after {
+  display: none;
+}
+
+#main-tabs .tab[class*="grp-"]::before {
+  position: absolute;
+  left: var(--s3);
+  bottom: calc(100% + 5px);
+  white-space: nowrap;
+  padding-left: 11px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text-muted);
+  background: radial-gradient(circle at 3px 55%,
+              var(--accent-ink) 0 3px, transparent 3.5px);
+  pointer-events: none;
+}
+
+#main-tabs .tab.grp-data::before { content: 'Data'; }
+#main-tabs .tab.grp-profiles::before { content: 'Local profiles'; }
+#main-tabs .tab.grp-grids::before { content: 'Grids & chemistry'; }
+#main-tabs .tab.grp-lines::before { content: 'Lines & fits'; }
+#main-tabs .tab.grp-diag::before { content: 'Diagnostics'; }
+
 #app-root.theme-dark #main-tabs .tab {
-  background: #1e293b !important;
-  border-color: #475569 !important;
-  color: #94a3b8 !important;
+  background: transparent !important;
+  color: var(--text-muted) !important;
 }
 
 #app-root.theme-dark #main-tabs .tab:hover {
-  background: rgba(59, 130, 246, 0.16) !important;
-  color: #93c5fd !important;
-  border-color: #3b82f6 !important;
+  background: var(--accent-soft) !important;
+  color: var(--accent-ink) !important;
 }
 
 #app-root.theme-dark #main-tabs .tab--selected,
 #app-root.theme-dark #main-tabs .tab.tab--selected {
-  background: #3b82f6 !important;
+  background: var(--accent) !important;
   color: #ffffff !important;
-  border-color: #3b82f6 !important;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45) !important;
 }
 
 /* Nested tabs → pills */
@@ -581,22 +802,11 @@ body:has(#app-root.theme-dark) {
   box-shadow: var(--shadow-sm);
 }
 
-/* Nav group hint above tabs */
+/* The old free-floating group row is gone -- the labels now render inside
+   the tab bar, above the group they actually name. Kept as a no-op guard in
+   case any other view still emits the markup. */
 .nav-groups {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 18px;
-  margin: 4px 0 8px;
-  padding: 0 4px;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--text-muted);
-}
-
-.nav-groups span {
-  opacity: 0.75;
+  display: none;
 }
 
 /* ---- Load page ---- */
@@ -649,21 +859,21 @@ body:has(#app-root.theme-dark) {
 }
 
 .load-card {
-  padding: 14px 14px 12px;
-  background: var(--page);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  margin-bottom: 10px;
-  border-left: 3px solid var(--accent);
+  padding: var(--s3) var(--s3) var(--s3) var(--s4);
+  background: var(--sunken);
+  border: none;
+  border-radius: var(--radius-sm);
+  margin-bottom: var(--s2);
+  box-shadow: inset 3px 0 0 0 var(--accent);
 }
 
 .load-card:last-child {
   margin-bottom: 0;
 }
 
-.load-card.accent-green { border-left-color: var(--success); }
-.load-card.accent-purple { border-left-color: var(--purple); }
-.load-card.accent-overlay { border-left-color: var(--overlay); }
+.load-card.accent-green { box-shadow: inset 3px 0 0 0 var(--success); }
+.load-card.accent-purple { box-shadow: inset 3px 0 0 0 var(--purple); }
+.load-card.accent-overlay { box-shadow: inset 3px 0 0 0 var(--overlay); }
 
 .load-card-head {
   display: flex;
@@ -733,7 +943,7 @@ body:has(#app-root.theme-dark) {
   font-size: 12px;
   font-weight: 600;
   background: var(--accent-soft);
-  color: var(--accent);
+  color: var(--accent-ink);
   border: 1px solid transparent;
 }
 
@@ -748,16 +958,16 @@ body:has(#app-root.theme-dark) {
 }
 
 #app-root.theme-dark .status-chip.warn {
-  color: #fbbf24;
+  color: #FBBF24;
 }
 
 /* ---- Collapsible advanced panels ---- */
 .kosma-details {
-  margin-bottom: 12px;
+  margin-bottom: var(--s3);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--card);
-  box-shadow: var(--shadow-sm);
+  box-shadow: none;
   overflow: hidden;
 }
 
@@ -779,7 +989,7 @@ body:has(#app-root.theme-dark) {
   content: '▸';
   display: inline-block;
   margin-right: 8px;
-  color: var(--accent);
+  color: var(--accent-ink);
   transition: transform 0.12s ease;
 }
 
@@ -816,11 +1026,11 @@ body:has(#app-root.theme-dark) {
 #app-root.theme-dark h3,
 #app-root.theme-dark h4,
 #app-root.theme-dark label {
-  color: #e8eaf0 !important;
+  color: #EAF2FF !important;
 }
 
 #app-root.theme-dark p {
-  color: #c8ced8;
+  color: #B4C7E4;
 }
 
 .page-intro {
@@ -834,7 +1044,7 @@ body:has(#app-root.theme-dark) {
 #app-root table {
   border-collapse: collapse;
   width: auto;
-  font-size: 13px;
+  font-size: var(--fs-base);
 }
 
 #app-root th {
@@ -842,8 +1052,9 @@ body:has(#app-root.theme-dark) {
   color: var(--text-heading);
   font-weight: 600;
   text-align: left;
-  padding: 8px 10px;
+  padding: var(--s2) 10px;
   border-bottom: 1px solid var(--border-strong);
+  white-space: nowrap;
 }
 
 #app-root td {
@@ -852,25 +1063,31 @@ body:has(#app-root.theme-dark) {
   color: var(--text);
 }
 
+/* One zebra mechanism for both themes, driven by --zebra, instead of a
+   light-only color-mix plus a separate dark override. */
 #app-root tbody tr:nth-child(even) {
-  background: color-mix(in srgb, var(--page) 70%, transparent);
+  background: var(--zebra);
+}
+
+#app-root tbody tr:hover {
+  background: var(--accent-soft);
 }
 
 #app-root.theme-dark table,
 #app-root.theme-dark th,
 #app-root.theme-dark td {
-  color: #e0e0e0;
-  border-color: #334155 !important;
+  color: #D6E4F7;
+  border-color: #17376E !important;
 }
 
 #app-root.theme-dark thead tr,
 #app-root.theme-dark th {
-  background-color: #263347 !important;
+  background-color: #0E2A5C !important;
 }
 
 #app-root.theme-dark code {
-  background-color: #1e293b;
-  color: #93c5fd;
+  background-color: #0A2350;
+  color: #6FB4FF;
   padding: 1px 4px;
   border-radius: 3px;
 }
@@ -878,28 +1095,28 @@ body:has(#app-root.theme-dark) {
 /* ---- Sliders ---- */
 #app-root.theme-dark .rc-slider-mark-text,
 #app-root.theme-dark .dash-slider-mark {
-  color: #c8d0dc !important;
+  color: #B4C7E4 !important;
   opacity: 1 !important;
   font-size: 11px !important;
   font-weight: 500;
 }
 
 #app-root.theme-dark .rc-slider-rail {
-  background-color: #334155 !important;
+  background-color: #17376E !important;
 }
 
 #app-root.theme-dark .rc-slider-track {
-  background-color: #6366f1 !important;
+  background-color: #1B6FE0 !important;
 }
 
 #app-root.theme-dark .rc-slider-dot {
-  border-color: #64748b !important;
-  background-color: #1e293b !important;
+  border-color: #8FA6C8 !important;
+  background-color: #0A2350 !important;
 }
 
 #app-root.theme-dark .rc-slider-handle {
-  border-color: #a5b4fc !important;
-  background-color: #e0e7ff !important;
+  border-color: #6FB4FF !important;
+  background-color: #DDEBFF !important;
 }
 
 #app-root .rc-slider-track {
@@ -938,9 +1155,9 @@ body:has(#app-root.theme-dark) {
 #app-root.theme-dark [class$="-placeholder"],
 #app-root.theme-dark [class$="-Input"],
 #app-root.theme-dark [class$="-ValueContainer"] {
-  background-color: #0f172a !important;
-  color: #e0e0e0 !important;
-  border-color: #475569 !important;
+  background-color: #061A40 !important;
+  color: #D6E4F7 !important;
+  border-color: #24508F !important;
 }
 
 #app-root.theme-dark .Select-placeholder,
@@ -948,27 +1165,27 @@ body:has(#app-root.theme-dark) {
 #app-root.theme-dark .Select-value-label,
 #app-root.theme-dark div[class*="-singleValue"],
 #app-root.theme-dark div[class*="-placeholder"] {
-  color: #e0e0e0 !important;
+  color: #D6E4F7 !important;
 }
 
 #app-root.theme-dark .Select-arrow,
 #app-root.theme-dark [class*="-indicatorContainer"] svg,
 #app-root.theme-dark [class*="-dropdownIndicator"] {
-  color: #9aa3b2 !important;
-  fill: #9aa3b2 !important;
+  color: #8FA6C8 !important;
+  fill: #8FA6C8 !important;
 }
 
 #app-root.theme-dark .VirtualizedSelectFocusedOption,
 #app-root.theme-dark .Select-option.is-focused,
 #app-root.theme-dark div[class*="-option"]:hover,
 #app-root.theme-dark [class$="-option"]:hover {
-  background-color: #334155 !important;
-  color: #f1f5f9 !important;
+  background-color: #17376E !important;
+  color: #EAF2FF !important;
 }
 
 #app-root.theme-dark .Select-option.is-selected,
 #app-root.theme-dark [class*="-option"][class*="selected"] {
-  background-color: #3b82f6 !important;
+  background-color: #1B6FE0 !important;
   color: #ffffff !important;
 }
 
@@ -976,27 +1193,27 @@ body:has(#app-root.theme-dark) div[class*="-menu"],
 body:has(#app-root.theme-dark) div[class$="-menu"],
 body:has(#app-root.theme-dark) .Select-menu-outer,
 body:has(#app-root.theme-dark) .Select-menu {
-  background-color: #1e293b !important;
-  color: #e0e0e0 !important;
-  border: 1px solid #475569 !important;
+  background-color: #0A2350 !important;
+  color: #D6E4F7 !important;
+  border: 1px solid #24508F !important;
 }
 
 body:has(#app-root.theme-dark) div[class*="-option"],
 body:has(#app-root.theme-dark) .Select-option {
-  background-color: #1e293b !important;
-  color: #e0e0e0 !important;
+  background-color: #0A2350 !important;
+  color: #D6E4F7 !important;
 }
 
 body:has(#app-root.theme-dark) div[class*="-option"]:hover,
 body:has(#app-root.theme-dark) .Select-option:hover,
 body:has(#app-root.theme-dark) .Select-option.is-focused {
-  background-color: #334155 !important;
-  color: #f1f5f9 !important;
+  background-color: #17376E !important;
+  color: #EAF2FF !important;
 }
 
 body:has(#app-root.theme-dark) [class*="-MenuList"],
 body:has(#app-root.theme-dark) [class$="-MenuList"] {
-  background-color: #1e293b !important;
+  background-color: #0A2350 !important;
 }
 
 /* ---- Larger dropdown menus: show more species/options at once ---- */
@@ -1017,7 +1234,7 @@ body:has(#app-root) [class$="-MenuList"] {
 #app-root.theme-dark .form-check-label,
 #app-root.theme-dark .dash-radioitems label,
 #app-root.theme-dark .dash-checklist label {
-  color: #e0e0e0 !important;
+  color: #D6E4F7 !important;
 }
 
 /* ---- Dark: catch remaining light inline backgrounds ---- */
@@ -1028,73 +1245,73 @@ body:has(#app-root) [class$="-MenuList"] {
 #app-root.theme-dark [style*="background-color: #ffffff"],
 #app-root.theme-dark [style*="background-color: white"],
 #app-root.theme-dark [style*="background: white"] {
-  background-color: #1e293b !important;
-  border-color: #334155 !important;
-  color: #e0e0e0 !important;
+  background-color: #0A2350 !important;
+  border-color: #17376E !important;
+  color: #D6E4F7 !important;
 }
 
 #app-root.theme-dark input:not([type="checkbox"]):not([type="radio"]):not([type="hidden"]):not([type="submit"]):not([type="button"]):not(.theme-seg-input):not(.seg-input),
 #app-root.theme-dark textarea {
-  background-color: #0f172a !important;
-  color: #e0e0e0 !important;
-  border-color: #475569 !important;
+  background-color: #061A40 !important;
+  color: #D6E4F7 !important;
+  border-color: #24508F !important;
 }
 
 #app-root.theme-dark button[style*="background-color: #eee"],
 #app-root.theme-dark button[style*="background-color: #f7f7f7"],
 #app-root.theme-dark [id*="btn-clear"],
 #app-root.theme-dark [id*="btn-react-net"] {
-  background-color: #334155 !important;
-  color: #e0e0e0 !important;
-  border-color: #475569 !important;
+  background-color: #17376E !important;
+  color: #D6E4F7 !important;
+  border-color: #24508F !important;
 }
 
 #app-root.theme-dark [style*="color: #666"],
 #app-root.theme-dark [style*="color: '#666"],
 #app-root.theme-dark span[style*="color: rgb(102, 102, 102)"] {
-  color: #9aa3b2 !important;
+  color: #8FA6C8 !important;
 }
 
 #app-root.theme-dark [style*="color: #333"],
 #app-root.theme-dark [style*="color: '#333"] {
-  color: #e0e0e0 !important;
+  color: #D6E4F7 !important;
 }
 
 #app-root.theme-dark [style*="color: #555"],
 #app-root.theme-dark [style*="color: '#555"] {
-  color: #c8d0dc !important;
+  color: #B4C7E4 !important;
 }
 
 #app-root.theme-dark [style*="border-bottom: 1px solid #eee"] {
-  border-bottom-color: #334155 !important;
+  border-bottom-color: #17376E !important;
 }
 
 /* Model setup */
 #app-root.theme-dark #model-setup-panel table {
-  background-color: #1e293b !important;
-  border-color: #475569 !important;
+  background-color: #0A2350 !important;
+  border-color: #24508F !important;
 }
 
 #app-root.theme-dark #model-setup-panel th,
 #app-root.theme-dark #model-setup-panel td {
-  background-color: #1e293b !important;
-  color: #e0e0e0 !important;
-  border-color: #475569 !important;
+  background-color: #0A2350 !important;
+  color: #D6E4F7 !important;
+  border-color: #24508F !important;
 }
 
 #app-root.theme-dark #model-setup-panel thead tr,
 #app-root.theme-dark #model-setup-panel th {
-  background-color: #263347 !important;
+  background-color: #0E2A5C !important;
 }
 
 #app-root.theme-dark #model-setup-panel div[style*="background"],
 #app-root.theme-dark #model-setup-panel [style*="backgroundColor"] {
-  background-color: #1e293b !important;
-  border-color: #475569 !important;
+  background-color: #0A2350 !important;
+  border-color: #24508F !important;
 }
 
 #app-root.theme-dark #model-setup-panel [style*="color: #1a1a2e"] {
-  color: #f1f5f9 !important;
+  color: #EAF2FF !important;
 }
 
 /* Scrollbars */
@@ -1104,16 +1321,16 @@ body:has(#app-root) [class$="-MenuList"] {
 }
 
 #app-root.theme-dark ::-webkit-scrollbar-track {
-  background: #1e293b;
+  background: #0A2350;
 }
 
 #app-root.theme-dark ::-webkit-scrollbar-thumb {
-  background: #475569;
+  background: #24508F;
   border-radius: 5px;
 }
 
 #app-root.theme-dark ::-webkit-scrollbar-thumb:hover {
-  background: #64748b;
+  background: #8FA6C8;
 }
 
 #app-root.theme-dark .dash-loading,
@@ -1122,17 +1339,17 @@ body:has(#app-root) [class$="-MenuList"] {
 }
 
 #app-root.theme-dark .rc-slider-tooltip-inner {
-  background-color: #334155 !important;
-  color: #e0e0e0 !important;
-  border: 1px solid #475569 !important;
+  background-color: #17376E !important;
+  color: #D6E4F7 !important;
+  border: 1px solid #24508F !important;
 }
 
 #app-root.theme-dark a {
-  color: #60a5fa;
+  color: #6FB4FF;
 }
 
 #app-root.theme-dark a:hover {
-  color: #93c5fd;
+  color: #6FB4FF;
 }
 
 #app-root.theme-dark .dash-graph,
@@ -1167,23 +1384,23 @@ body:has(#app-root) [class$="-MenuList"] {
 
 #export-format-selector label:has(input:checked) {
   background-color: var(--accent-soft);
-  color: var(--accent);
+  color: var(--accent-ink);
   font-weight: 600;
 }
 
 #app-root.theme-dark #export-format-selector label {
-  color: #c8d0dc;
+  color: #B4C7E4;
 }
 
 /* ---- Probe ranking ---- */
 .probe-info {
   background: var(--card);
   border: 1px solid var(--border);
-  border-left: 3px solid var(--accent);
   border-radius: var(--radius);
-  padding: 12px 16px 14px;
-  margin-bottom: 12px;
-  font-size: 13px;
+  box-shadow: inset 3px 0 0 0 var(--accent);
+  padding: var(--s3) var(--s4) var(--s4) var(--s4);
+  margin-bottom: var(--s3);
+  font-size: var(--fs-base);
   line-height: 1.5;
 }
 
@@ -1212,6 +1429,14 @@ body:has(#app-root) [class$="-MenuList"] {
 .probe-table-wrap table {
   width: 100%;
   margin: 0;
+}
+
+/* Header stays put while the 420px-tall probe table scrolls. */
+.probe-table-wrap thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  box-shadow: inset 0 -1px 0 0 var(--border-strong);
 }
 
 .probe-progress {
@@ -1244,12 +1469,13 @@ body:has(#app-root) [class$="-MenuList"] {
 }
 
 .probe-empty-note {
-  font-size: 13px;
+  font-size: var(--fs-base);
   line-height: 1.45;
-  margin: 0 0 12px;
-  padding: 8px 12px;
-  border-left: 3px solid var(--accent);
-  background: var(--card);
+  margin: 0 0 var(--s3);
+  padding: var(--s2) var(--s3);
+  border-radius: var(--radius-sm);
+  box-shadow: inset 3px 0 0 0 var(--accent);
+  background: var(--sunken);
 }
 
 .probe-math-label,
@@ -1312,4 +1538,62 @@ body:has(#app-root) [class$="-MenuList"] {
   .probe-heatmap-grid {
     grid-template-columns: 1fr;
   }
+}
+
+
+/* ---- Focus visibility -----------------------------------------------------
+   Buttons and inputs already had a ring; extend the same treatment to the
+   remaining keyboard-reachable controls so tabbing through never leaves the
+   user guessing where they are. */
+.kosma-details > summary:focus-visible,
+.app-about summary:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
+  border-radius: var(--radius-sm);
+}
+
+.seg-btn:has(input:focus-visible),
+.theme-seg-btn:has(input:focus-visible),
+#export-format-selector label:has(input:focus-visible) {
+  box-shadow: var(--ring) !important;
+}
+
+/* ---- Reduced motion -------------------------------------------------------
+   Every transition here is decorative, so honour the OS preference outright. */
+@media (prefers-reduced-motion: reduce) {
+  #app-root *,
+  #app-root *::before,
+  #app-root *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Selection picks up the accent rather than the browser default blue. */
+#app-root ::selection {
+  background: var(--accent-soft);
+  color: var(--text-heading);
+}
+
+
+/* ---- Parameter sliders --------------------------------------------------
+   These are the tool's primary instrument, so their filled track runs
+   deep-navy to cyan -- the same direction light is absorbed going into a
+   PDR. Scoped to this panel only, so the ramp reads as meaning rather
+   than decoration; sliders elsewhere keep the flat accent. */
+#app-root #controls-sliders-wrap .rc-slider-track {
+  background: linear-gradient(90deg,
+              var(--ink) 0%, var(--deep) 42%,
+              var(--beam) 78%, var(--glow) 100%) !important;
+}
+
+#app-root #controls-sliders-wrap .rc-slider-handle {
+  border-color: var(--glow) !important;
+  background-color: #ffffff !important;
+}
+
+#app-root #controls-sliders-wrap .rc-slider-rail {
+  background-color: var(--seg-bg) !important;
 }

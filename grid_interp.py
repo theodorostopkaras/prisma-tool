@@ -419,6 +419,10 @@ def resample_grid_3d_kosens(
     return grid_out, final_x, final_y, final_z
 
 
+class SliceTooSmallError(ValueError):
+    """Slice has fewer than 2 grid points along an axis (nothing to interpolate)."""
+
+
 def calculate_interpolation_error_kosens(
     grid_log10: np.ndarray,
     *,
@@ -575,6 +579,10 @@ def analyze_slice_interpolation(
     x_phys, y_phys, grid = align_grid_axes_ascending(
         x_phys, y_phys, grid, x_logscale=x_logscale, y_logscale=y_logscale,
     )
+    if min(grid.shape) < 2:
+        # Delaunay (griddata) needs a 2-D point cloud; a single model or one row can't be interpolated.
+        raise SliceTooSmallError('Interpolation analysis needs at least 2 grid points along both axes '
+                         f'(this slice has {grid.shape[1]} \u00D7 {grid.shape[0]}).')
     grid = impute_grid_kosens(grid, log_values=log_values)
 
     if log_values:

@@ -1,140 +1,169 @@
-# `probe_margin`, in pictures
+# `probe_margin` and the inference error Δ
 
-> **The whole idea in one line:** how much of a species' attenuation signal is
-> left over once you subtract how much that signal *wobbles* as you move across
-> the FUV axis.
+> **Superseded.** `probe_margin` is no longer computed. `plot_attenuation_fuv_response`
+> keeps `|R|` (`abs_response_dex`) and the swing (`fuv_swing_dex`) as separate numbers,
+> plots the per-`G₀` median R as a profile, and labels the probe-panel regions
+> *CR-dominated* / *G0-modulated response*; the verdict `FUV tracer` is now
+> `G0-modulated`. See `attenuation_compare_workflow.md`. The Δ material below still holds.
+
+> **Definition in one line.** `probe_margin` is the magnitude of a line's
+> response to CR attenuation minus the spread (swing) of that response
+> across the FUV axis: the part of the attenuation signal that is not
+> degenerate with a change in `G₀`.
 
 Figures: `python Scripts/GRID/make_probe_margin_explainer.py`.
-Numbers are the synthetic ones from the method doc — they reproduce what
-`plot_attenuation_fuv_response` actually prints on that grid.
+The numerical values in Figures 1–5 are from the synthetic grid of the method
+document; they are identical to what `plot_attenuation_fuv_response` prints for
+that grid.
+
+**Notation.** All logarithms are base 10. `x ≡ ζ_H` (CR ionization rate, grid
+x-axis), `y ≡ G₀` (FUV field, grid y-axis). A grid cell is indexed by
+`(i, j)` = (row in `G₀`, column in `ζ_H`). `I_const` and `I_atten` are the
+line intensities of the constant-CR and attenuated-CR model grids at the same
+nominal `(ζ_H, G₀)`. "dex" denotes a difference in log10.
 
 ---
 
-## The raw material: R
+## 1. The response field R
 
-For every cell of the grid you have one number:
-
+For every cell the response is defined as
 
 ```
-R  =  log10( I_atten / I_const )
+R(i, j)  =  log10( I_atten(i, j) / I_const(i, j) )
 ```
 
-*How much intensity this line loses when attenuation is switched on, at this
-exact (ζ_H, G₀).* Negative = fainter. That's it — no matching, no tolerance.
+i.e. the logarithmic change in line intensity caused by attenuation at fixed
+nominal parameters. `R < 0` means attenuation lowers the intensity. The
+quantity is evaluated cell-wise and involves no interpolation or matching;
+cells in which either intensity is non-positive or non-finite, or which fall
+below the observability limit, are masked (NaN).
 
 ![R over the grid](Figures/probe_margin/1_r_field.png)
 
-Two species, two completely different situations:
+The two synthetic species illustrate the two limiting cases:
 
-- **CO 1-0** — the same colour everywhere. Attenuation costs it 1.4 dex no
-  matter where you are.
-- **[OI] 63µm** — orange at the bottom, blue at the top. Attenuation makes it
-  *brighter* at low `G₀` and *fainter* at high `G₀`.
+- **CO 1-0** — `R ≈ −1.40` in every cell, so `∂R/∂log G₀ = 0`. The attenuation
+  response does not depend on the FUV field.
+- **[OI] 63µm** — `R > 0` at low `G₀` and `R < 0` at high `G₀`, so
+  `∂R/∂log G₀ < 0`. The sign of the response itself depends on the FUV field.
 
-**This is the entire distinction `probe_margin` is trying to capture.** If you
-observed a line and saw its intensity change, CO's change could only be
-attenuation. [OI]'s change might just mean you were looking at a different part
-of the radiation field.
+The distinction matters for inference. For CO 1-0 an observed intensity change
+relative to the constant-CR prediction can only be attributed to attenuation.
+For [OI] 63µm the same change could equally be produced by a different `G₀`, so
+the attenuation signal and the FUV field are degenerate. `probe_margin`
+measures how strongly that degeneracy affects each species.
 
 ---
 
-## Step 1 — squash each row to one number
+## 2. Reducing each row to a single value
 
-Each horizontal row of the grid sits at **one fixed `G₀`**, so it is one
-cosmic-ray experiment. Take the median of R along that row:
+A row of the grid is a sequence of models at fixed `G₀` and varying `ζ_H`, so
+it is a one-parameter CR experiment. The ζ_H-dependence is removed by taking
+the row median:
 
 ```python
-r_row[i] = np.nanmedian(response[i, :])      # median over ζ
+r_row[i] = np.nanmedian(response[i, :])      # median over ζ_H at fixed G₀
 ```
 
-The 6-row grid gives you a **vector of 6 numbers**, one per FUV value:
+For a grid with `N_y` rows this yields a vector `r_row ∈ ℝ^{N_y}` that depends
+on `G₀` only (here `N_y = 6`). The median is chosen over the mean so that
+individual cells (e.g. near a chemical transition) cannot dominate the row
+value.
 
 ![row medians](Figures/probe_margin/2_row_medians.png)
 
-- **CO 1-0 is a vertical line** — every row gives −1.40.
-- **[OI] 63µm is tilted** — the row median slides from +0.60 down to −0.90.
+- **CO 1-0**: `r_row = −1.40` for all rows (zero dispersion).
+- **[OI] 63µm**: `r_row` decreases monotonically from `+0.60` to `−0.90`.
 
-Everything from here on is just two summary numbers describing that vector.
+Both summary statistics below are functionals of this vector.
 
 ---
 
-## Step 2 — the two numbers, read off the same six dots
+## 3. The two statistics
 
 ![number line](Figures/probe_margin/3_number_line.png)
 
-### `abs_response_dex` = |R| — *how big is the effect*
-
-The median of the six, then absolute value.
-
-### `fuv_swing_dex` = "swing" — *how much does it depend on `G₀`*
-
-Sort the six, find the value 10% of the way up (`p10`) and 90% of the way up
-(`p90`), subtract.
-
-For **[OI] 63µm** the six numbers are:
+### `abs_response_dex` — location
 
 ```
-sorted:   -0.90   -0.60   -0.30    0.00   +0.30   +0.60
-                    ↑                             ↑
-                p10 = -0.75                   p90 = +0.45
-
-|R|   = |median| = |-0.15|          = 0.15   ← tiny effect
-swing = p90 - p10 = 0.45 - (-0.75)  = 1.20   ← huge G_0 dependence
+|R|  =  | median_i ( r_row[i] ) |
 ```
 
-(`p10` lands between the 1st and 2nd sorted values, so numpy interpolates:
-halfway between −0.90 and −0.60 gives −0.75.)
+The median over rows of the row medians; this is the typical magnitude of the
+attenuation response. (`response_dex` stores the signed value.)
 
-For **CO 1-0** all six numbers are −1.40, so `p10 = p90` and:
+### `fuv_swing_dex` — dispersion along G₀
 
 ```
-|R|   = 1.40      ← big effect
-swing = 0.00      ← identical at every G_0
+swing  =  max(r_row) − min(r_row)
 ```
 
-> **Why `p90 − p10` and not `max − min`?** So one freak row can't set the whole
-> number. It spans 80% of the FUV range and lets the extreme 10% at each end
-> fall away.
+It requires at least two valid rows; otherwise it is NaN. It is the **full
+range**: the grid is a complete, deterministic enumeration of environments, not
+a noisy sample, so no row is trimmed — a claim that the response does not
+depend on `G₀` must hold for every row (`grid_functions._swing`). An earlier
+version used the inter-decile range P90 − P10; it was dropped because it
+ignored real extreme environments. In 3D the swing of a box is split into a
+`G₀` part (at fixed density, the one the verdict tests) and a density part
+(`grid_functions._split_swing`).
+
+For **[OI] 63µm**:
+
+```
+sorted r_row:   -0.90   -0.60   -0.30    0.00   +0.30   +0.60
+
+|R|   = |median| = |(-0.30 + 0.00)/2| = 0.15
+swing = +0.60 − (−0.90)              = 1.50
+```
+
+For **CO 1-0** all elements are equal, so the swing is 0:
+
+```
+|R|   = 1.40
+swing = 0.00
+```
 
 ---
 
-## Step 3 — subtract
+## 4. The margin
 
 ```
-probe_margin = |R| − swing
+probe_margin  =  |R| − swing
 ```
 
 ![the subtraction](Figures/probe_margin/4_subtraction.png)
 
-Read the green bar as the signal and the blue bar as the amount of that signal
-you have to give away because it isn't stable across `G₀`. The diamond is what
-survives.
-
-| species | \|R\| | swing | margin | verdict |
+| species | \|R\| | swing | margin | interpretation |
 |---|---|---|---|---|
-| CO 1-0 | 1.40 | 0.00 | **+1.40** | huge effect, perfectly stable → great probe |
-| C+ 158µm | 0.25 | 0.88 | **−0.63** | small effect, wobbles 3.5× more than its own size |
-| [OI] 63µm | 0.15 | 1.20 | **−1.05** | barely responds, but swings wildly with `G₀` |
+| CO 1-0 | 1.40 | 0.00 | **+1.40** | large response, independent of `G₀` → attenuation-dominated |
+| C+ 158µm | 0.25 | 0.88 | **−0.63** | FUV-induced dispersion is 3.5× the response |
+| [OI] 63µm | 0.15 | 1.20 | **−1.05** | response is negligible compared with its `G₀` dependence |
 
-A **subtraction** rather than a ratio because both terms are already in dex —
-and because the *best* case is `swing → 0`, which a ratio would send to
-infinity.
+`probe_margin > 0` means the typical attenuation response is larger than the
+change in that response across the central 80 % of the FUV range. So a
+response of that size cannot come from a change in `G₀` alone.
 
----
-
-# The other half of the figure: Δ, the dex error
-
-`probe_margin` answers *"is this line telling me about cosmic rays?"*. The
-**left** panel of `plot_attenuation_fuv_response` answers a different question:
-*"if I ignore attenuation altogether, how wrong is the ζ_H I fit?"* That number
-is `Δ`, and it is built from a horizontal match, not from R.
+**Why a difference and not a ratio.** Both terms are in dex, so their
+difference is also in dex and can be read directly as a log-intensity. A ratio
+`|R|/swing` diverges as `swing → 0` and is undefined at `swing = 0`, which is
+exactly the ideal case, so it cannot rank the species of most interest.
 
 ---
 
-## Δ in one picture
+# The inference error Δ
 
-Stay on **one row** of the grid (one fixed `G₀`). You have two curves along ζ:
-the constant-CR grid `I_const(ζ)` and the attenuated grid `I_atten(ζ)`.
+`probe_margin` addresses whether an intensity change can be attributed to
+cosmic rays. The left panel of `plot_attenuation_fuv_response` addresses a
+separate quantity: the bias in the inferred `ζ_H` when an attenuated source is
+fitted with the constant-CR grid. This bias is `Δ`. It is obtained by matching
+intensities along the `ζ_H` axis, not from `R`.
+
+---
+
+## 5. Definition of Δ
+
+Consider one row (fixed `G₀`) and the two intensity profiles `I_const(ζ)` and
+`I_atten(ζ)` along it.
 
 ```
      ^  log I
@@ -143,333 +172,303 @@ the constant-CR grid `I_const(ζ)` and the attenuated grid `I_atten(ζ)`.
      |                                       -----------
      |                           ------------
      |               ------------                       ----- I_atten
-     |    ----o------........................----o--  <- same intensity
+     |    ----o------........................----o--  <- equal intensity
      |  --                       ------------
      +--------|----------------------------------|-----------------> log ζ_H
            ζ_nom                              x_match
               |<----------  Δ  (dex)  ---------->|
 ```
 
-**R is the vertical gap between the two curves; Δ is the horizontal one.**
-Same physics, measured along two different axes.
+`R` is the vertical separation of the two profiles at fixed `ζ`. `Δ` is their
+horizontal separation at fixed intensity.
 
-Take the intensity the **constant** grid predicts at `ζ_nom`. Walk along the
-**attenuated** row until you find the ζ where the attenuated model produces that
-same intensity (within `match_rtol = 2%`). That is `x_match`, and
+For a cell at `ζ_nom`, `x_match` is the `ζ` on the same row at which the
+attenuated model reproduces the constant-CR intensity:
 
 ```
+I_atten(x_match)  =  I_const(ζ_nom)      (relative tolerance match_rtol = 0.02)
+
 Δ  =  log10( x_match / ζ_nom )
 ```
 
-(`horizontal_intensity_matched_x_shift_dex`, `grid_functions.py:7809`; stored as
+(`horizontal_intensity_matched_x_shift_dex` in `grid_functions.py`; stored as
 `shift_dex` / `abs_shift_dex` in the pixel table.)
 
 ---
 
-## Why that horizontal distance *is* the inference error
+## 6. Δ as the bias of a constant-CR fit
 
-Fitting a real source — which is attenuated — against your constant-CR grid
-means solving
+Fitting an observed (attenuated) intensity with the constant-CR grid means
+solving
 
 ```
 I_const(ζ_inferred)  =  I_atten(ζ_true)
 ```
 
-for `ζ_inferred`. That is the *same equation* the match above solves, with
-`ζ_true = x_match` and `ζ_inferred = ζ_nom`. So
+for `ζ_inferred`. This is the matching equation of §5 with
+`ζ_inferred = ζ_nom` and `ζ_true = x_match`. Hence
 
 ```
-Δ  =  log10( ζ_true / ζ_inferred )   ←  the dex you get wrong
+Δ  =  log10( ζ_true / ζ_inferred )
 ```
 
-Nothing more is needed to turn a grid diagnostic into an observational error
-bar: 0.3 dex means a factor 2 wrong in ζ_H, 0.5 dex a factor 3, 1.0 dex a
-factor 10.
+`Δ` is the logarithmic bias of the inferred CR ionization rate, with no further
+assumptions. `|Δ| = 0.3, 0.5, 1.0` dex correspond to factors of 2.0, 3.2 and 10
+in `ζ_H`.
 
-**Why the scan is rightward-only.** Attenuation removes CR flux, so the line
-comes out fainter, so it looks like a *lower*-ζ constant-CR model. The inferred
-ζ is therefore too low and `ζ_true > ζ_inferred`: Δ is positive and the match
-lives at `x ≥ ζ_nom`. `scan_direction="rightward"` encodes exactly that
-expectation — a leftward match would be a sign the physics is not what we think.
+**Rightward-only scan.** In the attenuated model the ionization rate decreases
+with column density, so the column-averaged rate is lower than the nominal
+(surface) value. The attenuated model at `ζ_true` is therefore closest to a
+constant-CR model at some `ζ_eff < ζ_true`. A constant-CR fit recovers
+`ζ_inferred ≈ ζ_eff`, so `Δ > 0` and `x_match ≥ ζ_nom`. This argument does not
+depend on the sign of `∂I/∂ζ`; it follows from attenuation reducing the
+effective rate. `scan_direction="rightward"` encodes this expectation. A match
+only at `x < ζ_nom` would contradict it.
 
 ---
 
-## R and Δ are the same effect, divided by the slope
+## 7. Relation between R, Δ and the CR sensitivity S
 
-Let `S = dlog10(I_const)/dlog10(ζ)` — the local CR sensitivity, the `slope_dex`
-column. Expand the match equation to first order around `ζ_nom`:
-
-```
-log10 I_atten(x_match)  ≈  log10 I_const(x_match) + R
-                        ≈  log10 I_const(ζ_nom) + S·Δ + R
-```
-
-and that must equal `log10 I_const(ζ_nom)`, so
+Define the local CR sensitivity of the constant-CR model
 
 ```
-S · Δ  +  R  =  0        →        |Δ|  ≈  |R| / |S|
+S  =  ∂ log10 I_const / ∂ log10 ζ          (column `slope_dex`, dex/dex)
 ```
 
-**R is the numerator of the error; the slope is its denominator.**
+Write `log I_atten(x) = log I_const(x) + R(x)` and expand
+`log I_const(x_match)` to first order about `ζ_nom`:
 
-| species | \|R\| | S (dex/dex) | \|Δ\| ≈ \|R\|/\|S\| |
+```
+log I_atten(x_match)  =  log I_const(x_match) + R(x_match)
+                      ≈  log I_const(ζ_nom) + S·Δ + R(ζ_nom)
+```
+
+Setting this equal to `log I_const(ζ_nom)` (the matching condition) gives
+
+```
+S·Δ + R  ≈  0      ⇒      Δ  ≈  −R / S,      |Δ| ≈ |R| / |S|
+```
+
+The approximation assumes that `S` and `R` are approximately constant over
+`[ζ_nom, x_match]`. That is, it is valid when `|Δ|` is small compared with the
+scale over which `log I_const` departs from linearity in `log ζ`. For
+large `|Δ|` the matched value from §5 is the exact quantity and the ratio is
+only indicative.
+
+| case | \|R\| | S (dex/dex) | \|Δ\| ≈ \|R\|/\|S\| |
 |---|---|---|---|
 | steep row | 1.40 | 0.70 | 2.0 dex |
-| same R, flat row | 1.40 | 0.20 | 7.0 dex |
+| same R, shallow row | 1.40 | 0.20 | 7.0 dex |
 
-Two consequences, both of which the function is built around:
+Two consequences for the ranking:
 
-1. **A big \|Δ\| is not automatically a big attenuation effect.** It can just be
-   a flat row: `S → 0` sends Δ to infinity while the species has *stopped*
-   responding to cosmic rays at all.
-2. **The best CRIR probe has a small error.** A large R on a *steep* row — the
-   ideal probe — divides down to a tiny Δ. This is why the right panel is ranked
-   by `probe_margin` and not by Δ: an error-sorted list buries exactly the
-   species you were looking for.
-
----
-
-## The two things that can go wrong with a cell
-
-### 1. Flat row → the slope gate
-
-Where `|S|` is small, Δ is numerically enormous and physically meaningless. Only
-cells with
-
-```
-|S|  ≥  min_slope_dex          (default 0.1 dex/dex ≈ 26% per decade of ζ_H)
-```
-
-are *trusted*; `frac_trusted` in the returned table is the fraction of the
-species' grid that survives. Δ and R are gated on the identical `slope_dex`
-numbers used by `plot_attenuation_shift_summary`, so the two functions never
-disagree about which cells count.
-
-### 2. No match on the row → censoring
-
-Sometimes no `x_match` exists inside the row. That is **not** missing data, and
-dropping it would delete precisely the worst-determined models from the ranking.
-The usual reason is that the required `ζ_true` lies past the end of the grid
-row, so the cell is **right-censored**: the error is *larger* than anything
-measurable there. It enters at its lower bound
-
-```
-Δ_bound  =  log10( ζ_row_max / ζ_nom )
-```
-
-```
-        ζ_nom                        end of grid row
-          |                                 |
-          |<───── Δ_bound ─────────────────>|   ← what we record
-          |<───── Δ_true ──────────────────────────>?  ← unmeasurable
-```
-
-Note what `ζ_row_max` actually is: the largest `x_match` that is finite *and*
-positive on that row, not the nominal end of the ζ_H axis. If the last few
-columns of the row never produced a match, the bound is measured to the last
-**matchable** column, which makes `Δ_bound` conservative — the true displacement
-is at least that large, and possibly larger than even the axis would allow.
-
-Two guards on that imputation:
-
-- `Δ_bound ≤ 0` (i.e. `ζ_nom` already sits at the row end) means there is no
-  rightward room at all, so the cell carries no information and is dropped.
-  Note that this drops the cell from the **denominator** as well: `frac_censored`
-  is `n_censored / n_err`, where `n_err` counts only the cells that actually
-  contribute to the median (matched *plus* imputed). It is therefore the share of
-  the *reported* sample that is a bound, not the share of the trusted grid —
-  a species can have a small `frac_censored` and still be built on very few
-  cells, which is why `n_error_cells` is reported next to it.
-- A no-match cell can *also* mean that **no horizontal displacement reproduces
-  the attenuated intensity** — the curves differ by a vertical offset, or by a
-  displacement along `G₀`, which this whole construction does not model. The two
-  cases are not separable from the shift alone, so the imputation is only
-  defensible while censored cells are a minority. Past
-  `max_frac_censored = 0.5` the median itself falls on an imputed bound rather
-  than on a measurement, and the species is dropped from the ranking and both
-  figures (`ranked = False`, `probe_ranked = False`) with a printed note.
-
-The 0.5 threshold is an order-statistic argument, not a taste call. The median
-is the middle value of the pooled sample of measured `|Δ|` and imputed
-`Δ_bound`. Once more than half the sample is imputed, the middle value is an
-imputed entry **by construction**, whatever the numbers are — so the headline
-error of that species would be a statement about where the grid ends rather than
-about cosmic rays, and ranking on it would push the least measurable species to
-the top for the wrong reason. Below the threshold the majority of the sample is
-real measurement (though an individual median can still land on a bound if the
-bounds happen to fall mid-distribution — the guard bounds the failure mode, it
-does not eliminate it). Excluded species are **not deleted**: they stay in the
-returned table with `ranked = False` / `probe_ranked = False` and their
-`frac_censored` printed, so the exclusion is auditable rather than silent.
-
-Whenever `frac_censored > 0` the median is a **lower limit**, and both the
-printout carries a `>` and the figure a limit arrow. The direction is
-one-sided: every
-imputed cell enters *below* its true value, never above, so the pooled median can
-only be pulled down relative to the truth. `bound_gap` in the probe-ranking table
-(`error_dex - median_abs_shift_dex`) quantifies exactly this — how much of a
-species' reported error rests on imputed bounds rather than on matched shifts.
+1. **|Δ| is not a measure of the attenuation effect alone.** It scales as
+   `1/|S|`, so it diverges as the line becomes insensitive to `ζ`, even though
+   in that limit the line carries no CR information.
+2. **A good CR probe has a small |Δ|.** A large `|R|` together with a large
+   `|S|` gives a small bias. Sorting by `|Δ|` would place exactly these species
+   at the bottom, which is why the right panel is ranked by `probe_margin`
+   instead.
 
 ---
 
-## Reading the left panel
+## 8. Cell-level failure modes
 
-Everything on it comes from the per-cell `|Δ|` of one species, over trusted
-cells only:
+### 8.1 Low sensitivity: no slope gate
 
-| what you see | what it is |
+Because `|Δ| ∝ 1/|S|`, cells with small `|S|` can produce large,
+ill-conditioned values of Δ. **No gate on `|S|` is applied**: every cell with
+a model is retained, flat-row cells and small shifts included (cells below the
+detection limit enter at 0, §8.2). `slope_dex` is kept in the table as a
+diagnostic only. Δ and R are taken over the same cells as in
+`plot_attenuation_shift_summary`, so both functions operate on an identical
+cell set.
+
+The reason is that a gate on `|S|` removes the cells where the line does not
+respond to ζ — and with them the small and zero shifts. The medians then
+describe only the ζ-sensitive part of each row and overstate the bias the map
+shows as a whole. Keeping every observable cell has the opposite, known bias
+on the whole 2D grid: a species that shifts a little over most of the map
+outranks one strongly sensitive in a single CRIR band, whose median is pulled
+down by the inert part of its rows. The per-ζ regime verdicts
+(`attenuation_zeta_regime_verdicts`) and the 3D per-box verdicts grade each
+CRIR band separately and remove that bias.
+
+A large `|Δ|` in a single cell with small `|S|` still means loss of CR
+sensitivity rather than a strong CR effect; check `slope_dex` in `top_models`
+before following one up.
+
+### 8.2 No match and undetectable cells: read as no shift
+
+`collect_attenuation_x_shift_table` writes `Δ = 0` into every cell that has a
+model in both grids but no `x_match`: a no-match cell is read as *"attenuation
+moved nothing measurable here"*. Only cells with no model at all stay NaN.
+Cells below the detection limit (`obs_limit`, intensity grids only) are treated
+the same way inside the ranking functions (`_zero_unobservable_shifts`):
+`Δ = 0` and `R = 0`, because a change nobody can detect is no change.
+
+Nothing is imputed. A missing match has two readings that the shift alone
+cannot separate:
+
+- **Past the grid edge.** Where the attenuated profile is monotonic, the
+  required `ζ_true` lies beyond the upper end of the row, so the true `Δ` is
+  *larger* than anything the row can represent.
+- **Model mismatch.** No horizontal displacement reproduces the attenuated
+  intensity at all: the two profiles differ by an offset that no shift along
+  `ζ_H` can absorb, or the degeneracy runs along `G₀`, which this construction
+  does not model.
+
+Counting both as 0 means every median and percentile is a **conservative**
+(low) estimate of the ζ error wherever the first reading holds — most often in
+the high-`ζ_H` part of the grid, where little room is left to shift into. It
+never inflates the error with a value that was not measured.
+
+The same rule applies to every species, and no species is excluded on the
+fraction of its cells that are unmatched or undetectable. Each species is
+therefore summarised over the same cells, and a species detectable over only
+a small part of the grid ranks low instead of ranking on that part alone.
+`frac_observable` is reported next to it.
+
+---
+
+## 9. The left panel
+
+All quantities are computed from the per-cell `|Δ|` of one species over all
+its cells (no-match and undetectable cells as 0, §8.2):
+
+| element | quantity |
 |---|---|
-| bar length | **median** \|Δ\| over trusted cells — `error_dex` |
-| band | **p10–p90** of \|Δ\| across the grid — `error_p10`, `error_p90` |
-| bar colour | `frac_censored`, the fraction of cells that are lower limits (colour bar 0→1) |
-| ▶ at the band's right end | at least one censored cell → every percentile of this species, p90 included, is a lower limit |
-| no numbers | on purpose — the bar length *is* the median and the band ends *are* p10/p90, and a label only fitted beside the band's right edge, where it read as if it annotated p90. Exact values: the printout, or `error_dex` / `error_p10` / `error_p90` |
-| ordering | largest median error at the top |
+| bar length | median of `|Δ|` — `error_dex` |
+| band | P10–P90 of `|Δ|` — `error_p10`, `error_p90` |
+| bar colour | `frac_observable` (colour bar 0 → 1): fraction of the grid above the detection limit; the rest entered at 0 |
+| numeric labels | omitted; the only free position is beside P90, where a label would be misread as annotating P90. Values are in the printout and the table |
+| ordering | decreasing `error_dex` |
 
-> **The band is not an error bar.** It used to be drawn as a capped
-> `errorbar`, which reads as *uncertainty on the median* — and it is not that.
-> The median of hundreds of grid cells is very well determined; the band is
-> the **spread of \|Δ\| across those cells**, i.e. how differently the same
-> species behaves at different (ζ_H, G₀). The two are numerically miles apart:
-> the uncertainty on these medians is negligible, while the drawn span in the
-> real run is 0.1 → 2.4 dex. It is now drawn capless, as a band, for exactly
-> that reason — and note that the variation it encodes runs along axes that do
-> not appear anywhere on this panel, which is what the regime heatmaps are for.
+> **The band is a dispersion, not an uncertainty.** The statistics are computed
+> over the full set of grid cells. That set is a complete enumeration of the
+> model grid, not a random sample, so the median carries no sampling
+> uncertainty. The band is the P10–P90 range of `|Δ|` across parameter space,
+> i.e. how strongly the bias varies with `(ζ_H, G₀)`. It is drawn without caps
+> to avoid confusion with an error bar. In the real run it spans
+> ≈ 0.1–2.4 dex. The axes along which this variation occurs are not shown in
+> this panel (see §10).
 >
-> **Censoring applies to the whole band, not just the median.** An unmatched
-> cell enters at `Δ_bound = log10(ζ_row_max / ζ_nom)`, which lies *below* its
-> true value, so every percentile of a censored species is a lower limit and
-> the whole band is pushed leftward. The ▶ sits at p90 because that is the end
-> a safety call is made on: a worst case that looks tolerable may be an imputed
-> bound, and the bar colour alone does not say so.
+> **Zeros pull the whole band down.** Every unmatched or undetectable cell
+> enters at 0, so every percentile is conservative (§8.2). A pale bar (low
+> `frac_observable`) means much of that pull comes from undetectable cells.
 
-> Read it as: **"ignore attenuation and this is how many dex of ζ_H you get
-> wrong — and how much that depends on where in the grid you sit."** A short bar
-> with a long band is a species whose error is small in most of the grid and
-> bad in one corner; a dark bar is a species whose error is mostly *bounds*, not
-> measurements.
-
-### The four bar shapes
+### 9.1 Interpretation of median and dispersion
 
 ![how to read one bar](Figures/probe_margin/6_reading_order.png)
 
-*(These four are schematic archetypes, not the synthetic pixels used in figures
-1–5 — no single grid shows all four corners at once.)*
+*(Schematic archetypes; they are not taken from the synthetic grid of Figures
+1–5.)*
 
-The bar is a **median**, so a large bar already says the problem is widespread:
-by construction at least half the trusted cells have `|Δ|` ≥ the bar length. You
-do not need a narrow band to establish *prevalence* — the median has done
-that. What the band adds is **uniformity**.
+By definition at least half of the cells satisfy `|Δ| ≥ error_dex`,
+so a large median already establishes that the bias affects most of the grid.
+The band adds information about **homogeneity** across parameter space.
 
 | | narrow band | wide band |
 |---|---|---|
-| **large bar** | badly biased *uniformly* — one number transfers to any source in the grid | badly biased at the median, tolerable at the p10 end, far worse at the p90 end — still a real problem, just a regime-dependent one |
-| **small bar** | genuinely safe to ignore attenuation | **the trap** — fine over most of the grid, catastrophic in one corner |
+| **large median** | homogeneous large bias; a single value describes the grid | large bias with strong parameter dependence; a single value is not representative |
+| **small median** | bias negligible throughout | bias negligible in most of the grid but large in a sub-region |
 
-So "large bar + narrow band" is the cleanest *quotable* case, not the only
-dangerous one. A large bar with a wide band is not less of a problem; it is a
-problem you cannot summarise in one number, which is exactly what sends you to
-the heatmaps below. And the bottom-right cell is the one the ranking itself
-under-sells: it sorts on the median, so a species that is catastrophic in one
-corner sits low in the list.
+The bottom-right case is under-represented by the ranking, because the ranking
+sorts on the median: a species with a small median and a large P90 appears low
+in the list despite a severe bias in part of the grid.
 
-### The procedure, in order
+### 9.2 Decision procedure
 
 ```
-                       pick a species' bar
+                       select a species
                                 |
                                 v
-        1.  bar colour / limit arrow  —  dark, or arrow shown?
+        1.  error_p90 <= tolerance?
                                 |
                yes -------------+------------- no
                 |                               |
                 v                               v
-    every number below is a              numbers are measured
-    LOWER LIMIT: "at least"                    |
-                |                               |
-                +---------------+---------------+
-                                v
-        2.  p90  (right end of the band)  —  p90 <= your tolerance?
-                                |
-               yes -------------+------------- no
-                |                               |
-                v                               v
-    safe to ignore attenuation          you have a problem
-    for this line; stop                          |
+    attenuation can be neglected         attenuation cannot be
+    for this line (stop)                 neglected
+                                                 |
                                                  v
-        3.  bar (median)  —  is the median above tolerance too?
+        2.  error_dex > tolerance?
                                                  |
                             yes -----------------+----------------- no
                              |                                       |
                              v                                       v
-                  bad EVERYWHERE                            bad SOMEWHERE
-                  (>= half the grid);                       (wide band);
-                  one number describes it                   one number does not
+                  bias exceeds tolerance                   bias exceeds tolerance
+                  in >= 50 % of cells                      only in a sub-region
                              |                                       |
                              +-------------------+-------------------+
                                                  v
-        4.  regime heatmaps  —  along which axis, and in which corner?
+        3.  regime heatmaps: along which parameter, in which region?
             (`atten_shift_regime_heatmaps_*.pdf`)
 ```
 
-Step 2 before step 3 is deliberate: `error_p90` is the number that decides
-safety, `error_dex` only the number that decides *rank*. A species is safe to
-ignore only if its **worst** case is tolerable; it is dangerous as soon as its
-worst case is not, whatever its median says.
-
-### Answering the second half — *how much*, then *where*
-
-The bar answers the first half of that sentence. The second half is answered in
-two steps, by two different objects.
-
-**How much** — the band. `error_p10`–`error_p90` is the spread of `|Δ|` over
-the species' trusted cells, so the band *width* is the size of the grid
-dependence. Narrow: one number describes the species everywhere, and the median
-is a fair summary. Wide: the median is an average over cells that disagree with
-each other, and quoting it alone is misleading — the same species is a good CR
-probe in part of the grid and a bad one elsewhere.
-
-**Where** — not on this panel at all. The band is a spread, and a spread has
-thrown the coordinates away: it tells you the error varies by so many dex across
-the grid, never along which axis or in which corner. That is what the **regime
-heatmaps** of `plot_attenuation_shift_summary` are for
-(`atten_shift_regime_heatmaps_*.pdf`). They are two panels of species × parameter
-bin, coloured by **median `|Δ|` per bin** — one panel binned along `x` (ζ_H), one
-along `y` (`G₀`) — so a wide band resolves into a direction: a gradient across
-the x-panel means the error grows with CR rate, a gradient across the y-panel
-means it is `G₀` that decides. Both figures gate cells on the identical
-`slope_dex` numbers (see above), so a heatmap bin and a bar are the same Δ,
-sliced differently: read the bar for the ranking, the heatmap for whether that
-rank holds where *your* source sits.
-
-Two related columns answer a narrower version of the same question, but about
-`R` rather than `Δ`, and only along `G₀`: `fuv_swing_dex` is p90 − p10 of the
-**per-row median** response, and since each row is a fixed-`G₀` experiment,
-taking the median within the row removes the ζ_H variation and isolates the `G₀`
-dependence; `fuv_trend` is the regression slope of those row medians against
-`log₁₀ G₀`, which gives that dependence a *sign* — something a spread cannot.
-Because they are built on `R`, a wide Δ band beside a small `fuv_swing_dex`
-is informative in itself: the grid dependence is not along `G₀`, so it lives
-within the rows — either `R` varies along ζ_H, or, just as likely given
-Δ ≈ |R|/|S|, the CR sensitivity `S` does.
-
-Δ also appears on the right panel twice, so the two halves can be read together:
-marker **size** is `|Δ|`, and each legend entry carries its `|Δ|` in brackets.
+P90 is tested before the median because the criterion for neglecting
+attenuation is an upper bound on the bias over (nearly) the whole grid.
+`error_p90` decides admissibility, while `error_dex` only determines rank.
+The zeros of §8.2 pull every percentile down, so passing step 1 is
+conservative only where the matches stayed inside the grid; read a small
+median together with P90 (§9.1, bottom-right case) and the bar colour.
 
 ---
 
-## Worked example — the real run
+## 10. Localising the parameter dependence
 
-Everything above is machinery. This is the procedure run on the actual output in
-`Figures/atten_fuv_response.pdf`, on the eight species the pipeline itself
-selected — **run before the constituent cap existed**, i.e. what you get today
-with `max_per_constituent` set as high as `max_species`. It is kept in that form
-on purpose: it is the clearest picture of the failure the cap was added for.
+**Magnitude of the dependence.** The band width `error_p90 − error_p10`
+measures how much `|Δ|` varies across the cells. A narrow band means
+the median is representative. A wide band means the median averages over
+regions with substantially different bias, and it should not be quoted without
+the percentiles.
 
-The left panel's eight, with the medians it printed and the band ends read
-off the axis:
+**Direction of the dependence.** The band is a marginal distribution and
+therefore contains no information about *where* in parameter space the large
+values occur. That information is in the regime heatmaps of
+`plot_attenuation_shift_summary` (`atten_shift_regime_heatmaps_*.pdf`). They
+show the median `|Δ|` per species and per parameter bin, marginalised along
+`ζ_H` in one panel and along `G₀` in the other. A gradient in the ζ_H panel
+indicates that the bias depends on the CR ionization rate, and a gradient in
+the G₀ panel indicates that it depends on the FUV field. Both figures use the
+same cells (no-match and undetectable cells as 0, no slope gate), so a heatmap bin
+and a bar are computed from the same cell set.
 
-| species | median \|Δ\| | p10 | p90 | colour |
+Two table columns describe the `G₀` dependence of `R` (not of Δ):
+
+- `fuv_swing_dex` — spread of the row medians (full range by default, §3). The row median
+  removes the ζ_H dependence, so this isolates the variation with `G₀`.
+- `fuv_trend` — ordinary least-squares slope of `r_row` against
+  `log10 G₀` (dex of R per dex of G₀; at least 3 rows required). It gives the
+  sign of the dependence, which a range cannot.
+
+If a species has a wide Δ band but a small `fuv_swing_dex`, the variation of Δ
+is not driven by `G₀`. It must then arise within rows: from the ζ_H dependence
+of `R`, or, since `|Δ| ≈ |R|/|S|`, from the ζ_H dependence of the sensitivity
+`S`.
+
+On the right panel, marker size encodes `|Δ|`, and each legend entry lists its
+`|Δ|` in brackets, so both quantities can be read together.
+
+---
+
+## 11. Worked example — real grid
+
+The procedure applied to `Figures/atten_fuv_response.pdf`, using the eight
+species selected by the pipeline. This run **predates the constituent cap**
+(equivalent to `max_per_constituent = max_species` today). It is kept because
+it illustrates the problem the cap addresses (§12).
+
+It also **predates the current cell convention**: it used the `|S| ≥ 0.1`
+slope gate, imputed no-match cells as lower bounds (the `>` marks and the
+censoring paragraph below), and dropped undetectable cells. Rerun today,
+no-match and undetectable cells enter as 0, flat cells are kept and no species
+is excluded, so no median would carry `>` and the medians would be lower. The
+steps illustrate the reading procedure, not current numbers.
+
+Medians as printed; percentiles read from the axis:
+
+| species | median \|Δ\| | P10 | P90 | colour |
 |---|---|---|---|---|
 | HNC/H2O+ | >0.97 | ≈0.1 | ≈2.4 | orange |
 | HNC/OH+ | >0.93 | ≈0.1 | ≈2.4 | orange |
@@ -480,75 +479,74 @@ off the axis:
 | HNC/CO+ | >0.89 | ≈0.1 | ≈2.4 | orange |
 | N2H+/H+ | >0.88 | ≈0.1 | ≈3.4 | orange |
 
-**Step 1 — colour and the limit arrow.** Every bar is orange, not pale
-yellow, and every printed median carries `>`. On the 0→1 colour bar that is roughly 0.4–0.5: *half of the
-cells behind each of these bars are imputed bounds, not measurements.* They sit
-directly under the `max_frac_censored = 0.5` guard — species worse than that were
-already dropped and printed as excluded. So before reading a single value: these
-are **lower limits**, and the true errors are larger than what is drawn. Nothing
-below this step can be quoted as an equality.
+**(Historical) censoring.** In that run close to half of each sample consisted
+of imputed bounds, so every value in the table was a lower limit. This step no
+longer exists (§8.2).
 
-**Step 2 — p90.** ≈2.4 dex for the seven HNC ratios, ≈3.4 dex for N2H+/H+ —
-and every one of them carries the ▶, so these worst cases are themselves lower
-bounds. Three dex is a factor of ~2500 in ζ_H. Whatever your tolerance is, it is not that. All
-eight fail at step 2, so all eight are lines you cannot use while ignoring
+**Step 1 — P90.** ≈2.4 dex for the HNC ratios (a factor ≈250 in ζ_H) and
+≈3.4 dex for N2H+/H+ (a factor ≈2.5 × 10³), both lower limits. This exceeds
+any plausible tolerance, so none of the eight lines admits neglecting
 attenuation.
 
-**Step 3 — the median.** ≈0.9 dex, so at least half the grid is wrong by nearly
-an order of magnitude. That is the "bad **everywhere**" cell of the table — this
-is not one pathological corner dragging up an otherwise fine species.
+**Step 2 — median.** ≈0.9 dex, i.e. a bias of about a factor 8 in at least
+half of the cells. The bias is therefore widespread, not confined to a
+sub-region.
 
-**Step 4 — but the band is enormous.** p10 ≈ 0.1 against p90 ≈ 2.4: the same
-species is nearly harmless in the bottom decile of cells and catastrophic in the
-top. So it is *both* — bad on the typical cell **and** strongly regime-dependent.
-One number cannot describe it, which is precisely the trigger to go to
-`atten_shift_regime_heatmaps_rightward_top_median.pdf` and ask which axis and
-which corner. This is the case the 2×2 table calls "large bar, wide band".
+**Step 3 — dispersion.** P10 ≈ 0.1 and P90 ≈ 2.4 dex: the bias varies by more
+than two orders of magnitude in ζ_H across the grid. These species fall in the
+"large median, wide band" class of §9.1: the bias is both widespread and
+strongly parameter-dependent, which requires
+`atten_shift_regime_heatmaps_rightward_top_median.pdf` to locate.
 
-**A caution the ranking used to be unable to give you.** Seven of the eight
-share the same numerator, HNC. This is not eight independent verdicts; it is
-essentially one statement about HNC seen against seven different denominators,
-plus one about N2H+/H+. Read that way, the left panel says *HNC ratios are the
-worst thing in this grid to interpret without attenuation* — a single finding,
-listed eight times because the ranking sorts rows, not physical causes. That is
-now capped rather than left to the reader; see the next section.
+**Constituent degeneracy.** Seven of the eight entries share the numerator HNC.
+As shown in §12, these are not independent results. The panel effectively
+contains two findings, one for HNC and one for N2H+/H+, and the first is
+repeated seven times because the ranking operates on keys, not on the
+underlying species.
 
-## One species cannot take the whole list
+---
 
-The run above is the failure mode in its pure form: eight slots, one physical
-cause. It matters beyond tidiness — if HNC's grid has a pathology anywhere (a
-chemistry cliff, an abundance floor, a bad interpolation), that single defect
-appears as eight agreeing bars and reads as an overwhelming, reproducible
-result. The whole follow-up then chases one species' grid.
+## 12. Constituent degeneracy in ratio rankings
 
-### Why ratio families are not independent
+If one species' grid contains an artefact (a chemical discontinuity, an
+abundance floor, an interpolation defect), it appears in every ratio that
+contains the species. The ranking then shows several mutually consistent
+entries that look like independent confirmation.
 
-Both quantities are logarithmic, so they decompose **exactly** across a ratio:
+### 12.1 Decomposition over a ratio
+
+Both `R` and `S` are logarithmic quantities and decompose exactly:
 
 ```
-R_ratio = R_num - R_den            S_ratio = S_num - S_den
-|Δ_ratio| ≈ |R_ratio| / |S_ratio|
+R_ratio = R_num − R_den            S_ratio = S_num − S_den
 ```
 
-If a denominator is CR-inert (`R_den → 0`, `S_den → 0`) then
-`Δ_ratio → Δ_num` identically. Seven denominators like that give seven copies
-of HNC's number — which is exactly what the medians show: 0.89, 0.90, 0.93,
-0.93, 0.93, 0.97. **A spread of 0.08 dex across seven supposedly different
-observables is not a coincidence, it is the fingerprint.** Genuinely
-independent observables do not agree that closely.
+and, to the order of §7,
 
-### What the code does about it
+```
+|Δ_ratio|  ≈  |R_num − R_den| / |S_num − S_den|
+```
 
-**1. `max_per_constituent` (default 2)** caps how many entries in any top-N
-selection may share a constituent species. It applies to both panels of
-`plot_attenuation_fuv_response` and to the summary bars/heatmaps of
-`plot_attenuation_shift_summary` (`_cap_per_constituent`,
-`grid_functions.py`). Two, not one: a second denominator for the same numerator
-is a genuine robustness check, a seventh is a monoculture.
+If the denominator is insensitive to both CRs and attenuation
+(`|R_den| ≪ |R_num|`, `|S_den| ≪ |S_num|`), then
+`Δ_ratio = Δ_num · [1 + O(R_den/R_num, S_den/S_num)]`. All such ratios share
+the numerator's value up to first-order corrections. The seven HNC medians lie
+within 0.08 dex of each other (0.89–0.97), which is consistent with this limit
+and not what independent observables would be expected to give.
 
-Nothing is deleted. The cap decides only what is *drawn*; every species keeps
-its row and its numbers in the returned tables, the paginated per-species
-figures still show everything, and the suppressed entries are printed:
+### 12.2 Implementation
+
+**`max_per_constituent` (default 2).** This is the maximum number of entries in
+a top-N selection that may share a constituent species. It applies to both
+panels of `plot_attenuation_fuv_response` and to the summary bars and heatmaps
+of `plot_attenuation_shift_summary` (`_cap_per_constituent`,
+`grid_functions.py`). The default of 2 allows one consistency check (the same
+numerator against a second, independent denominator) without letting one
+species fill the selection.
+
+The cap affects only which entries are drawn. All species keep their rows in
+the returned tables, the paginated per-species figures are unaffected, and the
+suppressed entries are printed:
 
 ```
   [4 higher-ranked entries suppressed by max_per_constituent=2:
@@ -556,86 +554,90 @@ figures still show everything, and the suppressed entries are printed:
    other denominators, one finding not many]
 ```
 
-The crowding *is* a result — "these are all the same species" — so it moves
-into one printed line instead of occupying seven of the eight bars. Set
-`max_per_constituent=max_species` to get the old plain top-N back.
+`max_per_constituent = max_species` restores the uncapped top-N.
 
-**2. `den_contrib`**, a column on the `plot_attenuation_fuv_response` table and
-a `den=` field in its printout, is
+**`den_contrib`.** This column of the `plot_attenuation_fuv_response` table
+(also printed as `den=`) is
 
 ```
-den_contrib = |R_den| / (|R_num| + |R_den|)
+den_contrib  =  |R_den| / ( |R_num| + |R_den| )
 ```
 
-read off the *same table* — the constituents' own rows. Near 0 means the
-denominator contributes nothing to the ratio's response, i.e. the row is a
-numerator statement wearing a ratio's name. It is NaN when a constituent has no
-row of its own (not in `species_list`, or the key is a single species).
+evaluated from the constituents' own `response_dex` rows. It is the fractional
+contribution of the denominator to the total absolute response.
+`den_contrib → 0` means the ratio's response is carried by the numerator
+alone. It is NaN if a constituent has no row of its own (not in `species_list`)
+or if the key is not a two-component ratio.
 
-Use them together: the cap frees the slots, `den_contrib` names the cause.
+The two work together: the cap limits redundancy in the selection, and
+`den_contrib` identifies which constituent is responsible for a ratio's
+response.
 
 ---
 
-### The two panels do not share a single species
+### 12.3 Disjointness of the two panels
 
-| left panel (worst error) | right panel (best probe) |
+| left panel (largest \|Δ\|) | right panel (largest probe_margin) |
 |---|---|
 | HNC/H2O+, HNC/OH+, HNC/13CO+, HNC/18OH+, HNC/H218O+, HNC/NH2+, HNC/CO+, N2H+/H+ | SO2/CH3OH+, SO2/SO2+, HCO+/13CO2, 13CO/N2+, CO/N2+, H13CO+/13CO2, N2+, C+/N2+ |
 
-Zero overlap, and that is the point of having two panels. The left ranks on `Δ`
-— *how wrong you get ζ_H* — and the right on `margin = |R| − swing` — *whether
-the change you see can be blamed on cosmic rays at all*. A species can be
-enormous on one and absent from the other.
+The two sets have no species in common. This is expected: the left panel ranks
+by `|Δ|` ∝ `|R|/|S|`, and the right by `|R| − swing`. A species can be extreme
+in one metric and unremarkable in the other.
 
-Note also what the right panel does **not** absolve. `SO2/CH3OH+` is the
-cleanest probe in the run — `|R| ≈ 1.02`, swing `≈ 0.31`, so `margin ≈ +0.71`,
-far below the diagonal — and its legend entry still reads `(>0.57)`. The best CR
-probe in this grid still misplaces ζ_H by **at least half a dex** if you fit it
-against a constant-CR grid. The remaining seven cluster at `|R| ≈ 0.5–0.6` with
-swing `≈ 0.1–0.2` (margins ≈ +0.35 to +0.45) and carry `|Δ|` of 0.52–0.60, all
-with `>`.
+A large `probe_margin` does not imply a small bias. `SO2/CH3OH+` has the
+largest margin in the run (`|R| ≈ 1.02`, swing ≈ 0.31, margin ≈ +0.71), yet
+its legend entry reads `(>0.57)`. A constant-CR fit of this line
+underestimates ζ_H by at least 0.57 dex (a factor ≥ 3.7). The remaining seven
+have `|R| ≈ 0.5–0.6`, swing ≈ 0.1–0.2 (margins ≈ +0.35 to +0.45), and
+`|Δ| ≈ 0.52–0.60` dex, all lower limits.
 
-> The two panels answer, in order: **"can I trust this line to be about cosmic
-> rays?"** (right) and **"and how far off will I be anyway?"** (left). Passing
-> the first does not excuse you from the second. In this run *every* species
-> that passes the probe test still carries ≥0.5 dex of error — which is the
-> quantitative case for not ignoring attenuation in this grid at all.
+> The panels address two distinct questions: whether an intensity change is
+> attributable to CRs rather than to `G₀` (right), and the bias of ζ_H under a
+> constant-CR model (left). Satisfying the first does not bound the second.
+> In this grid, every species with a positive margin still carries a bias of
+> at least ≈0.5 dex, so attenuation cannot be neglected for any of the
+> candidate probes.
 
 ---
 
-## Where it lands on the real plot
+## 13. The right panel
 
 ![the probe panel](Figures/probe_margin/5_probe_panel.png)
 
-The right-hand panel of `plot_attenuation_fuv_response` plots exactly these two
-numbers against each other, so the dashed diagonal `y = x` **is**
+The right panel of `plot_attenuation_fuv_response` plots `fuv_swing_dex`
+against `abs_response_dex`, so the dashed line `y = x` is the locus
 `probe_margin = 0`:
 
-- **below the diagonal** → margin positive → the effect beats its own wobble →
-  *this line reports cosmic rays*
-- **above the diagonal** → margin negative → *FUV tracer, don't use it to
-  measure ζ*
-- **left of the dotted line** → `|R| < 0.1`, no response worth discussing, so
-  which side it's on is noise
+- **below the diagonal** — `probe_margin > 0`: the response exceeds its FUV
+  dispersion; the intensity change is attributable to attenuation.
+- **above the diagonal** — `probe_margin < 0`: the response is degenerate with
+  `G₀`; the line does not constrain ζ_H independently.
+- **left of the dotted line** — `|R| < response_floor_dex` (default 0.1 dex,
+  a 26 % intensity change). The response is below the floor, and the sign of
+  the margin is not interpreted.
 
-That sign test is literally the `cr_led` flag in the reconciliation cascade
-(`grid_functions.py:9944`), which is why `tracers` can never contain a negative
-margin and `problematic` freely can.
+The sign criterion is the `cr_led` flag (`probe_margin > 0`) of
+`reconcile_attenuation_species`. Consequently the `tracers` category contains
+no species with negative margin, while `problematic` may.
 
 ---
 
-## Cheat sheet
+## Summary of quantities
 
-| number | plain English | good value |
+| quantity | definition | preferred |
 |---|---|---|
-| `R` | dex the line moves when attenuation is switched on | — |
-| `S` (`slope_dex`) | dex the line moves per dex of ζ_H — CR sensitivity | **large** |
-| `Δ` (`error_dex`) | ≈ \|R\|/\|S\|: dex of ζ_H you get wrong ignoring attenuation | **small** |
-| `frac_censored` | share of cells where Δ is only a lower bound | **small** |
-| `abs_response_dex` | how much attenuation moves this line | **large** |
-| `fuv_swing_dex` | how much that answer changes with `G₀` | **small** |
-| `probe_margin` | the difference — signal you can actually trust | **positive and large** |
-| `den_contrib` | share of a ratio's response owned by its denominator | **not near 0** — near 0 restates the numerator |
+| `R` | `log10(I_atten / I_const)` per cell | — |
+| `S` (`slope_dex`) | `∂log I_const / ∂log ζ_H`; diagnostic, not a filter | large \|S\| |
+| `Δ` (`error_dex`) | median `log10(ζ_true / ζ_inferred)`; ≈ \|R\|/\|S\| to first order | small |
+| `frac_observable` | fraction of the grid above the detection limit; the rest enters Δ and R at 0 (reported, not a cut) | — |
+| `abs_response_dex` | \|median over rows of the row-median R\| | large |
+| `fuv_swing_dex` | max − min of the row-median R (3D: split into `g0_swing_dex`, tested, and `n_swing_dex`) | small |
+| `fuv_trend` | OLS slope of row-median R vs log G₀ | ≈ 0 |
+| `probe_margin` | `abs_response_dex − fuv_swing_dex` | positive and large |
+| `den_contrib` | `|R_den| / (|R_num| + |R_den|)` | not ≈ 0 (≈ 0: numerator-dominated) |
 
-**`margin > 0`: if this line changes, blame cosmic rays.**
-**`margin < 0`: if this line changes, you can't tell why.**
+**`probe_margin > 0`:** the attenuation response exceeds its FUV dependence, so
+an intensity change is attributable to cosmic rays.
+**`probe_margin < 0`:** the response is degenerate with `G₀`, so an intensity
+change cannot be attributed uniquely.

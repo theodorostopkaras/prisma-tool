@@ -530,3 +530,98 @@ if __name__ == '__main__':
     test_splatalogue_drops_lines_outside_frequency_window()
     test_splatalogue_live_hco_window_if_network()
     print('ok')
+
+
+def test_region_shapes_select_pixels():
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, 'dr21_hco+10_grid15.fits')
+        _sparse_otf_cube(path)
+        cube = cv.load_spectral_cube(path, hdu_index=1, use_cache=False)
+        centre = cv.nearest_filled_cell(cube, 0.0, 0.0)[2]
+        # Circle r = 0.1' around the centre holds only the centre pixel (grid 0.25').
+        assert cv.rows_in_shapes(cube, [cv.circle_shape(0, 0, 0.1)]) == [centre]
+        # Circle r = 0.3' also takes the 4 edge neighbours, not the corners (0.35').
+        assert len(cv.rows_in_shapes(cube, [cv.circle_shape(0, 0, 0.3)])) in (4, 5)
+        rect = dict(type='rect', x0=-0.3, x1=0.3, y0=-0.3, y1=-0.15)
+        bottom = cv.rows_in_shapes(cube, [rect])
+        assert bottom == sorted(int(r) for r in cv.rows_in_box(cube, -0.3, 0.3, -0.3, -0.15))
+        # Triangle covering the bottom row only; union with the centre circle.
+        tri = dict(type='path', path='M-0.4,-0.35L0.4,-0.35L0,-0.15Z')
+        assert set(cv.rows_in_shapes(cube, [tri])) <= set(bottom)
+        both = cv.rows_in_shapes(cube, [rect, cv.circle_shape(0, 0, 0.1)])
+        assert both == sorted(set(bottom) | {centre})
+        # Region mean spectrum = mean of the member pixels.
+        _v, y = cv.extract_spectrum(cube, both)
+        stack = np.vstack([cv.extract_spectrum(cube, [r])[1] for r in both])
+        np.testing.assert_allclose(y, np.nanmean(stack, axis=0))
+
+
+def test_relayout_shapes_and_physical_radius():
+    c = cv.circle_shape(0, 0, 1)
+    assert cv.apply_relayout_shapes({'autosize': True}, [c]) is None
+    assert cv.apply_relayout_shapes({'shapes': []}, [c]) == []
+    moved = cv.apply_relayout_shapes({'shapes[0].x0': -2, 'shapes[0].x1': 2}, [c])
+    assert moved[0]['x0'] == -2 and moved[0]['x1'] == 2 and c['x0'] == -1
+    # 1 pc at 206265 pc subtends 1 arcsec.
+    np.testing.assert_allclose(cv.physical_radius_arcsec(1.0, 206264.806), 1.0)
+    assert cv.shape_summary(cv.circle_shape(0, 0, 0.5)).startswith('circle')
+
+
+def test_channel_maps_bins_and_integrates():
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, 'dr21_hco+10_grid15.fits')
+        _sparse_otf_cube(path)
+        cube = cv.load_spectral_cube(path, hdu_index=1, use_cache=False)
+        v = np.sort(cube.velocity_kms)
+        dv = abs(cube.deltav_kms)
+        lo, hi = float(v[10]), float(v[10] + 3.5 * dv * 2)
+        # native channels: one panel per channel in range, equals channel_map * dv
+        native = cv.channel_maps(cube, lo, hi)
+        assert len(native) == np.count_nonzero((cube.velocity_kms >= lo)
+                                               & (cube.velocity_kms <= hi))
+        i0 = int(np.argmin(np.abs(cube.velocity_kms - lo)))
+        np.testing.assert_allclose(native[0][2], cv.channel_map(cube, i0) * dv,
+                                   equal_nan=True)
+        # binned: bins of 2 channels, total flux conserved, blanks kept
+        binned = cv.channel_maps(cube, hi, lo, bin_kms=2 * dv)  # reversed range ok
+        assert len(binned) == 4
+        np.testing.assert_allclose(sum(m for *_, m in binned),
+                                   sum(m for *_, m in native), equal_nan=True)
+        assert np.isnan(binned[0][2][2, 2])
+        # outside the cube -> empty; too many panels -> error
+        assert cv.channel_maps(cube, 1e4, 1e4 + 5) == []
+        try:
+            cv.channel_maps(cube, v[0], v[-1], bin_kms=dv / 1e3)
+            assert cube.nchan <= cv.CHANNEL_MAPS_MAX_PANELS
+        except ValueError:
+            pass
+
+
+def test_pv_cut_matches_spectra_along_cut():
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, 'dr21_hco+10_grid15.fits')
+        _sparse_otf_cube(path)
+        cube = cv.load_spectral_cube(path, hdu_index=1, use_cache=False)
+        start, end = cv.default_pv_cut(cube)
+        out = cv.pv_cut(cube, start, end)
+        pv = out['pv']
+        assert pv.shape == (cube.nchan, out['offset_arcsec'].size)
+        assert np.all(np.diff(out['velocity_kms']) > 0)
+        assert out['offset_arcsec'][0] == 0.0
+        # offset 0 sits on the start cell: its column is that cell's spectrum
+        iy = int(np.argmin(np.abs(cube.dec_axis_arcmin - start[1])))
+        ix = int(np.argmin(np.abs(cube.ra_axis_arcmin - start[0])))
+        row = cube.row_index[iy, ix]
+        if row >= 0:
+            vo = np.argsort(cube.velocity_kms)
+            np.testing.assert_allclose(pv[:, 0], cube.spectra[row][vo])
+        # a cut entirely off the map is all NaN; a width keeps the shape
+        far = cv.pv_cut(cube, (100, 100), (101, 100))
+        assert np.isnan(far['pv']).all()
+        wide = cv.pv_cut(cube, start, end, width_arcmin=0.5)
+        assert wide['pv'].shape == pv.shape and wide['width_arcmin'] > 0
+        try:
+            cv.pv_cut(cube, start, start)
+            assert False
+        except ValueError:
+            pass

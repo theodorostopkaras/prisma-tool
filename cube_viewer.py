@@ -16,6 +16,7 @@ from __future__ import annotations
 import glob
 import os
 import re
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -564,6 +565,118 @@ def collapse_map(cube: SpectralCube, v_low: float, v_high: float,
     return out
 
 
+CHANNEL_MAPS_MAX_PANELS = 48
+
+
+def channel_maps(cube: SpectralCube, v_start: float, v_end: float,
+                 bin_kms: Optional[float] = None
+                 ) -> List[Tuple[float, float, np.ndarray]]:
+    """Velocity channel maps: ``[(v_lo, v_hi, ∫T dv map), ...]`` over ``[v_start, v_end]``.
+
+    Each panel integrates the channels with ``v_lo <= v < v_hi`` (K km/s);
+    ``bin_kms`` <= native width (or None) gives one panel per native channel.
+    Bins with no channels are dropped; blanks stay NaN.
+    """
+    lo, hi = sorted((float(v_start), float(v_end)))
+    dv_nat = abs(float(cube.deltav_kms))
+    v = np.asarray(cube.velocity_kms, dtype=float)
+    if bin_kms is None or not np.isfinite(bin_kms) or bin_kms <= dv_nat:
+        # one panel per native channel, centred on the channel velocity
+        idx = np.flatnonzero((v >= lo) & (v <= hi))
+        edges = [(v[i] - dv_nat / 2, v[i] + dv_nat / 2, [i])
+                 for i in idx[np.argsort(v[idx])]]
+    else:
+        n = max(int(np.ceil((hi - lo) / bin_kms - 1e-9)), 1)
+        edges = []
+        for k in range(n):
+            a = lo + k * bin_kms
+            b = min(a + bin_kms, hi)
+            sel = (v >= a) & ((v < b) if k < n - 1 else (v <= b))
+            edges.append((a, b, np.flatnonzero(sel)))
+    edges = [e for e in edges if len(e[2])]
+    if len(edges) > CHANNEL_MAPS_MAX_PANELS:
+        raise ValueError(
+            f'{len(edges)} channel maps requested (max {CHANNEL_MAPS_MAX_PANELS}); '
+            'narrow the velocity range or widen the bin')
+    filled = cube.row_index >= 0
+    rows = cube.row_index[filled]
+    out = []
+    for a, b, chans in edges:
+        m = np.full((cube.ny, cube.nx), np.nan, dtype=float)
+        m[filled] = np.nansum(cube.spectra[np.ix_(rows, chans)], axis=1) * dv_nat
+        out.append((float(a), float(b), m))
+    return out
+
+
+def _frac_index(axis: np.ndarray, x: np.ndarray) -> np.ndarray:
+    """Nearest cell index of ``x`` on a regular (possibly descending) axis; -1 outside."""
+    axis = np.asarray(axis, dtype=float)
+    if axis.size == 1:
+        half = 0.5
+        return np.where(np.abs(x - axis[0]) <= half, 0, -1)
+    order = np.argsort(axis)
+    half = abs(axis[1] - axis[0]) / 2
+    f = np.interp(x, axis[order], np.arange(axis.size, dtype=float))
+    out = order[np.clip(np.rint(f).astype(int), 0, axis.size - 1)]
+    outside = (x < axis.min() - half) | (x > axis.max() + half)
+    return np.where(outside, -1, out)
+
+
+def pv_cut(cube: SpectralCube, start: Tuple[float, float], end: Tuple[float, float],
+           width_arcmin: float = 0.0, step_arcmin: Optional[float] = None
+           ) -> Dict[str, Any]:
+    """Position–velocity slice along the straight cut ``start`` → ``end`` (ΔRA, ΔDec arcmin).
+
+    Samples every ``step`` (default half a grid cell) along the cut; with
+    ``width_arcmin`` > 0 the spectra across the cut are averaged (nanmean).
+    Returns ``offset_arcsec`` (from ``start``), ascending ``velocity_kms`` and
+    ``pv`` shaped (nvel, noffset); samples off the map or on blank cells are NaN.
+    """
+    # ponytail: nearest-cell sampling (no bilinear) -- honest for sparse OTF grids,
+    # blocky for coarse cubes; swap in scipy.ndimage.map_coordinates if that matters.
+    p0 = np.asarray(start, dtype=float)
+    p1 = np.asarray(end, dtype=float)
+    length = float(np.hypot(*(p1 - p0)))
+    if not np.isfinite(length) or length <= 0:
+        raise ValueError('PV cut start and end must differ')
+    step = float(step_arcmin or cube.grid_step_arcsec / 120.0)
+    n_along = int(np.floor(length / step)) + 1
+    s = np.linspace(0.0, (n_along - 1) * step, n_along)
+    u = (p1 - p0) / length                 # along-cut unit vector
+    perp = np.array([-u[1], u[0]])
+    half_w = max(float(width_arcmin or 0.0), 0.0) / 2
+    n_perp = int(np.floor(half_w / step))
+    t = np.arange(-n_perp, n_perp + 1) * step
+    pts = p0 + s[:, None, None] * u + t[None, :, None] * perp   # (n_along, n_perp, 2)
+    ix = _frac_index(cube.ra_axis_arcmin, pts[..., 0])
+    iy = _frac_index(cube.dec_axis_arcmin, pts[..., 1])
+    rows = np.where((ix >= 0) & (iy >= 0),
+                    cube.row_index[np.clip(iy, 0, None), np.clip(ix, 0, None)], -1)
+    spec = np.full(rows.shape + (cube.nchan,), np.nan, dtype=float)
+    ok = rows >= 0
+    spec[ok] = cube.spectra[rows[ok]]
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)   # all-NaN columns
+        pv = np.nanmean(spec, axis=1)                     # (n_along, nchan)
+    v = np.asarray(cube.velocity_kms, dtype=float)
+    vo = np.argsort(v)
+    return {
+        'offset_arcsec': s * 60.0,
+        'velocity_kms': v[vo],
+        'pv': pv[:, vo].T,
+        'path_ra': np.array([p0[0], p1[0]]),
+        'path_dec': np.array([p0[1], p1[1]]),
+        'width_arcmin': 2 * half_w,
+    }
+
+
+def default_pv_cut(cube: SpectralCube) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    """Horizontal cut through the map centre spanning the full RA extent."""
+    ra, dec = cube.ra_axis_arcmin, cube.dec_axis_arcmin
+    yc = float(np.mean([dec.min(), dec.max()]))
+    return (float(ra.max()), yc), (float(ra.min()), yc)
+
+
 def clamp_channel(cube: SpectralCube, ichan) -> int:
     """Clip a channel index to ``[0, nchan)``; invalid values use the default."""
     n = max(int(cube.nchan), 1)
@@ -715,6 +828,134 @@ def rows_in_box(cube: SpectralCube, ra_min: float, ra_max: float,
     dec = cube.dec_off_deg * 60.0
     mask = (ra >= ra0) & (ra <= ra1) & (dec >= dec0) & (dec <= dec1)
     return np.where(mask)[0]
+
+
+_PATH_NUM = re.compile(r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?')
+
+
+def _path_vertices(path: str) -> np.ndarray:
+    """Vertices of a Plotly ``drawclosedpath`` SVG path (``M x,y L x,y … Z``)."""
+    nums = [float(v) for v in _PATH_NUM.findall(path or '')]
+    return np.asarray(nums[: len(nums) // 2 * 2], dtype=float).reshape(-1, 2)
+
+
+def rows_in_shape(cube: SpectralCube, shape: Dict[str, Any]) -> np.ndarray:
+    """Rows whose pixel centre (arcmin offsets) lies inside one Plotly shape.
+
+    CARTA-style region masks: ``rect`` (box), ``circle`` (Plotly draws an
+    axis-aligned ellipse inside x0..x1 × y0..y1, so it covers circles and
+    ellipses) and ``path`` (closed polygon from ``drawclosedpath``).
+    """
+    kind = (shape or {}).get('type')
+    ra = cube.ra_off_deg * 60.0
+    dec = cube.dec_off_deg * 60.0
+    if kind == 'rect':
+        return rows_in_box(cube, shape['x0'], shape['x1'], shape['y0'], shape['y1'])
+    if kind == 'circle':
+        xc = 0.5 * (float(shape['x0']) + float(shape['x1']))
+        yc = 0.5 * (float(shape['y0']) + float(shape['y1']))
+        a = 0.5 * abs(float(shape['x1']) - float(shape['x0']))
+        b = 0.5 * abs(float(shape['y1']) - float(shape['y0']))
+        if a <= 0 or b <= 0:
+            return np.array([], dtype=int)
+        return np.where(((ra - xc) / a) ** 2 + ((dec - yc) / b) ** 2 <= 1.0)[0]
+    if kind == 'path':
+        verts = _path_vertices(shape.get('path', ''))
+        if len(verts) < 3:
+            return np.array([], dtype=int)
+        from matplotlib.path import Path
+        inside = Path(verts).contains_points(np.column_stack([ra, dec]))
+        return np.where(inside)[0]
+    return np.array([], dtype=int)
+
+
+# Region i is drawn and its spectrum overplotted in REGION_COLORS[i % len]; red is
+# kept for the combined (union) spectrum.
+REGION_COLORS = ('#22c55e', '#3b82f6', '#a855f7', '#f59e0b', '#ec4899', '#14b8a6',
+                 '#84cc16', '#6366f1')
+
+
+def region_color(i: int) -> str:
+    return REGION_COLORS[int(i) % len(REGION_COLORS)]
+
+
+def sky_shift_arcmin(ref: SpectralCube, other: SpectralCube) -> Tuple[float, float]:
+    """(ΔRA, ΔDec) arcmin to add to ``other``'s offsets to put them in ``ref``'s frame.
+
+    Uses the map centres (CRVAL2/3); (0, 0) when either cube lacks them.
+    """
+    if None in (ref.crval2_deg, ref.crval3_deg, other.crval2_deg, other.crval3_deg):
+        return 0.0, 0.0
+    cosd = np.cos(np.radians(float(ref.crval3_deg)))
+    dra = (float(other.crval2_deg) - float(ref.crval2_deg) + 540.0) % 360.0 - 180.0
+    return dra * cosd * 60.0, (float(other.crval3_deg) - float(ref.crval3_deg)) * 60.0
+
+
+def rows_in_shapes(cube: SpectralCube, shapes: Sequence[Dict[str, Any]]) -> List[int]:
+    """Union of the rows inside every region shape (sorted)."""
+    rows: set = set()
+    for sh in shapes or []:
+        try:
+            rows.update(int(r) for r in rows_in_shape(cube, sh))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return sorted(rows)
+
+
+def apply_relayout_shapes(relayout: Dict[str, Any],
+                          shapes: Sequence[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+    """New shape list after a Plotly ``relayoutData`` event, or None if no shape changed.
+
+    Drawing / erasing sends the full list (``{'shapes': [...]}``); dragging or
+    resizing an editable shape sends ``{'shapes[i].x0': …}`` keys.
+    """
+    if not relayout:
+        return None
+    if 'shapes' in relayout:
+        return [dict(sh) for sh in (relayout['shapes'] or [])]
+    out = [dict(sh) for sh in (shapes or [])]
+    changed = False
+    for key, val in relayout.items():
+        m = re.match(r'shapes\[(\d+)\]\.(\w+)$', str(key))
+        if m and int(m.group(1)) < len(out):
+            out[int(m.group(1))][m.group(2)] = val
+            changed = True
+    return out if changed else None
+
+
+def circle_shape(x_arcmin: float, y_arcmin: float, r_arcmin: float,
+                 color: str = '#22c55e') -> Dict[str, Any]:
+    """Editable Plotly circle shape centred on (ΔRA, ΔDec) [arcmin] of radius ``r``."""
+    x, y, r = float(x_arcmin), float(y_arcmin), abs(float(r_arcmin))
+    return dict(type='circle', xref='x', yref='y',
+                x0=x - r, x1=x + r, y0=y - r, y1=y + r,
+                line=dict(color=color, width=2), fillcolor='rgba(0,0,0,0)')
+
+
+def physical_radius_arcsec(radius_pc: float, distance_pc: float) -> float:
+    """Angular radius [arcsec] of a physical radius at ``distance_pc`` (KoSens ``_draw_pc_circles``)."""
+    if not (distance_pc and distance_pc > 0):
+        raise ValueError('distance must be > 0 pc')
+    return float(radius_pc) / float(distance_pc) * 206264.806
+
+
+def shape_summary(shape: Dict[str, Any]) -> str:
+    """Short CARTA-like text: type, centre and size in arcsec."""
+    kind = shape.get('type')
+    if kind in ('rect', 'circle'):
+        xc = 30.0 * (float(shape['x0']) + float(shape['x1']))
+        yc = 30.0 * (float(shape['y0']) + float(shape['y1']))
+        w = 60.0 * abs(float(shape['x1']) - float(shape['x0']))
+        h = 60.0 * abs(float(shape['y1']) - float(shape['y0']))
+        if kind == 'rect':
+            return f'box ({xc:.1f}″, {yc:.1f}″) {w:.1f}″×{h:.1f}″'
+        if abs(w - h) <= 1e-3 * max(w, h, 1e-9):
+            return f'circle ({xc:.1f}″, {yc:.1f}″) r = {w / 2:.1f}″'
+        return f'ellipse ({xc:.1f}″, {yc:.1f}″) {w / 2:.1f}″×{h / 2:.1f}″'
+    if kind == 'path':
+        v = _path_vertices(shape.get('path', ''))
+        return f'polygon ({len(v)} vertices)'
+    return str(kind)
 
 
 def extract_spectrum(cube: SpectralCube, rows: Sequence[int]

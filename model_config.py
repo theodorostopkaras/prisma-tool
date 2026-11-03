@@ -8,6 +8,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import grid_naming as gn
@@ -24,6 +25,10 @@ _GRID_PARAM_PATHS = (
     'physical_params.cr_att_coeff',
     'physical_params.stopping_rate_coeff',
     'physical_params.atten_mode_choice',
+    'physical_params.cr_attenuation_mode',
+    'physical_params.cr_attenuation_index',
+    'physical_params.cr_attenuation_n0',
+    'physical_params.cr_attenuation_model',
 )
 
 _SECTION_TITLES = {
@@ -74,6 +79,54 @@ def parse_model_folder_tokens(folder_name: str, n_params: int = 6) -> Optional[T
     if tokens is None or len(tokens) != n_params:
         return None
     return tokens
+
+
+def _split_line_comment(line: str) -> Tuple[str, str]:
+    """Split ``code // comment`` at the first ``//`` outside a JSON string."""
+    in_str = escaped = False
+    for i, ch in enumerate(line):
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == '\\':
+                escaped = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif line.startswith('//', i):
+            return line[:i].rstrip(), line[i + 2:].strip()
+    return line.rstrip(), ''
+
+
+_KEY_RE = re.compile(r'^\s*"([^"]+)"\s*:')
+
+
+def jsonc_to_json(text: str) -> str:
+    """Convert newer PDR configs with ``// comments`` to plain JSON.
+
+    A trailing comment after a scalar ``"key": value`` becomes a sibling
+    ``"key_comment"`` entry, matching the older comment-key config format.
+    """
+    out = []
+    for line in text.splitlines():
+        code, comment = _split_line_comment(line)
+        m = _KEY_RE.match(code)
+        if comment and m and not code.endswith(('{', '[')):
+            extra = f'"{m.group(1)}_comment": {json.dumps(comment)}'
+            code = f'{code[:-1]}, {extra},' if code.endswith(',') else f'{code}, {extra}'
+        out.append(code)
+    return '\n'.join(out)
+
+
+def load_config(path: str) -> dict:
+    """Load a PDR config: strict JSON, or the newer ``//``-commented format."""
+    with open(path, encoding='utf-8') as fh:
+        text = fh.read()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return json.loads(jsonc_to_json(text))
 
 
 def _list_signature(value: list) -> tuple:
@@ -294,8 +347,7 @@ def scan_model_configs(grid_directory: str) -> dict:
 
     for path in paths:
         try:
-            with open(path, encoding='utf-8') as fh:
-                data = json.load(fh)
+            data = load_config(path)
         except (OSError, json.JSONDecodeError):
             skipped += 1
             continue
@@ -309,9 +361,12 @@ def scan_model_configs(grid_directory: str) -> dict:
         for k, v in flat.items():
             if k.endswith('.__raw__'):
                 raw_lists.setdefault(path, {})[k] = v
-        if not labels:
-            comments = extract_comments(data)
-            labels = extract_comment_labels(data)
+        # Merge across files: mixed grids carry keys only newer configs have.
+        for key, text in extract_comments(data).items():
+            if key not in comments:
+                comments[key] = text
+                labels[key] = comment_label(text) or key
+        if not empty['config_comment']:
             empty['config_comment'] = str(data.get('config_comment', '')).strip()
 
     if not flats:
@@ -361,11 +416,14 @@ def scan_model_configs(grid_directory: str) -> dict:
         else:
             val = next(iter(unique))
             section = path_key.split('.')[0] if '.' in path_key else 'general'
+            value = format_config_value(val, raw_lists.get(values[0][0], {}), path_key)
+            if len(values) < len(flats):
+                value = f'{value} (only in {len(values)}/{len(flats)} models)'
             shared_by_section.setdefault(section, []).append(dict(
                 path=path_key,
                 label=field_label(path_key, labels, comments),
                 comment=resolve_field_comment(path_key, comments, element_ref),
-                value=format_config_value(val, raw_lists.get(ref_path, {}), path_key),
+                value=value,
             ))
 
     def _varying_sort(item):
@@ -429,24 +487,24 @@ def config_for_tokens(summary: dict, tokens: Optional[Tuple[int, ...]]) -> Optio
 
 
 _BULLET = {'margin': '4px 0', 'paddingLeft': '4px', 'lineHeight': '1.45'}
-_SECTION_HDR = {'fontSize': '15px', 'fontWeight': '700', 'color': '#1a1a2e',
-                'margin': '18px 0 8px', 'borderBottom': '1px solid #dde', 'paddingBottom': '4px'}
-_NOTE = {'fontSize': '12px', 'color': '#666', 'margin': '0 0 10px'}
-_CARD = {'padding': '12px 16px', 'backgroundColor': '#f8faf8', 'borderRadius': '8px',
-         'border': '1px solid #d8e8d8', 'marginBottom': '12px'}
+_SECTION_HDR = {'fontSize': '15px', 'fontWeight': '700', 'color': 'var(--text)',
+                'margin': '18px 0 8px', 'borderBottom': '1px solid var(--border)', 'paddingBottom': '4px'}
+_NOTE = {'fontSize': '12px', 'color': 'var(--text-muted)', 'margin': '0 0 10px'}
+_CARD = {'padding': '12px 16px', 'backgroundColor': 'var(--sunken)', 'borderRadius': '8px',
+         'border': '1px solid var(--border)', 'marginBottom': '12px'}
 _TABLE = {'width': '100%', 'borderCollapse': 'collapse', 'fontSize': '12px'}
-_TH = {'padding': '6px 10px', 'borderBottom': '2px solid #ccd', 'textAlign': 'left',
-       'backgroundColor': '#eef2ee', 'fontWeight': '600', 'fontSize': '11px'}
-_TD_IDX = {'padding': '4px 8px', 'borderBottom': '1px solid #e8ece8', 'color': '#666',
+_TH = {'padding': '6px 10px', 'borderBottom': '2px solid var(--border-strong)', 'textAlign': 'left',
+       'backgroundColor': 'var(--seg-bg)', 'fontWeight': '600', 'fontSize': '11px'}
+_TD_IDX = {'padding': '4px 8px', 'borderBottom': '1px solid var(--border)', 'color': 'var(--text-muted)',
            'textAlign': 'right', 'width': '36px', 'fontSize': '11px'}
-_TD_SP = {'padding': '4px 10px', 'borderBottom': '1px solid #e8ece8',
+_TD_SP = {'padding': '4px 10px', 'borderBottom': '1px solid var(--border)',
           'fontFamily': 'Consolas, monospace', 'fontSize': '12px', 'whiteSpace': 'nowrap'}
-_TD_VAL = {'padding': '4px 10px', 'borderBottom': '1px solid #e8ece8', 'fontSize': '12px',
+_TD_VAL = {'padding': '4px 10px', 'borderBottom': '1px solid var(--border)', 'fontSize': '12px',
            'verticalAlign': 'top'}
-_TD_LAB = {'padding': '4px 10px', 'borderBottom': '1px solid #e8ece8', 'fontSize': '12px',
+_TD_LAB = {'padding': '4px 10px', 'borderBottom': '1px solid var(--border)', 'fontSize': '12px',
            'fontWeight': '600', 'verticalAlign': 'top', 'whiteSpace': 'normal'}
-_TD_COMMENT = {'padding': '4px 10px', 'borderBottom': '1px solid #e8ece8', 'fontSize': '11px',
-               'color': '#555', 'lineHeight': '1.45', 'verticalAlign': 'top', 'whiteSpace': 'normal'}
+_TD_COMMENT = {'padding': '4px 10px', 'borderBottom': '1px solid var(--border)', 'fontSize': '11px',
+               'color': 'var(--text)', 'lineHeight': '1.45', 'verticalAlign': 'top', 'whiteSpace': 'normal'}
 
 
 def build_fields_table(rows: List[dict], value_header: str = 'Value'):
@@ -535,7 +593,7 @@ def build_species_section(species_info: dict):
         html.P(notes, style=_NOTE),
         html.Div(build_species_table(species), style={
             'maxHeight': '420px', 'overflowY': 'auto', 'overflowX': 'auto',
-            'border': '1px solid #e0e0e0', 'borderRadius': '6px',
+            'border': '1px solid var(--border)', 'borderRadius': '6px',
         }),
     ]
     variants = species_info.get('variants') or []
@@ -560,8 +618,8 @@ def build_species_section(species_info: dict):
                 html.Tbody(variant_rows),
             ], style=_TABLE),
         ]))
-    return html.Div(children, style={**_CARD, 'backgroundColor': '#faf8fc',
-                                       'borderColor': '#d8d0e8'})
+    return html.Div(children, style={**_CARD, 'backgroundColor': 'var(--sunken)',
+                                       'borderColor': 'var(--border)'})
 
 
 def build_model_setup_panel(summary: Optional[dict], tokens: Optional[Tuple[int, ...]] = None):
@@ -572,7 +630,7 @@ def build_model_setup_panel(summary: Optional[dict], tokens: Optional[Tuple[int,
 
     if summary.get('error'):
         return html.Div([
-            html.P(summary['error'], style={'color': '#a33', 'fontSize': '13px'}),
+            html.P(summary['error'], style={'color': '#ef4444', 'fontSize': '13px'}),
             html.P('Configs are expected at '
                    '``<grid_dir>/Models/Model.../config_files/pdr_config_....json``.',
                    style=_NOTE),
@@ -589,7 +647,7 @@ def build_model_setup_panel(summary: Optional[dict], tokens: Optional[Tuple[int,
         header_bits.append(html.P(summary['config_comment'], style=_NOTE))
     if summary.get('n_skipped'):
         header_bits.append(html.P(f'{summary["n_skipped"]} file(s) skipped (parse errors).',
-                                  style={'color': '#888', 'fontSize': '11px'}))
+                                  style={'color': 'var(--text-muted)', 'fontSize': '11px'}))
 
     children = [html.Div(header_bits, style=_CARD)]
 
@@ -613,7 +671,7 @@ def build_model_setup_panel(summary: Optional[dict], tokens: Optional[Tuple[int,
             html.H3(f'Current model: {folder}', style={**_SECTION_HDR, 'marginTop': '0'}),
             build_fields_table(grid_rows) if grid_rows else html.P(
                 'No grid parameters in config.', style=_NOTE),
-        ], style={**_CARD, 'backgroundColor': '#f0f4ff', 'borderColor': '#c5d0ef'}))
+        ], style={**_CARD, 'backgroundColor': 'var(--sunken)', 'borderColor': 'var(--border)'}))
 
     sp_block = build_species_section(summary.get('species_info') or {})
     if sp_block is not None:
@@ -669,7 +727,7 @@ def build_model_setup_panel(summary: Optional[dict], tokens: Optional[Tuple[int,
                          style={'fontWeight': '600', 'cursor': 'pointer',
                                 'padding': '6px 0', 'fontSize': '13px'}),
             html.Div(build_fields_table(rows), style={'marginTop': '8px'}),
-        ], style={'marginBottom': '8px', 'borderBottom': '1px solid #eee', 'paddingBottom': '6px'}))
+        ], style={'marginBottom': '8px', 'borderBottom': '1px solid var(--border)', 'paddingBottom': '6px'}))
 
     if shared_blocks:
         children.append(html.Div([

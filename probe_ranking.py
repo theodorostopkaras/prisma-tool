@@ -2091,3 +2091,152 @@ def format_phys(val):
     if val is None or not np.isfinite(val):
         return '—'
     return sci_plain(float(val))
+
+
+# --- CR vs FUV dominance (KoSens ``plot_cr_fuv_dominance_3d``) ---------------------
+
+def cr_fuv_dominance(grids, species, slice_values=(1e3, 1e5), *, dominance_ratio=3.0,
+                     flat_slope=0.0, min_abundance=DEFAULT_MIN_ABUNDANCE, upsample=150,
+                     baseline_dex=1.0, smooth=False):
+    """Is X driven by cosmic rays or by FUV across the (G0, ζ) plane?
+
+    Per density (linear in log n between the bracketing slices), log X(log G0, log ζ)
+    is linear between grid points (as ``atten_compare._log_intensity_slope``, so S and D
+    agree with the observer table; ``smooth`` only upsamples the mesh), S_χ and S_ζ are centred
+    differences over ±``baseline_dex``/2 (one-sided at the edges) and the CR dominance
+    is D = |S_ζ| / (|S_ζ| + |S_χ|).  ``faint`` marks X < ``min_abundance``; ``flat``
+    both |S| < ``flat_slope``.  Cubes are (n_ζ, n_χ, n_n) prisma-tool grids.
+
+    Returns ``(panels, rows)``: ``panels[(species, i_slice)]`` holds the mesh
+    (``log_f``, ``log_c``), ``log_x``, ``D``, ``faint``, ``flat``; ``rows`` the
+    KoSens summary (frac_cr / frac_fuv / frac_mixed, valid_frac, var/range of
+    log X, median |S_ζ|, |S_χ| and iso-contour slope) per (species, slice).
+    """
+    from scipy.interpolate import RectBivariateSpline
+
+    species = [s for s in ([species] if isinstance(species, str) else species) if s in grids]
+    if not species:
+        return {}, []
+    first = grids[species[0]]
+    log_c = np.log10(np.asarray(first['crir_values'], float)[:, 0, 0])
+    log_f = np.log10(np.asarray(first['fuv_values'], float)[0, :, 0])
+    log_s = np.log10(np.asarray(first['densities'], float)[0, 0, :])
+    if log_c.size < 2 or log_f.size < 2 or log_s.size < 1:
+        return {}, []
+    slices = []
+    for v in slice_values:
+        if log_s.size == 1:
+            slices.append((0, 0.0, 10.0 ** log_s[0]))
+            continue
+        k = int(np.clip(np.searchsorted(log_s, np.log10(v)) - 1, 0, log_s.size - 2))
+        w = float(np.clip((np.log10(v) - log_s[k]) / (log_s[k + 1] - log_s[k]), 0.0, 1.0))
+        slices.append((k, w, 10.0 ** ((1 - w) * log_s[k] + w * log_s[k + 1])))
+    kf = kc = 1
+    fine_f = np.linspace(log_f[0], log_f[-1], upsample)
+    fine_c = np.linspace(log_c[0], log_c[-1], upsample)
+    if not smooth:
+        fine_f, fine_c = (ax if ax.size <= 10 else
+                          np.arange(ax[0], ax[-1] + 1e-6, baseline_dex) for ax in (log_f, log_c))
+    h = 0.5 * baseline_dex
+    f_lo, f_hi = np.clip(fine_f - h, log_f[0], None), np.clip(fine_f + h, None, log_f[-1])
+    c_lo, c_hi = np.clip(fine_c - h, log_c[0], None), np.clip(fine_c + h, None, log_c[-1])
+    log_floor = np.log10(min_abundance) - 1.0 if min_abundance > 0 else -40.0
+
+    panels, rows = {}, []
+    for sp in species:
+        # (n_ζ, n_χ, n_n) -> (n_n, n_χ, n_ζ), as the toolkit's (s, f, c) order.
+        cube = np.transpose(np.asarray(grids[sp]['grid'], float), (2, 1, 0))
+        log_cube = np.log10(np.where(np.isfinite(cube) & (cube > 0), cube, 10.0 ** log_floor))
+        for i, (k, w, n_val) in enumerate(slices):
+            hi_k = min(k + 1, log_cube.shape[0] - 1)
+            log_x = (1 - w) * log_cube[k] + w * log_cube[hi_k]
+            spl = RectBivariateSpline(log_f, log_c, log_x, kx=kf, ky=kc, s=0)
+            val = spl(fine_f, fine_c)
+            s_chi_s = (spl(f_hi, fine_c) - spl(f_lo, fine_c)) / (f_hi - f_lo)[:, None]
+            s_zeta_s = (spl(fine_f, c_hi) - spl(fine_f, c_lo)) / (c_hi - c_lo)[None, :]
+            s_chi, s_zeta = np.abs(s_chi_s), np.abs(s_zeta_s)
+            with np.errstate(invalid='ignore', divide='ignore'):
+                dom = s_zeta / (s_zeta + s_chi)
+                iso = -s_chi_s / s_zeta_s
+            faint = (val < np.log10(min_abundance) if min_abundance > 0
+                     else np.zeros_like(val, bool))
+            flat = ~faint & (np.fmax(s_zeta, s_chi) < flat_slope)
+            valid = ~(faint | flat) & np.isfinite(dom)
+            n_ok = max(int(valid.sum()), 1)
+            cr = valid & (s_zeta > dominance_ratio * s_chi)
+            fuv = valid & (s_chi > dominance_ratio * s_zeta)
+            panels[(sp, i)] = dict(log_f=fine_f, log_c=fine_c, log_x=val, D=dom,
+                                   faint=faint, flat=flat, n=n_val)
+            obs = val[~faint]
+            rows.append({
+                'species': sp, 'slice': n_val, 'valid_frac': float(valid.mean()),
+                'var_log_X': float(np.var(obs)) if obs.size else np.nan,
+                'range_log_X': float(np.ptp(obs)) if obs.size else np.nan,
+                'frac_cr': cr.sum() / n_ok, 'frac_fuv': fuv.sum() / n_ok,
+                'frac_mixed': (valid & ~cr & ~fuv).sum() / n_ok,
+                'median_abs_S_zeta': float(np.nanmedian(np.where(valid, s_zeta, np.nan)))
+                if valid.any() else np.nan,
+                'median_abs_S_chi': float(np.nanmedian(np.where(valid, s_chi, np.nan)))
+                if valid.any() else np.nan,
+                'median_iso_slope': float(np.nanmedian(np.where(valid & np.isfinite(iso),
+                                                                 iso, np.nan)))
+                if (valid & np.isfinite(iso)).any() else np.nan,
+            })
+    return panels, rows
+
+
+def fig_cr_fuv_dominance(panels, species, n_slices, *, n_contours=8, theme_colors=None,
+                         fmt=None):
+    """Rows = density slices, columns = species; colour D (PuOr_r), black iso-X lines.
+
+    Faint (X < min abundance) and flat cells are greyed out instead of hatched
+    (Plotly heatmaps have no hatching).
+    """
+    t = theme_colors or {}
+    fmt = fmt or str
+    species = [s for s in species if (s, 0) in panels]
+    if not species:
+        return None
+    titles = [fmt(s) for s in species] + [''] * (len(species) * (n_slices - 1))
+    fig = make_subplots(rows=n_slices, cols=len(species), shared_xaxes=True,
+                        shared_yaxes=True, subplot_titles=titles,
+                        horizontal_spacing=0.03, vertical_spacing=0.06)
+    for i in range(n_slices):
+        for j, sp in enumerate(species):
+            p = panels.get((sp, i))
+            if p is None:
+                continue
+            x, y = p['log_f'], p['log_c']
+            masked = p['faint'] | p['flat']
+            fig.add_trace(go.Heatmap(
+                x=x, y=y, z=np.where(masked, np.nan, p['D']).T, zmin=0, zmax=1,
+                colorscale='PuOr_r', showscale=(i == 0 and j == 0),
+                colorbar=dict(title=dict(text='D = |S<sub>ζ</sub>| / (|S<sub>ζ</sub>| + '
+                                              '|S<sub>χ</sub>|)', side='right'),
+                              tickvals=np.linspace(0, 1, 6)),
+                hovertemplate='log χ₀ = %{x:.2f}<br>log ζ = %{y:.2f}<br>D = %{z:.2f}'
+                              '<extra></extra>'), row=i + 1, col=j + 1)
+            if masked.any():
+                fig.add_trace(go.Heatmap(
+                    x=x, y=y, z=np.where(p['faint'], 1.0, np.where(p['flat'], 0.5, np.nan)).T,
+                    zmin=0, zmax=1, showscale=False, hoverinfo='skip',
+                    colorscale=[[0, 'rgba(160,160,160,0.35)'], [1, 'rgba(110,110,110,0.55)']]),
+                    row=i + 1, col=j + 1)
+            fig.add_trace(go.Contour(
+                x=x, y=y, z=p['log_x'].T, ncontours=n_contours, showscale=False,
+                contours=dict(coloring='none', showlabels=True,
+                              labelfont=dict(size=9, color='black')),
+                line=dict(color='black', width=0.8), hoverinfo='skip'),
+                row=i + 1, col=j + 1)
+            if j == 0:
+                fig.update_yaxes(title_text=f'log ζ (n = {p["n"]:.0e})', row=i + 1, col=1)
+            if i == n_slices - 1:
+                fig.update_xaxes(title_text='log χ₀ [Draine]', row=i + 1, col=j + 1)
+    fig.update_layout(
+        height=max(320, 300 * n_slices + 80), paper_bgcolor=t.get('paper_bg', 'white'),
+        plot_bgcolor=t.get('plot_bg', 'white'), font=dict(color=t.get('font', '#222')),
+        margin=dict(l=70, r=40, t=60, b=60),
+        title=dict(text='CR vs FUV dominance · black: iso-log X · grey: X below the '
+                        'abundance floor (dark) or flat', x=0.01, xanchor='left',
+                   font=dict(size=14)))
+    return fig

@@ -47,3 +47,28 @@ def test_transitions_never_cross_species():
         assert combos == [('CO', 0), ('HCN', 2)]
     finally:
         ap._simline = saved
+
+
+def test_read_field_falls_back_to_zeta_local(tmp_path):
+    # KoSens fd03c61: newer KOSMA-τ stores ζ(r) as ``zeta_local`` (no ``cosray`` column).
+    import h5py
+    path = tmp_path / 'm.hdf5'
+    with h5py.File(path, 'w') as hf:
+        hf['Aux/CR'] = np.array([[1e-16], [5e-17]])
+    fmap = {'zeta_local': ('Aux/CR', 0)}
+    with h5py.File(path, 'r') as hf:
+        np.testing.assert_allclose(ap._read_field(hf, ap.KEY_COSRAY, fmap), [1e-16, 5e-17])
+        assert ap._read_field(hf, ap.KEY_COSRAY, {'cosray': ('Aux/CR', 3)}) is None
+
+
+def test_rate_regime_flip_colours():
+    # Γ_CR < Γ_PE everywhere with constant ζ; the attenuated grid flips one cell.
+    n, z = np.repeat([3.0, 4.0], 2), np.tile([-17.0, -16.0], 2)
+    const = dict(n=n, crir=z, heat={'Cosmic rays': np.ones(4), 'Photo-electric effect': np.full(4, 2.0)})
+    att = dict(n=n, crir=z, heat={'Cosmic rays': np.array([3.0, 1, 1, 1]),
+                                  'Photo-electric effect': np.full(4, 2.0)})
+    fig = ap.fig_rate_regime_boundary(const, 'Cosmic rays', 'Photo-electric effect',
+                                      data_atten=att, x_lim=(-17, -17))
+    z_reg = np.asarray(fig.data[0].z, float)
+    assert z_reg[0, 0] == 2 and (z_reg.ravel()[1:] == 0).all()   # orange: PE → CR
+    np.testing.assert_allclose(fig.layout.xaxis.range, [-17.5, -16.5])

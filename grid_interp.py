@@ -149,7 +149,7 @@ def _griddata_resample_2d(
     n_valid = int(np.count_nonzero(valid))
     if n_valid < 4 and method in ('cubic', 'spline'):
         method = 'linear'
-    if n_valid < 3 and method == 'linear':
+    if n_valid < 4 and method == 'linear':
         method = 'nearest'
 
     if method == 'spline' and ny >= 2 and nx >= 2 and n_valid == flat.size:
@@ -165,9 +165,12 @@ def _griddata_resample_2d(
         except Exception:
             method = 'linear'
 
-    resampled = griddata(
-        points[valid], flat[valid], xi, method=method, fill_value=np.nan,
-    ).reshape(ty, tx).astype(np.float64)
+    try:
+        resampled = griddata(
+            points[valid], flat[valid], xi, method=method, fill_value=np.nan,
+        ).reshape(ty, tx).astype(np.float64)
+    except Exception:  # degenerate (e.g. collinear) valid nodes: Qhull fails
+        resampled = np.full((ty, tx), np.nan, dtype=np.float64)
     if np.any(np.isnan(resampled)):
         resampled = griddata(
             points[valid], flat[valid], xi, method='nearest',
@@ -406,9 +409,18 @@ def resample_grid_3d_kosens(
     y_target = np.linspace(0.0, 1.0, ny) if ny > 1 else np.array([0.0])
     x_target = np.linspace(0.0, 1.0, nx) if nx > 1 else np.array([0.0])
 
+    # Values interpolate in log10 along z as well (KoSens ``process_grids_3d``):
+    # linear in X lets the larger neighbour dominate and biased steep species
+    # by up to several dex between z nodes.
+    if log_values:
+        positive = grid > 0
+        min_pos = float(np.nanmin(grid[positive])) if positive.any() else 1e-30
+        values = np.log10(np.maximum(grid, min_pos))
+    else:
+        values = grid
     rgi = RegularGridInterpolator(
         (log_z_orig, y_coords, x_coords),
-        grid,
+        values,
         method='linear',
         bounds_error=False,
         fill_value=None,
@@ -416,6 +428,8 @@ def resample_grid_3d_kosens(
     Z_new, Y_new, X_new = np.meshgrid(log_z_new, y_target, x_target, indexing='ij')
     points = np.stack([Z_new.ravel(), Y_new.ravel(), X_new.ravel()], axis=-1)
     grid_out = rgi(points).reshape(tz, ny, nx)
+    if log_values:
+        grid_out = 10.0 ** grid_out
     return grid_out, final_x, final_y, final_z
 
 

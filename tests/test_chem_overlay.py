@@ -80,3 +80,11 @@ if __name__ == '__main__':
     test_overlay_map_not_same_as_primary()
     test_chem_only_shows_axis_controls()
     print('all tests passed')
+
+
+def test_reaction_label_restores_truncated_product_charge():
+    # KOSMA-τ metadata drops the last product's '+'; balanced labels stay as they are.
+    assert ap._reaction_label('Formation rate H3+ | HEH+ + H2 > HE + H3') == 'HEH+ + H2 → HE + H3+'
+    assert ap._reaction_label('Destruction rate HNC | H+ + HNC > HCN + H') == 'H+ + HNC → HCN + H+'
+    assert ap._reaction_label('Formation rate H2+ | H2 + CRP > H2+ + e-') == 'H2 + CRP → H2+ + e-'
+    assert ap._reaction_label('Formation rate CO | HCO+ + e- > CO + H') == 'HCO+ + e- → CO + H'

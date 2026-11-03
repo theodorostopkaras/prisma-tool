@@ -340,6 +340,7 @@ def run_map_fit(
     create_uncertainty_maps: bool = False,
     plot_contours: bool = False,
     axis_config: Optional[dict] = None,
+    output_prefix: str = 'fitted',
 ) -> dict:
     """Run ``fit_fits_maps_to_grids_3d`` and return the results dict."""
     os.makedirs(output_dir, exist_ok=True)
@@ -368,7 +369,7 @@ def run_map_fit(
         set_mass_name=axis_cfg['set_mass_name'],
         target_units=target_units,
         output_dir=output_dir,
-        output_prefix='fitted',
+        output_prefix=output_prefix,
         create_plots=False,
         fig_dir_PATH=False,
         or_PATH=False,
@@ -386,6 +387,21 @@ def run_map_fit(
     )
     result['fit_axis_config'] = axis_cfg
     return result
+
+
+def attenuation_shift_map(z_const, z_atten):
+    """ε_att = log10(z_atten / z_const) per pixel (KoSens ``atten_shift_map``)."""
+    z_const = np.asarray(z_const, dtype=float)
+    z_atten = np.asarray(z_atten, dtype=float)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        return np.where((z_const > 0) & (z_atten > 0), np.log10(z_atten / z_const), np.nan)
+
+
+def write_map_fits(path: str, data, header=None) -> str:
+    """Write a 2-D map with the observed map's header (WCS) to ``path``."""
+    hdr = header.copy() if header is not None else None
+    fits.PrimaryHDU(np.asarray(data, dtype=np.float32), header=hdr).writeto(path, overwrite=True)
+    return path
 
 
 def read_fits_header(fits_path: str):
@@ -517,11 +533,11 @@ _FIT_THEMES = {
         font='#333333',
     ),
     'dark': dict(
-        paper_bg='#1a1a2e',
-        plot_bg='#16213e',
-        grid='#2a3a5c',
-        title='#e8eaf0',
-        font='#e0e0e0',
+        paper_bg='#18181B',
+        plot_bg='#141416',
+        grid='#27272A',
+        title='#FAFAFA',
+        font='#E4E4E7',
     ),
 }
 
@@ -546,8 +562,15 @@ def fig_fits_map(
     colorscale: str = 'Viridis',
     colorbar_title: str = '',
     theme: str = 'light',
+    zmin: Optional[float] = None,
+    zmax: Optional[float] = None,
+    overlay: Optional[dict] = None,
 ) -> Any:
-    """Plotly heatmap for a 2-D parameter or diagnostic map."""
+    """Plotly heatmap for a 2-D parameter or diagnostic map.
+
+    ``overlay`` = ``{'distance_pc', 'radii_pc', 'color', 'scale_pc'}`` draws physical
+    circles at the image centre and a scale bar (KoSens ``_draw_pc_circles``).
+    """
     import plotly.graph_objects as go
 
     arr = np.asarray(data, dtype=float)
@@ -587,7 +610,10 @@ def fig_fits_map(
             outlinewidth=0,
         ),
         hovertemplate=hover,
+        **({'zmin': zmin, 'zmax': zmax} if zmin is not None and zmax is not None else {}),
     ))
+    if overlay:
+        _add_physical_overlay(fig, overlay, wcs, x_coords, y_coords, header)
     plot_height = int(max(520, min(780, 420 * sky_ratio)))
     t = _fit_theme_colors(theme)
     fig.update_layout(
@@ -614,6 +640,46 @@ def fig_fits_map(
         ),
     )
     return fig
+
+
+def _add_physical_overlay(fig, overlay, wcs, x_coords, y_coords, header):
+    """Circles of physical radius at the map centre + a scale bar (data coordinates)."""
+    dist = float(overlay.get('distance_pc') or 0)
+    if dist <= 0 or len(x_coords) < 2 or len(y_coords) < 2:
+        return
+    xc, yc = 0.5 * (x_coords[0] + x_coords[-1]), 0.5 * (y_coords[0] + y_coords[-1])
+    if wcs is not None:
+        # Axes are RA/Dec degrees: a sky circle is wider in RA by 1/cos(Dec).
+        per_deg_y = 1.0
+        per_deg_x = 1.0 / max(abs(np.cos(np.deg2rad(yc))), 0.05)
+        to_axis = 1.0 / 3600.0
+    else:
+        scale = abs(float((header or {}).get('CDELT2', 0) or 0)) * 3600.0
+        if scale <= 0:
+            return  # no pixel scale: cannot place a physical size
+        per_deg_x = per_deg_y = 1.0
+        to_axis = 1.0 / scale
+    color = overlay.get('color') or 'red'
+    for r_pc in overlay.get('radii_pc') or []:
+        r = float(r_pc) / dist * 206264.806 * to_axis
+        fig.add_shape(type='circle', xref='x', yref='y',
+                      x0=xc - r * per_deg_x, x1=xc + r * per_deg_x,
+                      y0=yc - r * per_deg_y, y1=yc + r * per_deg_y,
+                      line=dict(color=color, width=1.5))
+        fig.add_annotation(x=xc + r * per_deg_x, y=yc, text=f'{float(r_pc):g} pc',
+                           showarrow=False, font=dict(color=color, size=11),
+                           xanchor='left')
+    bar_pc = float(overlay.get('scale_pc') or 0)
+    if bar_pc > 0:
+        L = bar_pc / dist * 206264.806 * to_axis * per_deg_x
+        x_lo, x_hi = sorted((x_coords[0], x_coords[-1]))
+        y_lo, y_hi = sorted((y_coords[0], y_coords[-1]))
+        x0 = x_lo + 0.06 * (x_hi - x_lo)
+        y0 = y_lo + 0.06 * (y_hi - y_lo)
+        fig.add_shape(type='line', xref='x', yref='y', x0=x0, x1=x0 + L, y0=y0, y1=y0,
+                      line=dict(color=color, width=3))
+        fig.add_annotation(x=x0 + L / 2, y=y0, text=f'{bar_pc:g} pc', showarrow=False,
+                           yshift=10, font=dict(color=color, size=11))
 
 
 def fig_chi2_dominant_map(
@@ -1084,8 +1150,8 @@ def fig_fitted_params_kde(result: dict, *, theme: str = 'light') -> Any:
         vals = np.asarray(param_map, dtype=float).ravel()
         vals = vals[np.isfinite(vals)]
         vals = vals[vals > 0]
-        if vals.size < 2:
-            continue
+        if vals.size < 2 or np.ptp(vals) == 0:
+            continue  # constant map (e.g. every pixel at a grid edge): KDE is singular
         plot_vals = np.log10(vals)
         label = axis_cfg.get(name_key, title)
         inner = label.strip('$') if label.startswith('$') and label.endswith('$') else label
@@ -1388,7 +1454,8 @@ def chi2_analysis_figures(
 
 
 def fit_result_figures(result: dict, fits_header=None, *,
-                       theme='light', colorscale='Viridis') -> Dict[str, Any]:
+                       theme='light', colorscale='Viridis',
+                       overlay: Optional[dict] = None) -> Dict[str, Any]:
     """Build Plotly figures for fitted x/y/z parameter maps."""
     if not result:
         return {}
@@ -1400,21 +1467,21 @@ def fit_result_figures(result: dict, fits_header=None, *,
             axis_cfg.get('x_map_title', 'Best-fit x parameter'),
             header=header, zscale='log',
             colorbar_title=axis_cfg.get('x_colorbar', ''),
-            theme=theme, colorscale=colorscale,
+            theme=theme, colorscale=colorscale, overlay=overlay,
         ),
         'y': fig_fits_map(
             result['y_param_map'],
             axis_cfg.get('y_map_title', 'Best-fit y parameter'),
             header=header, zscale='log',
             colorbar_title=axis_cfg.get('y_colorbar', ''),
-            theme=theme, colorscale=colorscale,
+            theme=theme, colorscale=colorscale, overlay=overlay,
         ),
         'z': fig_fits_map(
             result['z_param_map'],
             axis_cfg.get('z_map_title', 'Best-fit z parameter'),
             header=header, zscale='log',
             colorbar_title=axis_cfg.get('z_colorbar', ''),
-            theme=theme, colorscale=colorscale,
+            theme=theme, colorscale=colorscale, overlay=overlay,
         ),
     }
     chi2_red = result.get('chi2_reduced_map')
@@ -1423,7 +1490,7 @@ def fit_result_figures(result: dict, fits_header=None, *,
             chi2_red, 'Reduced χ² per pixel',
             header=header, zscale='linear', colorscale=colorscale,
             colorbar_title='χ²<sub>ν</sub>',
-            theme=theme,
+            theme=theme, overlay=overlay,
         )
     dom_map = result.get('chi2_dominant_index_map')
     dom_species = result.get('chi2_dominant_species')
@@ -1433,6 +1500,16 @@ def fit_result_figures(result: dict, fits_header=None, *,
         )
         if dom_fig is not None:
             figs['chi2_dominant'] = dom_fig
+    shift = result.get('atten_shift_map')
+    if shift is not None and np.any(np.isfinite(shift)):
+        lim = float(np.nanmax(np.abs(shift))) or 0.1
+        figs['delta_att'] = fig_fits_map(
+            shift, 'ε<sub>att</sub> = log<sub>10</sub>(z<sub>atten</sub> / z<sub>const</sub>) '
+                   '— fit with attenuated vs constant-CR grids',
+            header=header, zscale='linear', colorscale='RdBu_r',
+            colorbar_title='ε<sub>att</sub> [dex]', theme=theme,
+            zmin=-lim, zmax=lim, overlay=overlay,
+        )
     kde_fig = fig_fitted_params_kde(result, theme=theme)
     if kde_fig is not None:
         figs['kde'] = kde_fig

@@ -105,8 +105,8 @@ cell by cell and returns a long frame, **one row per `(species, iy, ix)`**:
 | `species`, `iy`, `ix` | identity and grid indices |
 | `x`, `y`, `x_name`, `y_name` | physical coordinates (ζ_H, G_0) |
 | `value_ref`, `value_atten` | the two intensities in that cell |
-| `shift_dex`, `abs_shift_dex` | Δ, the horizontal match shift (NaN where no match) |
-| `slope_dex` | S, the local CR sensitivity of the **reference** grid |
+| `shift_dex`, `abs_shift_dex` | Δ, the horizontal match shift (0 where no match, NaN only where there is no model) |
+| `slope_dex` | S, the local CR sensitivity of the **reference** grid (diagnostic only, never used as a filter) |
 
 **Every figure in the workflow is a reduction of this one table.** That is why the two
 plot functions can be joined on `species` in stage 7 with no risk of inconsistent inputs.
@@ -176,8 +176,13 @@ horizontal displacement — or none reproduces it at all and the match fails. **
 blows up not because cosmic rays matter more there, but because the species has stopped
 responding to them.**
 
-Hence every median over shifts is gated on `|S| >= min_slope_dex` (default 0.1, i.e.
-intensity moving by less than ~26% per decade of CRIR is discarded).
+**No gate on S is applied.** Every cell with a model enters every median, small shifts and
+flat-row cells included; cells below the detection limit enter at 0 (§3.5).
+The price is a bias in the 2D whole-grid numbers: a species that shifts a little over
+most of the map outranks one that is strongly sensitive in a single CRIR band, because
+the median of the latter is pulled down by the inert part of its rows. The per-ζ regime
+verdicts (§7.1) and the 3D per-box verdicts grade each CRIR band separately and remove
+that bias, so no filtering is needed to protect them.
 
 The relation is a local linearisation and is **never used to compute anything**: Δ always
 comes from the real match search, so it stays correct where rows are curved.
@@ -197,8 +202,32 @@ all**, because the two curves differ by something this construction does not mod
 vertical offset, or a displacement along `G_0`. Attributing that to a cosmic-ray
 inference error would be wrong.
 
-The cases cannot be separated from the shift alone. That is why stage 5 gates on *how
-many* of a species' cells are affected rather than trusting any single cell.
+The cases cannot be separated from the shift alone. **The choice made here: a no-match
+cell is read as "no shift" (Δ = 0)**, neither as missing data nor as a lower bound on a
+larger shift. `collect_attenuation_x_shift_table` writes 0 into every cell that has a
+model in both grids but no match; only cells with no model at all (non-finite intensity,
+non-positive x) stay NaN. A no-match cell therefore pulls every median towards zero
+rather than up, and a species whose attenuation is not reproducible by any horizontal
+displacement is graded as barely shifted, not as badly biased.
+
+Where case (1) holds, the true shift is larger than 0, so every median built this way is a
+**conservative** (low) estimate of the ζ error, never an imputed one. This bites most in
+the high-ζ part of the grid, where there is little room left to shift into.
+
+**Unobservable cells follow the same rule.** A cell where a line behind the key is below
+`obs_limit` (100 mK, intensity grids only) shows no change anyone could measure, so it
+enters at **Δ = 0 and R = 0** (`_zero_unobservable_shifts`, applied inside both ranking
+functions; the `pixels` table keeps the raw shift and the `observable` flag).
+
+Consequences that run through the rest of this document:
+
+- **Every species is summarised over the same cells with the same rule, and no species is
+  excluded.** There are no sample cuts on unmatched, censored, shifted or observable
+  fractions. A species detectable over a small part of the grid ranks low instead of
+  ranking on that part alone; `frac_observable` is reported next to it.
+- The only thresholds left are labels on the continuous numbers (`response_floor_dex`,
+  `min_error_dex`, the `swing < |R|` diagonal, §7) and display choices (`max_species`,
+  `max_per_constituent`, `min_abs_response_dex = 0`).
 
 ---
 
@@ -224,52 +253,29 @@ given species shifts. Everything after this reduces that spatial detail down to 
 
 ---
 
-## 5. Stage 4 — Step 1, breadth: *which* species move, and *where* (notebook §5)
+## 5. Stage 4 — *which* species move, and *where* (notebook §5)
 
 ```python
 shift_overview = GRf.plot_attenuation_shift_summary(
     my_grids_a0, my_grids_a1,
     x_shift_scan_direction="rightward", x_shift_match_rtol=0.02,
-    min_abs_shift_dex=0.1, shift_abs_edges=(0.1, 0.3, 0.5, 1.0),
-    max_frac_unmatched=0.5,
+    shift_abs_edges=(0.1, 0.3, 0.5, 1.0), obs_limit=GRf.OBS_INTENSITY_LIMIT,
     n_x_bins=4, n_y_bins=4, n_top_models=8,
     n_top_summary_species=12, summary_only=True,
 )
 ```
 
-Ranks species by `n_affected = n_shifted + n_unmatched` — **an unmatched cell counts as
-evidence that the species moved**. That is defensible for this question: *"did it move"*
-is well posed everywhere, even where the *size* of the move is not. Counts deliberately
-ignore the `min_slope_dex` gate for the same reason; medians and the top-model lists
-apply it.
-
-> **Consequence that drives the whole reconciliation:** this ranking is about **breadth,
-> not magnitude**, and it *rewards* unmatched cells. The next stage treats those same
-> cells as evidence of ignorance.
-
-### The ceiling on that reward: `max_frac_unmatched`
-
-Rewarding unmatched cells is defensible while they are a **minority**. A species whose
-grid is mostly unmatched has moved almost everywhere and been measured almost nowhere:
-its median rests on the matched leftovers, and — for the same reason as §3.5 — a no-match
-cell can mean the two curves differ by something *no horizontal x-shift reproduces* (a
-vertical offset, a displacement along `y`) rather than a large CR shift. Topping this
-ranking on such cells is therefore not evidence that cosmic rays moved the species.
-
-Species with `frac_unmatched > max_frac_unmatched` (default 0.5) are excluded from the
-rankings, all five figures and the winner map, and returned with `ranked = False`. This
-is the deliberate twin of `max_frac_censored` in stage 5: **the two functions now rank
-the same pool of species**, so a name at the top of one is a name the other has also
-seen fit to measure.
-
-Set `max_frac_unmatched=1.0` to restore the ungated behaviour.
+Every statistic is taken over **every cell with a model**, the same for every species:
+counts, medians, heatmaps and the top-model lists all use that set, with unmatched and
+unobservable cells entering as Δ = 0 (§3.5). Species are ranked by `median_abs_shift_dex`
+— one number, computed identically for all of them. No species is dropped.
 
 ### Figures
 
 | # | content |
 |---|---|
-| 1 | left: stacked bar of models per \|Δ\| dex bin (lowest bin omitted, grey = unmatched); every species has the same model count, marked by the dotted "all models" line, so the gap above a bar is the models that did **not** move; right: median \|Δ\| per species among matched cells |
-| 2 | heatmaps of median \|Δ\| over log-spaced x and y bins — only slope-gated cells contribute, so a bin can be blank where the reference grid is flat in x |
+| 1 | left: stacked bar of models per \|Δ\| dex bin (lowest bin omitted; unmatched and unobservable cells sit in it at 0); every species has the same model count, marked by the dotted "all models" line, so the gap above a bar is the models that did **not** move; right: median \|Δ\| per species over all cells |
+| 2 | heatmaps of median \|Δ\| over log-spaced x and y bins — every cell contributes, unmatched and unobservable ones as 0. This is the number to compare with the triple plot's shift panel, read with blank (no-match) and hatched (unobservable) pixels as 0 |
 | 3 | **winner map** — in each `(x, y)` regime, the species with the largest median \|Δ\|. Read as *"under these initial conditions, follow up this species."* Return here at the end |
 | 4–5 | figures 1 and 2 repeated for the top `n_top_summary_species` only |
 
@@ -278,16 +284,13 @@ Set `max_frac_unmatched=1.0` to restore the ungated behaviour.
 `pixels`, `species_summary`, `top_models`, `top_overall`, `regime_median`,
 `regime_winners`.
 
-`species_summary` carries `n_valid` (matched cells), `n_unmatched`, `n_trusted`,
-`frac_shifted`, `frac_unmatched`, `median_abs_shift_dex`, and `ranked` (False for species
-held back by `max_frac_unmatched`). Gated species stay in this table on purpose —
-`reconcile_attenuation_species` needs the row to grade them `unmeasurable` rather than
-`no data` — but appear in no figure, in `top_models`, or in `regime_median` /
-`regime_winners`.
+`species_summary` carries `n_cells`, `n_valid` (cells with a model), `frac_observable`
+(reported, not a cut) and the mean / median / std / max of \|Δ\|, sorted by
+`median_abs_shift_dex`. Every species appears in every figure and table.
 
 ---
 
-## 6. Stage 5 — Steps 2–4: magnitude, honesty, attribution (notebook §6)
+## 6. Stage 5 — magnitude and attribution (notebook §6)
 
 ```python
 divergence = GRf.plot_attenuation_fuv_response(shift_overview["pixels"])
@@ -296,67 +299,50 @@ divergence = GRf.plot_attenuation_fuv_response(shift_overview["pixels"])
 Reads the **same pixels table** — nothing is recomputed, so the two figures are directly
 comparable and joinable. Two panels, ranked **independently**.
 
-### Left panel — Step 4: how wrong is ζ?
+### Left panel — how wrong is ζ?
 
-Per species, each cell contributes its `|Δ|` if it passes the slope gate and a match was
-found. A trusted cell with **no** match is not dropped: it enters at its lower bound
-`log10(x_row_max / x_nom)`, because dropping it would delete precisely the
-worst-determined models from a ranking of worst-determined models.
+Per species, every cell with a model contributes its `|Δ|`, unmatched and unobservable
+cells as 0 (§3.5). No slope gate is applied, so `error_dex` is the median over the same
+cells as the summary's `median_abs_shift_dex` — the two are the same number.
 
 - bar = median of that array
 - band = p10–p90 across the grid — a *spread over cells*, not an uncertainty on
   the median (drawn capless for that reason: a capped error bar reads as "this
   median is poorly known", and it is not)
-- bar colour = fraction of contributing cells that are lower limits
-- `>` in the printout marks a median that is itself a bound; on the figure
-  that is the ▶ at the band's end (no numbers are drawn — the bar and band
-  ends already carry them)
-- ▶ at the band's right end marks the same for p90: censored cells enter below
-  their true value, so every percentile of that species is a lower limit
+- bar colour = `frac_observable`, the fraction of cells above the detection limit (the
+  rest entered at 0)
 
-### Step 2 — is the number measured or imputed?
+### Right panel — is it cosmic rays, or is it FUV?
 
-Because a no-match cell is ambiguous (§3.5), imputing one is only defensible while such
-cells are a **minority**. Past `frac_censored = 0.5` the median itself falls on an imputed
-bound rather than a measured shift, and the species is no longer being measured at all.
-
-Species above `max_frac_censored` are excluded from the ranking and both panels, returned
-with `ranked = False`.
-
-> Without this gate the ranking **inverts**: the less measurable a species is, the more
-> censored cells it has, the higher its imputed bound, and the higher it ranks.
-
-### Right panel — Step 3: is it cosmic rays, or is it FUV?
-
-Both axes are reductions of the R field, and the reduction is **two-stage, along ζ
-first**. Each grid row is one CR experiment at fixed `G_0`, so each row collapses to its
+Both axes are reductions of the R field (unobservable cells at R = 0), and the reduction
+is **two-stage, along ζ first**. Each grid row is one CR experiment at fixed `G_0`, so each row collapses to its
 median R. That gives one robust number per FUV value, and the FUV question becomes
 whether that number stays flat as `G_0` moves.
 
 | axis | quantity | meaning |
 |---|---|---|
 | x | `abs_response_dex` | \|median over rows of the per-row median R\| — how large the attenuation effect typically is |
-| y | `fuv_swing_dex` | p90 − p10 of the per-row medians — how much that effect depends on where in the radiation field you sit |
+| y | `fuv_swing_dex` | spread of the per-row medians, max − min over every row (nothing trimmed: the grid is a complete enumeration). In 3D the verdict uses its G₀ part `g0_swing_dex`; in 2D the two are equal — how much that effect depends on where in the radiation field you sit |
 
 Marker size = the inference error `|Δ|`; colour = species identity (legend).
 
 Two dividers, neither arbitrary:
 
-- **Diagonal `y = x`** is `probe_margin = 0`, the very quantity the panel is ranked by.
-  *Below it* the attenuation response exceeds the response's own spread across `G_0`, so
-  the line is **reporting cosmic rays**. *Above it* the species moves more with the
-  radiation field than attenuation ever moves it — an **FUV tracer**, not a CR one.
+- **Diagonal `y = x`** is `swing = |R|`. *Below it* the attenuation response exceeds its
+  own spread across `G_0`: a **CR-dominated response**. *Above it* `G_0` moves the response
+  more than attenuation does: an **G0-modulated response**. This describes the response
+  to attenuation — it does not make the species an FUV tracer.
 - **Vertical line at `response_floor_dex`** asks the prior question: is there any response
   at all? Left of it the species barely moves, so which side of the diagonal it falls on
   is noise.
 
-```
-probe_margin = |R| − fuv_swing_dex
-```
+`|R|` and the swing are kept as **two separate numbers** — no combined score. A single
+`|R| − swing` value (the former `probe_margin`) hid which of the two drove it. The
+returned table carries `cr_dominated = fuv_swing_dex < abs_response_dex` for the side of
+the diagonal.
 
-Deliberately a **difference, not a ratio**: both terms are already in dex, so no epsilon
-is needed and nothing blows up as the swing approaches zero. It reads as *the response
-that survives the worst of the species' own FUV variability*.
+A third figure plots the per-row median R against `G_0` for the same species and colours:
+the profile the swing summarises (swing = its extent, `fuv_trend` = its slope).
 
 ### Why the two panels rank independently
 
@@ -364,99 +350,98 @@ Since `|Δ| ≈ R / S`, the ideal CRIR probe — a large response on a **steep**
 **small** inference error. Ranking the right panel by `error_dex` would sort exactly the
 best probes to the bottom and truncate them away before they could be drawn.
 
-So: left panel takes the largest `error_dex`, right panel the largest `probe_margin`,
-from the same gated pool. The two sets overlap but are not the same; the returned table
-flags each with `ranked` and `probe_ranked`.
+So: left panel takes the largest `error_dex`, the probe and profile panels the largest `|R|`,
+from the same pool of every species. The two sets overlap but are not the same; the
+returned table flags each with `ranked` and `probe_ranked` (display selection only).
 
-Axes share fixed limits (`probe_axis_max`, raised automatically if any species would fall
-outside, so nothing is ever clipped) so two runs of this figure can be compared by eye.
+Both axes are logarithmic and zoomed to the data, with equal limits so the diagonal stays
+at 45°. A zero swing is pinned to the bottom edge.
 
 ---
 
-## 7. Stage 6 — Step 5: reconciliation, one verdict per species (notebook §7)
+## 7. Stage 6 — reconciliation, one verdict per species (notebook §7)
 
 ```python
 views = GRf.reconcile_attenuation_species(
     shift_overview, divergence,
-    min_frac_shifted=0.5, max_frac_unmatched=0.5, max_frac_censored=0.5,
     response_floor_dex=0.1, min_error_dex=0.3,
 )
 ```
 
-The two functions read the same table and rank differently, so the difference between
-them is **informative rather than a conflict to average away**. The summary counts an
-unmatched cell as movement; the response function counts it as ignorance. A species can
-top the summary on unmatched cells and be dropped outright by the response function —
-that combination is itself the finding: *wide effect, unmeasurable magnitude*.
+The two functions read the same table with the same cell rule, so their medians agree;
+the response function adds whether the response is CR- or G0-modulated.
 
-### The four-question cascade (applied in order)
+### The three-question cascade (applied in order)
 
 | step | flag | test | question |
 |---|---|---|---|
-| 1 | `broad` | `frac_shifted >= min_frac_shifted` | does it touch a useful part of the grid? |
-| 2 | `honest` | `frac_unmatched <= max_frac_unmatched` **and** `frac_censored <= max_frac_censored` | is the magnitude measured, or imputed? |
-| 3 | `cr_led` | `probe_margin > 0` | is the response CR, or `G_0`? |
-| 4 | `matters` | `error_dex >= min_error_dex` | is the ζ error worth caring about? (0.3 dex = ×2) |
+| 1 | — | `abs_response_dex >= response_floor_dex` | does attenuation change the line at all? |
+| 2 | `cr_led` | `fuv_swing_dex < abs_response_dex` | is the response CR- or G0-modulated? |
+| 3 | `matters` | `error_dex >= min_error_dex` | is the ζ error worth caring about? (0.3 dex = ×2) |
 
-Step 2 is now also applied *upstream*, inside each plot function — `max_frac_unmatched`
-in stage 4, `max_frac_censored` in stage 5 — so a species failing it is already absent
-from both sets of figures by the time it gets here. It still reaches the cascade, because
-both functions keep it in their returned table, and `unmeasurable` is a finding worth
-naming rather than a row worth deleting.
+These are **labels on numbers computed identically for every species, not cuts on the
+sample**: every species stays in every table. The **first failing test names the
+verdict**, so a grade can always be traced back to the step that decided it. Verdicts, in
+cascade order:
 
-The **first failing test names the verdict**, so a grade can always be traced back to the
-step that decided it. Verdicts, in cascade order:
+`no response` → `G0-modulated` → `robust attenuation probe` → `robust, small bias`, plus `no data`
+for a species missing from one of the two tables.
 
-`no response` → `unmeasurable` → `FUV tracer` → `CR-led, narrow` → `CRIR probe` →
-`CR-led, small bias`, plus `no data` for a species missing from one of the two tables.
-
-All four flags come back alongside the verdict, so a reader who disagrees with a
-threshold can see which species would flip.
-
-### Two columns worth reading directly
-
-- **`bound_gap` = `error_dex` − `median_abs_shift_dex`.** The summary's median uses
-  matched cells only; the response function's uses matched **plus** imputed bounds. A
-  large gap means that species' ranking leans on imputation rather than measurement.
-- **`frac_trusted_shift` vs `frac_trusted_fuv`.** Same name, **different denominators**
-  (trusted among *matched* cells, versus among cells where R is defined, which includes
-  unmatched ones). They will not agree numerically and neither is wrong.
-  **Never average them.**
+The flags come back alongside the verdict, so a reader who disagrees with a threshold can
+see which species would flip.
 
 ### Three views of the same rows
 
 | key | question | sorted by | restricted to |
 |---|---|---|---|
 | `table` | the full graded record | verdict tier, then `error_dex` | everything |
-| `problematic` | **which lines mislead me most?** | `error_dex` ↓ | `honest` species only |
-| `tracers` | **which lines are the best CR probes?** | `probe_margin` ↓ | CR-led verdicts |
+| `problematic` | **which lines mislead me most?** | `error_dex` ↓ | everything with an `error_dex` |
+| `tracers` | **which lines are the best CR probes?** | `abs_response_dex` ↓ | CR-led verdicts |
 
 They are allowed to disagree, and the disagreement is the point:
 
-- `problematic` is a **correction priority** list. An FUV tracer can lead it — the ζ error
+- `problematic` is a **correction priority** list. An `G0-modulated` species can lead it — the ζ error
   is real, its cause simply is not cosmic rays, and the `verdict` column says so.
 - `tracers` is a **line selection** list. It deliberately drops the `matters` cut: a clean
   probe whose ζ error falls just under `min_error_dex` is still a clean probe, it simply
   biases you less. This is why a species can rank higher here than in `table`, where the
   verdict tier comes first.
 
+### 7.1 Per-ζ regime verdicts
+
+```python
+zeta_views = GRf.attenuation_zeta_regime_verdicts(
+    shift_overview["pixels"], n_bins=3,
+    response_floor_dex=0.1, min_error_dex=0.3,
+)
+```
+
+Cuts the CRIR axis into `n_bins` equal-log-width regimes (`low` / `mid` / `high`) and runs
+the unchanged stages 4–6 on each regime's cells; the FUV axis is not binned, so the swing
+still spans the full `G_0` range. This is what corrects the 2D bias of §3.4: a line inert
+at low ζ and responsive at high ζ has a whole-grid median near zero, but grades on its
+own merits in the `high` regime. Shifts were matched on the full row before the cut.
+Returns `whole_grid`, `regimes` (one graded row per species and regime) and
+`best_regimes`. The 3D workflow (`grid_3d.attenuation_regime_verdicts_3d`) does the same
+per n·G₀·ζ box.
+
 ---
 
 ## 8. Stage 7 — where to go next
 
 ```python
-probes = views["table"].query("verdict == 'CRIR probe'")["species"]
+probes = views["table"].query("verdict == 'robust attenuation probe'")["species"]
 shift_overview["regime_winners"].query("species in @probes")
 ```
 
-Take the `CRIR probe` rows back to `regime_winners` from stage 4 to see **where** in
+Take the `robust attenuation probe` rows back to `regime_winners` from stage 4 to see **where** in
 `(ζ_H, G_0)` to follow each one up, and to `top_models` for the individual KOSMA-τ models
 behind the largest shifts.
 
 A species you would act on is:
 
-> **broad** in step 1 · **honest** in step 2 · **below the diagonal** in step 3 ·
-> carrying a large **`error_dex`** in step 4.
+> responding (step 1) · **below the diagonal** (step 2) · carrying a large
+> **`error_dex`** (step 3).
 
 But if you are choosing a line to **observe** rather than a bias to **correct**, read the
 `tracers` table, not the `problematic` one.
@@ -467,17 +452,15 @@ But if you are choosing a line to **observe** rather than a bias to **correct**,
 
 | parameter | default | role |
 |---|---|---|
-| `min_slope_dex` | 0.1 | CR-sensitivity gate — **set identically in both plot functions** |
 | `exclude_ice` | True | drop J-prefixed grain-surface species and their ratios |
 | `exclude_isotopologues` | False | drop 13C/18O/17O/15N/34S/33S isotopologues and their ratios — **pass the same value to both plot functions**; run once with each value to separate the two investigations (headers, figures and files are tagged, files end in `_no_iso` / `_with_iso`) |
 | `x_shift_scan_direction` | `'rightward'` | only this gives Δ its ζ-error meaning |
 | `x_shift_match_rtol` | 0.02 | intensity match band for the shift search |
-| `max_frac_unmatched` | 0.5 | step-2 gate inside `plot_attenuation_shift_summary` — **pass the same value to `reconcile_attenuation_species`** |
-| `max_frac_censored` | 0.5 | step-2 gate inside `plot_attenuation_fuv_response` |
+| `obs_limit` | `OBS_INTENSITY_LIMIT` (intensity) / None (abundance) | detection limit; cells below it enter at Δ = 0, R = 0 |
 | `response_floor_dex` | 0.1 | the vertical divider — pass the same value to `reconcile_attenuation_species` |
 
 Both inputs to `reconcile_attenuation_species` must come from the **same** `pixels`
-table, and both functions must have run with the same `min_slope_dex`, `exclude_ice` and
+table, and both functions must have run with the same `exclude_ice` and
 `exclude_isotopologues`,
 or the columns are not commensurable. The defaults already match.
 
@@ -487,25 +470,28 @@ or the columns are not commensurable. The defaults already match.
 
 1. **Two trees differing in anything but attenuation** — undetectable, and invalidates
    every figure.
-2. **Reading the winner map as a tracer ranking.** It ranks by \|Δ\| alone; an FUV tracer
+2. **Reading the winner map as a tracer ranking.** It ranks by \|Δ\| alone; a G0-modulated species
    with a large ζ error wins there and is still the wrong line to observe. That is exactly
-   what steps 2–4 exist to catch.
-3. **Trusting a large \|Δ\| at high `G_0`.** Since S varies with `G_0`, that can mean loss
-   of CR sensitivity rather than a stronger CR effect — hence the slope gate.
-4. **Averaging `frac_trusted_shift` with `frac_trusted_fuv`.** Different denominators.
-5. **Dropping no-match cells** from the magnitude ranking. They are censored observations,
-   not missing data — imputed as lower bounds, and gated at 50%.
-   The mirror-image mistake is **keeping a species whose grid is mostly no-match**: past
-   50% neither ranking is measuring it any more, which is what `max_frac_unmatched` and
-   `max_frac_censored` cut off at either end.
-6. **A species missing from one of the two tables** returns `no data`, not a low grade.
+   what the reconciliation exists to catch.
+3. **Trusting a large \|Δ\| where S is small.** No slope gate is applied, so a cell on a
+   flat stretch of the reference row can carry a large \|Δ\| that means loss of CR
+   sensitivity rather than a stronger CR effect. Check `slope_dex` in `top_models` before
+   following up a single cell.
+4. **Reading a whole-grid 2D median as the species' best case.** Unmatched and
+   unobservable cells count as 0 and inert cells are not filtered, so a species sensitive
+   (or detectable) in one CRIR band only is under-ranked. Read its grade in the per-ζ
+   regimes (§7.1) or the 3D boxes.
+5. **Comparing the shift panel with the medians by eye** without reading blank (no-match)
+   and hatched (unobservable) pixels as 0 — the medians do exactly that.
+6. **Reading a median as the true error.** It is conservative: unmatched cells may hide
+   shifts larger than the grid can represent.
+7. **A species missing from one of the two tables** returns `no data`, not a low grade.
 
 ---
 
 ## 11. Column guide — how to read every returned table
 
-One line per column. A name that appears in two tables means the same thing in both,
-except `frac_trusted`, `ranked` and `observable`, whose rows state both meanings.
+One line per column. A name that appears in two tables means the same thing in both.
 
 ### `pixels` — one row per grid cell (`collect_attenuation_x_shift_table`)
 
@@ -521,65 +507,54 @@ except `frac_trusted`, `ranked` and `observable`, whose rows state both meanings
 | `y_name` | Grid key the y values come from. | — |
 | `value_ref` | Grid value in the constant-CR model, I_const. | The grid an observer would fit a source with. |
 | `value_atten` | Grid value in the attenuated model, I_atten. | Plays the role of the real (attenuated) source. |
-| `shift_dex` | Signed shift Δ = log10(ζ_match / ζ_nom): how far along ζ the constant-CR grid must move to reproduce I_atten. NaN = no match. | Rightward scan: positive Δ = ζ comes out too low if attenuation is ignored. NaN cells are never filled in any map; only error_dex imputes a bound for some of them (see frac_censored). |
+| `shift_dex` | Signed shift Δ = log10(ζ_match / ζ_nom): how far along ζ the constant-CR grid must move to reproduce I_atten. 0 = both grids have a model but no match (read as no shift); NaN = no model in that cell. Unobservable cells keep their raw value here; the ranking functions read them as 0. | Rightward scan: positive Δ = ζ comes out too low if attenuation is ignored. The triple plot draws the raw match (no-match pixels blank); every table reads them as 0. |
 | `abs_shift_dex` | \|shift_dex\|. | The magnitude every median and bin uses. |
-| `slope_dex` | Local CR sensitivity S = dlog10(I_const) / dlog10(ζ). | \|Δ\| ~ R / S, so where \|S\| < min_slope_dex the shift blows up because the line stopped responding to ζ, not because the CR effect is strong. Such cells are not trusted: medians, heatmaps and top-model lists skip them. |
-| `observable` | pixels: True where every line behind the key is >= obs_limit in both grids. reconcile table: frac_observable >= min_frac_observable. | Ratios are judged on their two lines, never on the ratio value, so a bright/faint ratio is unobservable wherever the faint line is. All True when obs_limit is None. |
+| `slope_dex` | Local CR sensitivity S = dlog10(I_const) / dlog10(ζ). | \|Δ\| ~ R / S, so where \|S\| is small a large shift means the line stopped responding to ζ, not a strong CR effect. Diagnostic only: no statistic filters on it. |
+| `observable` | True where every line behind the key is >= obs_limit in both grids. | Ratios are judged on their two lines, never on the ratio value, so a bright/faint ratio is unobservable wherever the faint line is. All True when obs_limit is None. False cells enter every statistic at 0. |
 
 ### `species_summary` and regime tables (`plot_attenuation_shift_summary`)
 
 | column | meaning | how to read |
 |---|---|---|
-| `n_cells` | Observable cells of the species. | Cells are interpolated mesh points (target_shape), not independent KOSMA-τ models, so neighbouring cells are not independent evidence. |
-| `n_valid` | Cells with a match (finite shift). | — |
-| `n_unmatched` | Cells with no match (n_cells - n_valid), for any reason, no slope gate. | Includes flat-row and row-end cells, which frac_censored leaves out. |
-| `n_trusted` | Matched cells passing the slope gate \|S\| >= min_slope_dex. | These cells back every median of the summary. |
-| `n_shifted` | Matched cells with \|Δ\| >= min_abs_shift_dex (no slope gate). | 'Did it move' is well posed even on flat rows, so this count is ungated. |
-| `n_affected` | n_shifted + n_unmatched. | How many models moved or could not be matched; first sort key of species_summary. |
-| `frac_shifted` | n_shifted / n_valid. | Breadth: how much of the matched map moved. Small = the effect sits in a corner (verdict 'CR-led, narrow'). |
-| `frac_unmatched` | n_unmatched / n_cells. | How much of the shift map is empty. Not frac_censored: it counts every no-match cell over the whole observable map. Above max_frac_unmatched the species is not ranked. |
-| `frac_trusted` | Share of cells passing the slope gate. species_summary: among matched cells. Response table: among cells where R is defined (unmatched included). | Same name, different denominators: the two will not agree and neither is wrong. Never average them. |
-| `mean_abs_shift_dex` | Mean \|Δ\| over trusted matched cells. | Pulled by outliers; prefer the median. |
-| `median_abs_shift_dex` | Median \|Δ\| over trusted matched cells only. | Pure measurement, nothing imputed. Compare with error_dex through bound_gap. |
-| `std_abs_shift_dex` | Standard deviation of \|Δ\| over trusted matched cells. | Small = the shift is nearly uniform over the grid. |
-| `max_abs_shift_dex` | Largest trusted \|Δ\|. | Worst single cell; top_models says where it sits. |
-| `no match` | Unmatched cells (grey stack in the summary bar figure). | Equals n_unmatched. |
-| shift-bin columns | Matched cells whose \|Δ\| falls in this bin (one column per \|Δ\| range, e.g. \|Δ\| < 0.1). | The lowest bin is left out of the bar figure: it asks how many moved. |
-| `frac_observable` | Fraction of the grid above obs_limit. | Every other count and median is over these cells only. Below min_frac_observable the species is dropped. 1.0 for every species usually means obs_limit was None. |
-| `ranked` | species_summary: passed max_frac_unmatched and min_frac_observable, so it is drawn. Response table: drawn in the left (error) panel. | False rows stay for reference. In the response table False also covers max_frac_censored, min_abs_response_dex, max_species and max_per_constituent. |
+| `n_cells` | Cells of the species (every grid cell). | Cells are interpolated mesh points (target_shape), not independent KOSMA-τ models, so neighbouring cells are not independent evidence. |
+| `n_valid` | Cells with a model (finite shift; unmatched and unobservable as 0). | Equals n_cells unless part of the grid has no model. |
+| `mean_abs_shift_dex` | Mean \|Δ\| over all cells (unmatched and unobservable as 0). | Pulled by outliers; prefer the median. |
+| `median_abs_shift_dex` | Median \|Δ\| over all cells (unmatched and unobservable as 0). The sort key. | No slope gate: small and zero shifts pull it down. Equals error_dex. |
+| `std_abs_shift_dex` | Standard deviation of \|Δ\| over all cells. | Small = the shift is nearly uniform over the grid. |
+| `max_abs_shift_dex` | Largest \|Δ\|. | Worst single cell; top_models says where it sits (check its slope_dex). |
+| shift-bin columns | Cells whose \|Δ\| falls in this bin (one column per \|Δ\| range, e.g. \|Δ\| < 0.1). | The lowest bin is left out of the bar figure: it asks how many moved. |
+| `frac_observable` | Fraction of the grid above obs_limit. | Reported, not a cut: the other cells entered at 0. 1.0 for every species usually means obs_limit was None. |
 | `x_bin` | Log-spaced x (ζ) bin of the regime tables. | — |
 | `y_bin` | Log-spaced y (G0) bin of the regime tables. | — |
-| `n_models` | Trusted matched cells in that (x_bin, y_bin) regime. | A handful of cells = a noisy regime median; do not follow it up on its own. |
+| `n_models` | Cells in that (x_bin, y_bin) regime. | A handful of cells = a noisy regime median; do not follow it up on its own. |
 
 ### Response table (`plot_attenuation_fuv_response`)
 
 | column | meaning | how to read |
 |---|---|---|
-| `error_dex` | Median \|Δ\| over trusted cells: measured shifts plus the lower bound log10(ζ_row_max / ζ_nom) for censored cells. The dex error in the inferred ζ if attenuation is ignored (0.3 dex = factor 2). | A median rewards breadth: a moderate shift everywhere outranks a large one in a corner. A lower limit whenever frac_censored > 0; trust it only with a low frac_censored (see bound_gap). |
+| `error_dex` | Median \|Δ\| over all cells (unmatched and unobservable as 0). The dex error in the inferred ζ if attenuation is ignored (0.3 dex = factor 2). | A median rewards breadth: a moderate shift everywhere outranks a large one in a corner (§3.4). Conservative where matches fall off the grid. |
 | `error_p10` | 10th percentile of the cells behind error_dex. | Spread over the grid, not an uncertainty on the median. |
 | `error_p90` | 90th percentile of the cells behind error_dex. | The worst-decile error. A wide p10-p90 band = the error depends on where in the grid the source sits. |
-| `frac_censored` | censored / (measured trusted + censored). Censored = trusted, no match, ζ_nom not at the row end; such cells enter error_dex at their lower bound. | How much of error_dex is imputed rather than measured. Not frac_unmatched: flat-row and row-end no-match cells are left out, and the denominator is only the error cells. Above 0.5 the median is itself an imputed bound, set by where the ζ grid ends; above max_frac_censored the species is not ranked. |
-| `n_error_cells` | Cells behind error_dex (measured + censored). | — |
-| `response_dex` | Signed median of R = log10(I_atten / I_const) over the per-G0-row medians. | Needs no match, so it is defined where the shift is NaN. Negative = attenuation dims the line. |
+| `n_error_cells` | Cells behind error_dex. | — |
+| `response_dex` | Signed median of R = log10(I_atten / I_const) over the per-G0-row medians; unobservable cells enter at R = 0. | Needs no match. Negative = attenuation dims the line. |
 | `abs_response_dex` | \|response_dex\|. | Below response_floor_dex (0.1 dex ~ 26%) the line barely responds: verdict 'no response'. |
-| `fuv_swing_dex` | p90 - p10 of the per-G0-row median R. | How much the attenuation response changes with the FUV field. Small = the CR effect does not care about G0. |
+| `fuv_swing_dex` | Spread of the per-G0-row median R: max - min over every row. In 3D split into `g0_swing_dex` (across G0 at fixed n; the verdict's swing) and `n_swing_dex` (across n at fixed G0; reported). | How much the attenuation response changes with the FUV field. Small = the CR effect does not care about G0. |
 | `fuv_trend` | Slope of R against log10(G0), in dex of R per dex of G0. | 0 = FUV-independent; the sign gives the direction. |
 | `n_fuv_rows` | G0 rows with a finite R. | swing needs >= 2 rows, trend >= 3. |
-| `probe_margin` | abs_response_dex - fuv_swing_dex. | > 0: the response exceeds its own G0 spread (CR-led, below the probe-panel diagonal). < 0: FUV tracer. Ranks the right panel. |
+| `cr_dominated` | fuv_swing_dex < abs_response_dex. | True: the response exceeds its own G0 spread (below the probe-panel diagonal). False: G0-modulated response. |
 | `den_contrib` | \|R_den\| / (\|R_num\| + \|R_den\|) for a ratio whose two lines both have rows. | Near 0 = the denominator is inert and the ratio restates its numerator. NaN for single lines or a missing constituent. |
-| `probe_ranked` | Drawn in the right (probe) panel. | — |
+| `frac_observable` | Fraction of the grid above obs_limit. | Reported, not a cut; colours the error bars. |
+| `ranked` | Drawn in the left (error) panel. | Display only: max_species, max_per_constituent, min_abs_response_dex. `max_species=None` (the PRISMA tab) draws every species, split over figures. |
+| `probe_ranked` | Drawn in the right (probe) panel. | Display only, as ranked. |
 
 ### Reconciliation (`reconcile_attenuation_species`)
 
 | column | meaning | how to read |
 |---|---|---|
-| `broad` | frac_shifted >= min_frac_shifted. | False -> verdict 'CR-led, narrow'. |
-| `honest` | frac_unmatched <= max_frac_unmatched and frac_censored <= max_frac_censored. | Both are needed: the first guards the shift map, the second guards error_dex. False -> verdict 'unmeasurable'. |
-| `cr_led` | probe_margin > 0. | False -> verdict 'FUV tracer'. |
+| `cr_led` | fuv_swing_dex < abs_response_dex. | False -> verdict 'G0-modulated'. |
 | `matters` | error_dex >= min_error_dex. | Is the ζ error worth correcting? Not applied to the tracers view. |
-| `verdict` | First step the species fails, in cascade order. | no data: missing from one table \| unobservable: frac_observable too low \| no response: \|R\| < response_floor_dex \| unmeasurable: not honest \| FUV tracer: probe_margin <= 0 \| CR-led, narrow: not broad \| CRIR probe: passes every step and the error matters \| CR-led, small bias: passes every step, error below min_error_dex. |
-| `bound_gap` | error_dex - median_abs_shift_dex: how far the imputed bounds moved the median. | The effect of imputation, not how many cells were imputed (that is frac_censored). Below 50% censored the gap depends on the censored count and the spread of the measured shifts, not on the bound size: a near-uniform species keeps a small gap however many cells are censored. Negative when the bounds sit below the measured shifts (ζ_nom close to the row end). High frac_censored and a large gap: treat error_dex as a lower limit. |
-| `problematic` view | View: honest species sorted by error_dex. | Which lines mislead you most if attenuation is ignored. A species can lead it and still be an FUV tracer: the error is real, its cause is not cosmic rays. |
-| `tracers` view | View: CR-led verdicts sorted by probe_margin. | The best CRIR probes. The matters cut is not applied: a clean probe with a small ζ error is still a clean probe, it simply biases you less. |
+| `verdict` | First step the species fails, in cascade order. | no data: missing from one table \| no response: \|R\| < response_floor_dex \| G0-modulated: swing >= \|R\| \| robust attenuation probe: CR-led and the error matters \| robust, small bias: CR-led, error below min_error_dex. |
+| `problematic` view | View: every species with an error_dex, sorted by it. | Which lines mislead you most if attenuation is ignored. A species can lead it and still be G0-modulated: the error is real, its cause is not cosmic rays. |
+| `tracers` view | View: CR-led verdicts sorted by abs_response_dex. | The best CRIR probes. The matters cut is not applied: a clean probe with a small ζ error is still a clean probe, it simply biases you less. |
 
 ---

@@ -86,7 +86,9 @@ def compose_rgb_image(
     conv_factors: Optional[Sequence[float]] = None,
 ) -> Tuple[np.ndarray, List[np.ndarray]]:
     """
-    Build an ``(ny, nx, 3)`` RGB image in [0, 1] from three channel grids.
+    Build an ``(ny, nx, 3)`` RGB image in [0, 1] from three (or more) channel grids.
+
+    Channels past the third (e.g. JCO in grey, KoSens) join the fractional total.
 
     Optional ``conv_factors`` scale each channel before the fractional mix
     (KoSens mass-density / unit conversion weights).
@@ -94,10 +96,10 @@ def compose_rgb_image(
     Returns ``(rgb, fractions)`` where ``fractions[i]`` is the fractional
     contribution of channel *i* to the per-pixel total.
     """
-    if len(grids) != 3:
-        raise ValueError(f'Exactly 3 channel grids required, got {len(grids)}')
-    if len(colors) != 3:
-        raise ValueError(f'Exactly 3 colours required, got {len(colors)}')
+    if len(grids) < 3:
+        raise ValueError(f'At least 3 channel grids required, got {len(grids)}')
+    if len(colors) < len(grids):
+        raise ValueError(f'{len(grids)} channel grids need as many colours, got {len(colors)}')
 
     cleaned = [positive_grid(g) for g in scale_channel_grids(grids, conv_factors)]
     stacked = np.stack(cleaned, axis=0)
@@ -112,7 +114,7 @@ def compose_rgb_image(
 
     ny, nx = cleaned[0].shape
     rgb = np.zeros((ny, nx, 3), dtype=float)
-    for i in range(3):
+    for i in range(len(cleaned)):
         col = np.asarray(colors[i], dtype=float)
         for ch in range(3):
             rgb[:, :, ch] += fractions[i] * float(col[ch])
@@ -146,7 +148,7 @@ def auto_label_positions(
     x_plot = np.asarray(x_plot, dtype=float)
     y_plot = np.asarray(y_plot, dtype=float)
     out = []
-    for i in range(3):
+    for i in range(len(stacked)):
         mask = dominant == i
         if not np.any(mask):
             frac = stacked[i]
@@ -303,7 +305,7 @@ def fig_rgb_phase(
         ))
 
     annotations = []
-    positions = list(label_xy or [(None, None)] * 3)
+    positions = list(label_xy or [(None, None)] * len(channel_labels))
     for i, label in enumerate(channel_labels):
         if i >= len(positions):
             break

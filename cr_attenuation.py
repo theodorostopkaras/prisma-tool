@@ -86,21 +86,24 @@ def extrapolate_profile_loglog(x: np.ndarray, y: np.ndarray, x_max: float = DEFA
     return np.append(x, x_ext), np.append(y, y_ext)
 
 
-def attenuation_threshold_nh2(n_h2: np.ndarray, stopping_rate: float = DEFAULT_STOPPING_RATE):
-    """
-    N_H2 at the attenuation threshold (KoSens ``stopping_rate`` convention).
+def effective_column(n_h2, n_h):
+    """H2-equivalent column N_eff = N(H2) + N(H)/2 = N_H/2 (KoSens attenuation onset).
 
-  ``cd_prof_h2[i] / stopping_rate > 1`` for the first depth index ``i``.
+    One H2 stops cosmic rays like two H atoms, so the atomic PDR layer counts too;
+    attenuation starts where N_eff >= ``DEFAULT_STOPPING_RATE`` (Padovani et al. 2009).
     """
-    n_h2 = np.asarray(n_h2, dtype=float)
-    if n_h2.size == 0 or stopping_rate <= 0:
-        return None
-    idx = 0
-    for i, val in enumerate(n_h2):
-        if val / stopping_rate > 1.0:
-            idx = i
-            break
-        idx = 1
-    if idx <= 0:
-        return float(n_h2[0]) if n_h2.size else None
-    return float(n_h2[idx - 1])
+    return np.asarray(n_h2, dtype=float) + 0.5 * np.asarray(n_h, dtype=float)
+
+
+def attenuated_mass_fraction(radius_cm, integrand_total_h, n_eff,
+                             threshold: float = DEFAULT_STOPPING_RATE) -> float:
+    """Fraction of the clump mass in which cosmic rays are attenuated (KoSens ``f_att``).
+
+    ``f_att = ∫ 4πr² n_H [N_eff(r) >= threshold] dr / ∫ 4πr² n_H dr`` on the model's own
+    shells (``integrand_total_h`` = 4πr² n_H), so 0 <= f_att <= 1.  All three arrays share
+    one radius grid, ordered centre -> surface.
+    """
+    # ponytail: step mask on the shell grid, resolution-limited by KOSMA-tau's shell spacing
+    w = np.asarray(integrand_total_h, dtype=float)
+    inside = np.asarray(n_eff, dtype=float) >= threshold
+    return float(np.trapezoid(w * inside, radius_cm) / np.trapezoid(w, radius_cm))

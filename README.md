@@ -26,7 +26,8 @@ After loading a main grid on **Load grids**, the other tabs become active:
 | **Intensities** | SIMLINE line-intensity slice maps and spectrum |
 | **Spectra** | SimLine PV FITS velocity spectra / PV diagrams, plus a CARTA-style observational cube viewer |
 | **Interpolation error** | Native vs resampled grids with decimation error maps (abundance + SIMLINE) |
-| **CR attenuation** | ζ<sub>H₂</sub> vs N<sub>H₂</sub> profiles with Padovani 𝓛/𝓗/𝓤 reference bands |
+| **CR attenuation** | ζ<sub>H₂</sub> vs N<sub>H</sub> profiles with Padovani 𝓛/𝓗/𝓤 reference bands |
+| **Probe ranking** | Regime-aware CRIR probe scores; **CR vs FUV dominance** maps D = \|S_ζ\|/(\|S_ζ\|+\|S_χ\|) over (χ₀, ζ) per density |
 | **Attenuation impact** | KoSens attenuation workflow: ζ error from ignoring attenuation, CR-probe quality, one verdict per tracer (single n_H or full 3-D, per environment) |
 | **Map fit** | Fit observed FITS maps to the 3-D SIMLINE model grid (KoSens3D) |
 
@@ -83,6 +84,13 @@ The heating/cooling rates come from
 (`erg cm⁻³ s⁻¹`); labels are taken from the metadata table. In the breakdown
 panels the line dash pattern is cycled alongside the colour so all components
 stay distinguishable.
+
+**Grid-integrated vs CRIR** integrates every rate as ∫4πr² Γ dr (the rates are
+already per volume; KoSens ``total_heating_cooling_calculation``). The absolute
+figure takes a rate floor (default 0) and **Top N channels** (a channel is drawn
+if it is among the N largest in at least one plotted model). The **share bars**
+below give each channel's % of the total heating / cooling, with the attenuated
+overlay grid hatched next to the main grid at every ζ.
 
 ## Model setup (JSON configs)
 
@@ -251,6 +259,13 @@ gridded here:
   FWHM starting values for each component (or lock filled values).
 - Species labels come from the **filename + RESTFREQ**, not the CLASS ``LINE``
   keyword (often a leftover backend name such as ``HCN_LSB``).
+- **Regions (CARTA-style masks)** — the map tool bar has box, circle/ellipse and
+  polygon drawing tools plus an eraser. Shapes stay editable (drag / resize); the
+  spectrum, measurements and Gaussian fit use the mean over every pixel whose
+  centre lies inside any region. **Add circle** places a circle by numbers:
+  centre ΔRA/ΔDec in arcsec (empty = map centre), radius in arcsec or in pc with
+  a distance (empty = half the beam BMAJ). **Clear regions** goes back to the
+  brightest pixel.
 
 Point **FITS file or directory** at a single cube or a folder of CLASS exports
 (e.g. the DR21 IRAM ``grid15`` set), or a CASA image cube
@@ -278,10 +293,10 @@ When both data sources are loaded, each slice plane shows:
 
 The **CR attenuation** tab follows the KoSens ``CR_atten_plot`` notebook:
 
-- **ζ<sub>H₂</sub> vs N<sub>H₂</sub>** (or A<sub>V</sub>) from KOSMA structure output
-  (`cosray` × 20/13, `cd_prof_h2`)
+- **ζ<sub>H₂</sub> vs N<sub>H</sub> = N(H) + 2N(H₂)** (or A<sub>V</sub>) from KOSMA
+  structure output (`cosray` × 20/13, `cd_prof_h`, `cd_prof_h2`), as KoSens ``CRIR_ratio``
 - **Padovani et al. (2018/2024)** reference bands 𝓛, 𝓗, 𝓤 with ± factor-of-2
-  uncertainty shading (on the N<sub>H₂</sub> axis)
+  uncertainty shading, placed at N<sub>H</sub> = 2 N(H₂)
 - **Add current model** — snapshot the slider selection; **Add all overlay matches**
   — add every attenuated model at the current density / mass / FUV / metallicity
 - Optional log-log extrapolation to 10²⁵ cm⁻² and attenuation-threshold vertical
@@ -316,6 +331,12 @@ Pick the species, set **Top reactions / depth point** (N), and choose a
 R is the volumetric reaction rate (cm⁻³ s⁻¹) from the `frate_*`/`drate_*` columns. It is
 integrated without an extra n(X) weight, because `drate_X` already contains n(X).
 
+The **reaction pathway network** follows the selected model (its top formation /
+destruction reactions). A copy of the grid sliders sits above the network, synced
+with the main ones, so the model can be changed without scrolling up;
+**Upstream / Downstream depth**, **Max nodes** and **Branches / species** set the
+extent of the graph.
+
 ### Reaction selection (same union as `top_reactions_plot`)
 
 1. At **every depth point**, the N reactions with the largest metric are found.
@@ -338,6 +359,13 @@ maps. Requires:
 Provide JSON mappings of spectroscopic line keys to FITS paths and optional
 per-line errors. Output includes fitted n_H, χ, and ζ maps and reduced χ² maps
 (written to the chosen output directory).
+
+With an attenuated SIMLINE overlay loaded and **ε_att** ticked, the maps are
+refitted with the attenuated grids (``fitted_atten_*``) and
+ε_att (Eq. 16) = log₁₀(ζ_atten / ζ_const) is shown and written to
+``fitted_<z>_atten_shift_dex.fits``. **Distance / circle radii / scale bar** draw
+circles of physical radius (pc) at the map centre and a scale bar on every
+fitted map (KoSens ``circles_pc`` / ``scale_pc``).
 
 Implementation: `grid_fit.py`, `map_fit.py`, `map_fit_extras.py`.
 
@@ -366,11 +394,18 @@ are the cleanest CR probes* (line selection).
 
 1. **Breadth** — how many models move per |Δ| bin, median |Δ| per ζ / χ
    (/ n_H) bin, and the winner map (who moves most where).
-2. **Magnitude & probe** — ζ error bars (median, p10–p90 spread, censored
-   fraction) and the probe plane |R| vs its environment swing.
-3. **Verdicts** — broad → honest → CR-led → matters; *Best CR probes* and
-   *Lines that mislead most*, plus, in 3-D mode, verdicts per density slice and
-   per (n_H, χ, ζ) environment.
+2. **Magnitude & probe** — ζ error bars (median, p10–p90 spread, observable
+   fraction) and the probe plane |R| vs its χ swing.
+3. **Verdicts** — responds → CR-led → matters; *Best CR probes* and
+   *Lines that mislead most*, verdicts per ζ regime, plus, in 3-D mode, verdicts
+   per (n_H, χ, ζ) box, the attenuation impact matrix (with f_att and the clump
+   column log N_H per box), the scope of each probe (universal / conditional) and
+   the **observer error table** (Δ, Δ_lin, S_ζ, S_χ, r, D per box, CSV / LaTeX
+   download). Verdicts: *robust attenuation probe*, *robust, small bias*,
+   *G0-modulated*, *no response*.
+
+Every cell with a model counts for every species: unmatched cells and cells
+below the detection limit enter at Δ = 0 and R = 0, and no species is excluded.
 
 **Compute** builds both cubes and runs the per-cell shift search (the slow
 part); every threshold then applies instantly to the cached cells. Each step
@@ -418,6 +453,15 @@ piece on its own:
 
 ```bash
 python -m pip install 'astroquery>=0.4.7'
+```
+
+**Optional: Graphviz** (a system program, not a pip package) lays out the
+**Chemistry** reaction pathway network with curved, non-overlapping arrows.
+Without it, or for very large networks (≈ > 40 species), the built-in layout
+is used.
+
+```bash
+conda install graphviz        # or: sudo apt install graphviz / brew install graphviz
 ```
 
 ### CLI options

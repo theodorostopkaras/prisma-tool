@@ -23,7 +23,7 @@
   --fs-xl: 22px;
 
   /* Shared control height so inputs, buttons and dropdowns line up */
-  --ctl-h: 34px;
+  --ctl-h: 32px;
 
   --radius: 10px;
   --radius-sm: 6px;
@@ -44,6 +44,7 @@
   --accent-hover: #0F58BE;
   --accent-ink: #1560CE;
   --accent-soft: rgba(21, 96, 206, 0.10);
+  --on-accent: #ffffff;
   --success: #16a34a;
   --purple: #7c3aed;
   --overlay: #9a6b5a;
@@ -61,37 +62,65 @@
   --tab-sel: #ffffff;
   --nav-bar: #ffffff;
   /* Recessed surface for cards nested inside a panel */
-  --sunken: #F5F8FC;
+  --sunken: #FAFAFA;
   /* Table zebra, one mechanism for both themes */
   --zebra: rgba(11, 33, 69, 0.028);
 }
 
 #app-root.theme-dark {
-  --accent: #1B6FE0;
-  --accent-hover: #2B8CFF;
-  --accent-ink: #6FB4FF;
-  --accent-soft: rgba(43, 140, 255, 0.18);
+  /* Graphite: the interface is greyscale, colour belongs to the data.
+     Selected means bright (inverted), not coloured. */
+  --accent: #E4E4E7;
+  --accent-hover: #FAFAFA;
+  --accent-ink: #E4E4E7;
+  --accent-soft: rgba(255, 255, 255, 0.08);
+  --on-accent: #111113;
+  --ink: #18181B;
+  --deep: #1F1F23;
+  --beam: #71717A;
+  --glow: #E4E4E7;
   --success: #22c55e;
   --purple: #a78bfa;
   --overlay: #c4a484;
-  --page: #041538;
-  --card: #0A2350;
-  --border: #17376E;
-  --border-strong: #24508F;
-  --text: #D6E4F7;
-  --text-muted: #8FA6C8;
-  --text-heading: #EAF2FF;
-  --input-bg: #061A40;
-  --input-border: #24508F;
-  --seg-bg: #061A40;
+  --page: #0F0F11;
+  --card: #18181B;
+  --border: #27272A;
+  --border-strong: #3F3F46;
+  --text: #E4E4E7;
+  --text-muted: #A1A1AA;
+  --text-heading: #FAFAFA;
+  --input-bg: #131316;
+  --input-border: #3F3F46;
+  --seg-bg: #131316;
   --tab-bg: transparent;
-  --tab-sel: #0A2350;
-  --nav-bar: #0A2350;
-  --sunken: #071F47;
+  --tab-sel: #18181B;
+  --nav-bar: #18181B;
+  --sunken: #141416;
   --zebra: rgba(255, 255, 255, 0.03);
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
   --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.4);
-  --ring: 0 0 0 3px var(--accent-soft);
+  --ring: 0 0 0 2px rgba(250, 250, 250, 0.35);
+}
+
+/* Dash 4 core components (Dropdown, Slider inputs, Checklist, popovers) colour
+   themselves from these variables; defaults are light. Popovers portal into
+   <body>, hence the body:has() selector alongside #app-root. */
+#app-root.theme-dark,
+body:has(#app-root.theme-dark) {
+  --Dash-Fill-Inverse-Strong: #18181B;
+  --Dash-Fill-Interactive-Strong: #E4E4E7;
+  --Dash-Fill-Interactive-Weak: rgba(255, 255, 255, 0.04);
+  --Dash-Fill-Disabled: rgba(255, 255, 255, 0.08);
+  --Dash-Fill-Primary-Hover: rgba(255, 255, 255, 0.06);
+  --Dash-Fill-Primary-Active: rgba(255, 255, 255, 0.10);
+  --Dash-Shading-Strong: rgba(0, 0, 0, 0.6);
+  --Dash-Shading-Weak: rgba(0, 0, 0, 0.4);
+  --Dash-Stroke-Strong: #52525B;
+  --Dash-Stroke-Weak: #3F3F46;
+  --Dash-Text-Primary: #E4E4E7;
+  --Dash-Text-Strong: #FAFAFA;
+  --Dash-Text-Weak: #A1A1AA;
+  --Dash-Text-Disabled: rgba(228, 228, 231, 0.45);
 }
 
 html, body {
@@ -105,9 +134,11 @@ body:has(#app-root.theme-light) {
   color: #22314A;
 }
 
+/* Dark until the app mounts (covers the "Loading..." splash). */
+body:not(:has(#app-root.theme-light)),
 body:has(#app-root.theme-dark) {
-  background-color: #041538;
-  color: #D6E4F7;
+  background-color: #0F0F11;
+  color: #E4E4E7;
 }
 
 #app-root {
@@ -134,7 +165,7 @@ body:has(#app-root.theme-dark) {
 }
 
 #app-root.theme-light { color: #22314A; }
-#app-root.theme-dark { color: #D6E4F7; }
+#app-root.theme-dark { color: #E4E4E7; }
 
 /* ---- Cards / panels ---- */
 /* Elevation language: flat surfaces are separated by a border only.
@@ -187,7 +218,7 @@ body:has(#app-root.theme-dark) {
 
 .btn-primary {
   background: var(--accent);
-  color: #fff !important;
+  color: var(--on-accent) !important;
   border-color: var(--accent);
 }
 
@@ -250,7 +281,7 @@ body:has(#app-root.theme-dark) {
   color: var(--text);
   border: 1px solid var(--input-border);
   border-radius: var(--radius-sm);
-  padding: var(--s2) 10px;
+  padding: 6px 10px;
   font-size: var(--fs-base);
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
@@ -337,7 +368,7 @@ textarea.kosma-input {
 .app-header .app-about p,
 #app-root.theme-dark .app-header .app-brand-lead,
 #app-root.theme-dark .app-header .app-about p {
-  color: #B9CCEA !important;
+  color: #D4D4D8 !important;
 }
 
 .app-header .app-about summary {
@@ -359,7 +390,7 @@ textarea.kosma-input {
 }
 
 #app-root .app-header .theme-seg-btn {
-  color: #B9CCEA !important;
+  color: #D4D4D8 !important;
 }
 
 #app-root .app-header .theme-seg-btn:has(input:checked) {
@@ -508,7 +539,7 @@ textarea.kosma-input {
 .theme-seg label:has(input:checked),
 .seg-control label:has(input:checked) {
   background: var(--accent) !important;
-  color: #ffffff !important;
+  color: var(--on-accent) !important;
   border-radius: var(--radius-pill) !important;
   box-shadow: 0 1px 3px rgba(37, 99, 235, 0.35) !important;
 }
@@ -520,7 +551,7 @@ textarea.kosma-input {
 .theme-seg label:has(input:checked) .theme-opt,
 .theme-seg label:has(input:checked) .theme-opt-text,
 .seg-control label:has(input:checked) .seg-opt {
-  color: #ffffff !important;
+  color: var(--on-accent) !important;
 }
 
 #app-root.theme-dark .theme-seg-btn:has(input:checked),
@@ -529,9 +560,9 @@ textarea.kosma-input {
 #app-root.theme-dark .theme-seg label:has(input:checked),
 #app-root.theme-dark .seg-control label:has(input:checked) {
   background: var(--accent) !important;
-  color: #ffffff !important;
+  color: var(--on-accent) !important;
   border-radius: var(--radius-pill) !important;
-  box-shadow: 0 1px 4px rgba(59, 130, 246, 0.45) !important;
+  box-shadow: none !important;
 }
 
 #app-root.theme-dark .theme-seg-btn,
@@ -580,7 +611,7 @@ textarea.kosma-input {
 }
 
 #app-root.theme-dark .theme-ico-moon {
-  box-shadow: inset -3px -1px 0 1px #c7d2e5;
+  box-shadow: inset -3px -1px 0 1px #D4D4D8;
 }
 
 #app-root.theme-dark .theme-ico-sun {
@@ -631,48 +662,68 @@ textarea.kosma-input {
 }
 
 /* ---- Main tabs ----------------------------------------------------------
-   Twelve chips all shouting at once made the selected one hard to find, and
-   the group names floated in their own row above, aligned to nothing.
+   Page navigation as segmented button groups: each group (Data, Profiles &
+   chemistry, ...) is one connected bar of button-like tabs with its name
+   above it. Group membership comes from the grp-* class on the group's first
+   dcc.Tab; the last tab of a group is the one followed by a grp-* tab.
 
-   Now: chips are quiet by default and only the selected one carries the
-   accent; each group's first tab renders its group name directly above
-   itself via ::before. The label lives in the flex row-gap, so it travels
-   with its group when the bar wraps -- no fixed widths to keep in sync.
-   Group membership comes from the grp-* classes set on each dcc.Tab.
+   Dash 4 renders #main-tabs itself as the flex container (.tab-container)
+   with the .tab divs as direct children -- style the element, not a child.
 ------------------------------------------------------------------------- */
 #main-tabs.prisma-tabs {
-  margin-top: var(--s1);
-}
-
-#main-tabs.prisma-tabs > div:first-child {
   display: flex !important;
+  flex-direction: row !important;
   flex-wrap: wrap;
   align-items: stretch;
-  /* row-gap leaves room for the group label above each row */
-  gap: 26px var(--s1);
-  /* top padding clears the first row's group labels */
-  padding: 26px var(--s3) var(--s3);
+  /* row gap and top padding hold the group captions above each row */
+  row-gap: 32px;
+  column-gap: 0;
+  padding: 32px var(--s3) var(--s3);
+  margin: var(--s1) 0 var(--s4) !important;
   background: var(--card);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   box-shadow: none;
-  margin-bottom: var(--s4);
+  overflow: visible;
 }
 
 #main-tabs .tab {
   position: relative;
-  border: none !important;
-  border-radius: var(--radius-sm) !important;
-  background: transparent !important;
-  color: var(--text-muted) !important;
-  padding: var(--s2) var(--s3) !important;
+  flex: 0 0 auto !important;
+  width: auto !important;
+  display: inline-flex !important;
+  align-items: center;
+  cursor: pointer;
+  white-space: nowrap;
+  background: var(--seg-bg) !important;
+  color: var(--text) !important;
+  border: 1px solid var(--border-strong) !important;
+  border-left-width: 0 !important;
+  border-radius: 0 !important;
+  padding: 9px 18px !important;
   font-weight: 600 !important;
-  font-size: var(--fs-base) !important;
+  font-size: var(--fs-md) !important;
   font-family: var(--font) !important;
   letter-spacing: -0.01em;
   bottom: 0 !important;
   box-shadow: none;
   transition: background 0.12s ease, color 0.12s ease, box-shadow 0.12s ease;
+}
+
+/* First tab of a group: left edge + rounded left corners. */
+#main-tabs .tab[class*="grp-"] {
+  border-left-width: 1px !important;
+  border-top-left-radius: var(--radius-sm) !important;
+  border-bottom-left-radius: var(--radius-sm) !important;
+}
+
+/* Last tab of a group: rounded right corners + the space to the next group
+   (on the right, so a group that wraps to a new row starts flush left). */
+#main-tabs .tab:has(+ .tab[class*="grp-"]),
+#main-tabs .tab:last-child {
+  margin-right: var(--s5);
+  border-top-right-radius: var(--radius-sm) !important;
+  border-bottom-right-radius: var(--radius-sm) !important;
 }
 
 #main-tabs .tab:hover {
@@ -683,58 +734,33 @@ textarea.kosma-input {
 #main-tabs .tab:focus-visible {
   outline: none;
   box-shadow: var(--ring);
+  z-index: 2;
 }
 
-/* Selected chip is the one thing allowed to float. */
+/* Selected: filled; the -1px shadow paints over the neighbour's shared edge. */
 #main-tabs .tab--selected,
 #main-tabs .tab.tab--selected {
+  z-index: 1;
   background: var(--accent) !important;
-  color: #ffffff !important;
-  border: none !important;
-  border-top: none !important;
-  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.16),
-              0 2px 8px var(--accent-soft) !important;
+  color: var(--on-accent) !important;
+  border-color: var(--accent) !important;
+  box-shadow: -1px 0 0 0 var(--accent), 0 2px 8px var(--accent-soft) !important;
 }
 
 #main-tabs .tab--selected:hover,
 #main-tabs .tab.tab--selected:hover {
   background: var(--accent-hover) !important;
-  color: #ffffff !important;
+  color: var(--on-accent) !important;
 }
 
-/* Group labels: sit above the first tab of each run, in the row gap. */
-#main-tabs .tab[class*="grp-"] {
-  margin-left: var(--s5);
-}
-
-#main-tabs .tab[class*="grp-"]:first-child {
-  margin-left: 0;
-}
-
-/* Hairline between groups, sitting in the 24px gap and running up past the
-   label so the caption reads as belonging to the run on its right. */
-#main-tabs .tab[class*="grp-"]::after {
-  content: '';
-  position: absolute;
-  right: calc(100% + 11px);
-  top: -17px;
-  bottom: 3px;
-  width: 1px;
-  background: var(--border);
-  pointer-events: none;
-}
-
-#main-tabs .tab[class*="grp-"]:first-child::after {
-  display: none;
-}
-
+/* Group caption above the first tab of each group, in the row gap. */
 #main-tabs .tab[class*="grp-"]::before {
   position: absolute;
-  left: var(--s3);
-  bottom: calc(100% + 5px);
+  left: 2px;
+  bottom: calc(100% + 6px);
   white-space: nowrap;
   padding-left: 11px;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   letter-spacing: 0;
   text-transform: none;
@@ -745,26 +771,14 @@ textarea.kosma-input {
 }
 
 #main-tabs .tab.grp-data::before { content: 'Data'; }
-#main-tabs .tab.grp-profiles::before { content: 'Local profiles'; }
-#main-tabs .tab.grp-grids::before { content: 'Grids & chemistry'; }
-#main-tabs .tab.grp-lines::before { content: 'Lines & fits'; }
-#main-tabs .tab.grp-diag::before { content: 'Diagnostics'; }
-
-#app-root.theme-dark #main-tabs .tab {
-  background: transparent !important;
-  color: var(--text-muted) !important;
-}
-
-#app-root.theme-dark #main-tabs .tab:hover {
-  background: var(--accent-soft) !important;
-  color: var(--accent-ink) !important;
-}
+#main-tabs .tab.grp-profiles::before { content: 'Profiles & chemistry'; }
+#main-tabs .tab.grp-grids::before { content: 'Grids & lines'; }
+#main-tabs .tab.grp-cr::before { content: 'Cosmic-ray diagnostics'; }
+#main-tabs .tab.grp-obs::before { content: 'Observations'; }
 
 #app-root.theme-dark #main-tabs .tab--selected,
 #app-root.theme-dark #main-tabs .tab.tab--selected {
-  background: var(--accent) !important;
-  color: #ffffff !important;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45) !important;
+  box-shadow: -1px 0 0 0 var(--accent), 0 1px 4px rgba(0, 0, 0, 0.45) !important;
 }
 
 /* Nested tabs → pills */
@@ -1026,11 +1040,11 @@ textarea.kosma-input {
 #app-root.theme-dark h3,
 #app-root.theme-dark h4,
 #app-root.theme-dark label {
-  color: #EAF2FF !important;
+  color: #FAFAFA !important;
 }
 
 #app-root.theme-dark p {
-  color: #B4C7E4;
+  color: #D4D4D8;
 }
 
 .page-intro {
@@ -1076,47 +1090,59 @@ textarea.kosma-input {
 #app-root.theme-dark table,
 #app-root.theme-dark th,
 #app-root.theme-dark td {
-  color: #D6E4F7;
-  border-color: #17376E !important;
+  color: #E4E4E7;
+  border-color: #27272A !important;
 }
 
 #app-root.theme-dark thead tr,
 #app-root.theme-dark th {
-  background-color: #0E2A5C !important;
+  background-color: #1F1F23 !important;
 }
 
 #app-root.theme-dark code {
-  background-color: #0A2350;
-  color: #6FB4FF;
+  background-color: #1F1F23;
+  color: var(--text);
   padding: 1px 4px;
   border-radius: 3px;
 }
 
 /* ---- Sliders ---- */
-#app-root.theme-dark .rc-slider-mark-text,
-#app-root.theme-dark .dash-slider-mark {
-  color: #B4C7E4 !important;
-  opacity: 1 !important;
-  font-size: 11px !important;
+#app-root .rc-slider-mark-text,
+#app-root .dash-slider-mark {
+  font-size: 13px !important;
   font-weight: 500;
 }
 
+#app-root.theme-dark .rc-slider-mark-text,
+#app-root.theme-dark .dash-slider-mark {
+  color: #D4D4D8 !important;
+  opacity: 1 !important;
+}
+
+/* Parameter readouts use the tab10 PARAM_DEFS colours (shared with plot
+   lines); lift them so the darker ones (blue, purple, brown) read on dark. */
+#app-root.theme-dark [id*="slabel-"],
+#app-root.theme-dark [id*="slice-label-"],
+#app-root.theme-dark #model-info span {
+  filter: brightness(1.5);
+}
+
 #app-root.theme-dark .rc-slider-rail {
-  background-color: #17376E !important;
+  background-color: #27272A !important;
 }
 
 #app-root.theme-dark .rc-slider-track {
-  background-color: #1B6FE0 !important;
+  background-color: var(--accent) !important;
 }
 
 #app-root.theme-dark .rc-slider-dot {
-  border-color: #8FA6C8 !important;
-  background-color: #0A2350 !important;
+  border-color: #A1A1AA !important;
+  background-color: #18181B !important;
 }
 
 #app-root.theme-dark .rc-slider-handle {
-  border-color: #6FB4FF !important;
-  background-color: #DDEBFF !important;
+  border-color: var(--accent) !important;
+  background-color: #F4F4F5 !important;
 }
 
 #app-root .rc-slider-track {
@@ -1155,9 +1181,9 @@ textarea.kosma-input {
 #app-root.theme-dark [class$="-placeholder"],
 #app-root.theme-dark [class$="-Input"],
 #app-root.theme-dark [class$="-ValueContainer"] {
-  background-color: #061A40 !important;
-  color: #D6E4F7 !important;
-  border-color: #24508F !important;
+  background-color: #131316 !important;
+  color: #E4E4E7 !important;
+  border-color: #3F3F46 !important;
 }
 
 #app-root.theme-dark .Select-placeholder,
@@ -1165,55 +1191,55 @@ textarea.kosma-input {
 #app-root.theme-dark .Select-value-label,
 #app-root.theme-dark div[class*="-singleValue"],
 #app-root.theme-dark div[class*="-placeholder"] {
-  color: #D6E4F7 !important;
+  color: #E4E4E7 !important;
 }
 
 #app-root.theme-dark .Select-arrow,
 #app-root.theme-dark [class*="-indicatorContainer"] svg,
 #app-root.theme-dark [class*="-dropdownIndicator"] {
-  color: #8FA6C8 !important;
-  fill: #8FA6C8 !important;
+  color: #A1A1AA !important;
+  fill: #A1A1AA !important;
 }
 
 #app-root.theme-dark .VirtualizedSelectFocusedOption,
 #app-root.theme-dark .Select-option.is-focused,
 #app-root.theme-dark div[class*="-option"]:hover,
 #app-root.theme-dark [class$="-option"]:hover {
-  background-color: #17376E !important;
-  color: #EAF2FF !important;
+  background-color: #27272A !important;
+  color: #FAFAFA !important;
 }
 
 #app-root.theme-dark .Select-option.is-selected,
 #app-root.theme-dark [class*="-option"][class*="selected"] {
-  background-color: #1B6FE0 !important;
-  color: #ffffff !important;
+  background-color: var(--accent-soft) !important;
+  color: #FAFAFA !important;
 }
 
 body:has(#app-root.theme-dark) div[class*="-menu"],
 body:has(#app-root.theme-dark) div[class$="-menu"],
 body:has(#app-root.theme-dark) .Select-menu-outer,
 body:has(#app-root.theme-dark) .Select-menu {
-  background-color: #0A2350 !important;
-  color: #D6E4F7 !important;
-  border: 1px solid #24508F !important;
+  background-color: #18181B !important;
+  color: #E4E4E7 !important;
+  border: 1px solid #3F3F46 !important;
 }
 
 body:has(#app-root.theme-dark) div[class*="-option"],
 body:has(#app-root.theme-dark) .Select-option {
-  background-color: #0A2350 !important;
-  color: #D6E4F7 !important;
+  background-color: #18181B !important;
+  color: #E4E4E7 !important;
 }
 
 body:has(#app-root.theme-dark) div[class*="-option"]:hover,
 body:has(#app-root.theme-dark) .Select-option:hover,
 body:has(#app-root.theme-dark) .Select-option.is-focused {
-  background-color: #17376E !important;
-  color: #EAF2FF !important;
+  background-color: #27272A !important;
+  color: #FAFAFA !important;
 }
 
 body:has(#app-root.theme-dark) [class*="-MenuList"],
 body:has(#app-root.theme-dark) [class$="-MenuList"] {
-  background-color: #0A2350 !important;
+  background-color: #18181B !important;
 }
 
 /* ---- Larger dropdown menus: show more species/options at once ---- */
@@ -1234,7 +1260,7 @@ body:has(#app-root) [class$="-MenuList"] {
 #app-root.theme-dark .form-check-label,
 #app-root.theme-dark .dash-radioitems label,
 #app-root.theme-dark .dash-checklist label {
-  color: #D6E4F7 !important;
+  color: #E4E4E7 !important;
 }
 
 /* ---- Dark: catch remaining light inline backgrounds ---- */
@@ -1245,73 +1271,73 @@ body:has(#app-root) [class$="-MenuList"] {
 #app-root.theme-dark [style*="background-color: #ffffff"],
 #app-root.theme-dark [style*="background-color: white"],
 #app-root.theme-dark [style*="background: white"] {
-  background-color: #0A2350 !important;
-  border-color: #17376E !important;
-  color: #D6E4F7 !important;
+  background-color: #18181B !important;
+  border-color: #27272A !important;
+  color: #E4E4E7 !important;
 }
 
 #app-root.theme-dark input:not([type="checkbox"]):not([type="radio"]):not([type="hidden"]):not([type="submit"]):not([type="button"]):not(.theme-seg-input):not(.seg-input),
 #app-root.theme-dark textarea {
-  background-color: #061A40 !important;
-  color: #D6E4F7 !important;
-  border-color: #24508F !important;
+  background-color: #131316 !important;
+  color: #E4E4E7 !important;
+  border-color: #3F3F46 !important;
 }
 
 #app-root.theme-dark button[style*="background-color: #eee"],
 #app-root.theme-dark button[style*="background-color: #f7f7f7"],
 #app-root.theme-dark [id*="btn-clear"],
 #app-root.theme-dark [id*="btn-react-net"] {
-  background-color: #17376E !important;
-  color: #D6E4F7 !important;
-  border-color: #24508F !important;
+  background-color: #27272A !important;
+  color: #E4E4E7 !important;
+  border-color: #3F3F46 !important;
 }
 
 #app-root.theme-dark [style*="color: #666"],
 #app-root.theme-dark [style*="color: '#666"],
 #app-root.theme-dark span[style*="color: rgb(102, 102, 102)"] {
-  color: #8FA6C8 !important;
+  color: #A1A1AA !important;
 }
 
 #app-root.theme-dark [style*="color: #333"],
 #app-root.theme-dark [style*="color: '#333"] {
-  color: #D6E4F7 !important;
+  color: #E4E4E7 !important;
 }
 
 #app-root.theme-dark [style*="color: #555"],
 #app-root.theme-dark [style*="color: '#555"] {
-  color: #B4C7E4 !important;
+  color: #D4D4D8 !important;
 }
 
 #app-root.theme-dark [style*="border-bottom: 1px solid #eee"] {
-  border-bottom-color: #17376E !important;
+  border-bottom-color: #27272A !important;
 }
 
 /* Model setup */
 #app-root.theme-dark #model-setup-panel table {
-  background-color: #0A2350 !important;
-  border-color: #24508F !important;
+  background-color: #18181B !important;
+  border-color: #3F3F46 !important;
 }
 
 #app-root.theme-dark #model-setup-panel th,
 #app-root.theme-dark #model-setup-panel td {
-  background-color: #0A2350 !important;
-  color: #D6E4F7 !important;
-  border-color: #24508F !important;
+  background-color: #18181B !important;
+  color: #E4E4E7 !important;
+  border-color: #3F3F46 !important;
 }
 
 #app-root.theme-dark #model-setup-panel thead tr,
 #app-root.theme-dark #model-setup-panel th {
-  background-color: #0E2A5C !important;
+  background-color: #1F1F23 !important;
 }
 
 #app-root.theme-dark #model-setup-panel div[style*="background"],
 #app-root.theme-dark #model-setup-panel [style*="backgroundColor"] {
-  background-color: #0A2350 !important;
-  border-color: #24508F !important;
+  background-color: #18181B !important;
+  border-color: #3F3F46 !important;
 }
 
 #app-root.theme-dark #model-setup-panel [style*="color: #1a1a2e"] {
-  color: #EAF2FF !important;
+  color: #FAFAFA !important;
 }
 
 /* Scrollbars */
@@ -1321,16 +1347,16 @@ body:has(#app-root) [class$="-MenuList"] {
 }
 
 #app-root.theme-dark ::-webkit-scrollbar-track {
-  background: #0A2350;
+  background: #18181B;
 }
 
 #app-root.theme-dark ::-webkit-scrollbar-thumb {
-  background: #24508F;
+  background: #3F3F46;
   border-radius: 5px;
 }
 
 #app-root.theme-dark ::-webkit-scrollbar-thumb:hover {
-  background: #8FA6C8;
+  background: #A1A1AA;
 }
 
 #app-root.theme-dark .dash-loading,
@@ -1339,17 +1365,21 @@ body:has(#app-root) [class$="-MenuList"] {
 }
 
 #app-root.theme-dark .rc-slider-tooltip-inner {
-  background-color: #17376E !important;
-  color: #D6E4F7 !important;
-  border: 1px solid #24508F !important;
+  background-color: #27272A !important;
+  color: #E4E4E7 !important;
+  border: 1px solid #3F3F46 !important;
 }
 
 #app-root.theme-dark a {
-  color: #6FB4FF;
+  color: var(--text);
+  text-decoration: underline;
+  text-decoration-color: var(--border-strong);
+  text-underline-offset: 2px;
 }
 
 #app-root.theme-dark a:hover {
-  color: #6FB4FF;
+  color: #FAFAFA;
+  text-decoration-color: currentColor;
 }
 
 #app-root.theme-dark .dash-graph,
@@ -1389,7 +1419,7 @@ body:has(#app-root) [class$="-MenuList"] {
 }
 
 #app-root.theme-dark #export-format-selector label {
-  color: #B4C7E4;
+  color: #D4D4D8;
 }
 
 /* ---- Probe ranking ---- */
@@ -1596,4 +1626,82 @@ body:has(#app-root) [class$="-MenuList"] {
 
 #app-root #controls-sliders-wrap .rc-slider-rail {
   background-color: var(--seg-bg) !important;
+}
+
+/* Rosenberg CO SLED table: same height as the 560px bar chart beside it, larger text. */
+#int-co-alpha-table .probe-table-wrap { height: 560px; max-height: 560px; }
+#int-co-alpha-table .probe-table-wrap th,
+#int-co-alpha-table .probe-table-wrap td { font-size: 15px; padding: 6px 10px; }
+
+/* Attenuation impact: setup cards and per-figure options */
+.ai-step { padding: 14px 18px 16px; margin-bottom: 12px; }
+.ai-step-head {
+  display: flex; align-items: center; gap: 10px; margin-bottom: 12px;
+  font-size: var(--fs-md); font-weight: 600; color: var(--text-heading);
+}
+.ai-step-num {
+  display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px;
+  border-radius: var(--radius-pill); background: var(--accent); color: var(--on-accent);
+  font-size: var(--fs-sm); font-weight: 700;
+}
+.ai-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px 22px;
+  align-items: start;
+}
+.ai-grid + .ai-field { margin-top: 12px; }
+.ai-label { display: block; margin-bottom: 5px; font-size: var(--fs-base); font-weight: 600; }
+.ai-hint-mark { color: var(--text-muted); font-weight: 400; cursor: help; }
+.ai-tracer-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ai-run-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 2px 4px 12px; }
+.ai-options {
+  margin: 8px 0 12px; padding: 10px 14px; background: var(--sunken);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+#ai-env-wrap { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+.ai-options-title {
+  margin-bottom: 8px; font-size: var(--fs-sm); font-weight: 600; color: var(--text-muted);
+}
+
+
+/* ---- Graphite (dark): header band and native browser blues ------------- */
+#app-root.theme-dark .app-header {
+  background: linear-gradient(105deg, var(--ink) 0%, var(--deep) 100%);
+  border: 1px solid var(--border);
+  box-shadow: none;
+}
+
+#app-root.theme-dark .app-header .app-about summary {
+  color: var(--text-muted);
+}
+
+/* Checkboxes/radios, focus outlines and text selection otherwise fall back
+   to the browser's blue. */
+#app-root.theme-dark {
+  accent-color: #E4E4E7;
+}
+
+#app-root.theme-dark *:focus-visible {
+  outline: none;
+  box-shadow: var(--ring) !important;
+}
+
+#app-root.theme-dark ::selection {
+  background: rgba(250, 250, 250, 0.18);
+  color: #FAFAFA;
+}
+
+/* ---- Inline radio / checklist groups (_RADIO in app.py) -----------------
+   Options sit side by side and wrap, instead of one option per line. */
+#app-root .radio-inline {
+  display: flex !important;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: 12px;
+  row-gap: 2px;
+}
+
+#app-root .radio-inline > label {
+  display: inline-flex !important;
+  width: auto !important;
+  align-items: center;
 }

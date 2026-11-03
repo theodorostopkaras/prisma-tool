@@ -52,6 +52,7 @@ import sys
 import threading
 
 import numpy as np
+import pandas as pd
 from scipy.integrate import cumulative_trapezoid
 import h5py
 
@@ -90,6 +91,7 @@ import plot_style as ps
 import map_fit_extras as mfe
 import probe_ranking as pr
 import atten_compare as ac
+import transition_fronts as tf
 
 
 # --- CLI ----------------------------------------------------------------------
@@ -201,6 +203,10 @@ RGB_CHANNEL_COLORS = (
     {'label': 'Channel 2 (green)', 'color': '#008000'},
     {'label': 'Channel 3 (red)', 'color': '#D62728'},
 )
+# Extra abundance channels join the fractional total (KoSens adds JCO in grey).
+RGB_EXTRA_DEFAULT_SPECIES = ('JCO',)
+RGB_EXTRA_COLORS = ((0.502, 0.502, 0.502), (1.0, 0.75, 0.0), (0.0, 0.75, 0.75),
+                    (0.8, 0.2, 0.8), (0.55, 0.35, 0.15))
 RGB_GRID_TRANSITION_OPTIONS = [
     {'label': ' H \u2194 H\u2082 (dashed)', 'value': 'hh2'},
     {'label': ' C \u2194 CO (solid)', 'value': 'cco'},
@@ -283,7 +289,11 @@ PLOT_THEME_OPTIONS = [
         'value': 'dark',
     },
 ]
-DEFAULT_PLOT_THEME = 'light'
+DEFAULT_PLOT_THEME = 'dark'
+# ponytail: Dash 4.2's Input stepper turns the value into NaN (blank box) when
+# ``min`` is set without ``max``; every bounded-below number input gets this
+# ceiling. Drop once fixed upstream (tests/test_number_inputs.py guards it).
+NUM_INPUT_MAX = 1e12
 PLOT_THEMES = {
     'light': dict(
         paper_bg='#ffffff',
@@ -312,30 +322,30 @@ PLOT_THEMES = {
         accent='#1560CE',
     ),
     'dark': dict(
-        paper_bg='#0A2350',
-        plot_bg='#041538',
-        grid='#17376E',
-        axis_line='#24508F',
-        title='#EAF2FF',
-        font='#D6E4F7',
-        muted='#8FA6C8',
-        heading='#EAF2FF',
-        legend_bg='rgba(10,35,80,0.94)',
-        legend_border='#24508F',
-        placeholder='#8FA6C8',
-        placeholder_plot='#071F47',
+        paper_bg='#18181B',
+        plot_bg='#141416',
+        grid='#27272A',
+        axis_line='#3F3F46',
+        title='#FAFAFA',
+        font='#E4E4E7',
+        muted='#A1A1AA',
+        heading='#FAFAFA',
+        legend_bg='rgba(24,24,27,0.94)',
+        legend_border='#3F3F46',
+        placeholder='#A1A1AA',
+        placeholder_plot='#141416',
         contour_line='rgba(255,255,255,0.35)',
-        vline='rgba(214,228,247,0.45)',
-        controls_bg='#0A2350',
-        page_bg='#041538',
-        card_bg='#0A2350',
-        card_border='#17376E',
-        input_bg='#061A40',
-        input_border='#24508F',
-        tab_border='#17376E',
-        tab_bg='#071F47',
-        tab_sel_bg='#0A2350',
-        accent='#2B8CFF',
+        vline='rgba(228,228,231,0.45)',
+        controls_bg='#18181B',
+        page_bg='#0F0F11',
+        card_bg='#18181B',
+        card_border='#27272A',
+        input_bg='#131316',
+        input_border='#3F3F46',
+        tab_border='#27272A',
+        tab_bg='#141416',
+        tab_sel_bg='#18181B',
+        accent='#E4E4E7',
     ),
 }
 UI_FONT = "'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', sans-serif"
@@ -356,10 +366,11 @@ KEY_NELECTR = 'n_electr'     # electron density n(e-) (Densities)
 KEY_HEAT_CR = 'heatrate_cr'  # cosmic-ray heating component (Heating rates, col 3)
 KEY_COSRAY  = 'cosray'       # CR ionisation rate profile (Gas state)
 KEY_NH2_PROFILE = 'cd_prof_h2'  # H2 column-density profile (Local quantities)
+KEY_NHI_PROFILE = 'cd_prof_h'    # atomic-H column-density profile (Local quantities)
 KEY_RADIUS  = 'radius'       # radial profile (pc) for integrated abundances
 
 CR_ATTEN_XAXIS_OPTIONS = [
-    {'label': ' N<sub>H₂</sub> [cm⁻²]', 'value': 'nh2'},
+    {'label': ' N<sub>H</sub> = N(H) + 2N(H₂) [cm⁻²]', 'value': 'nh2'},
     {'label': ' A<sub>V</sub> [mag]', 'value': 'av'},
 ]
 
@@ -402,6 +413,8 @@ _PLANE_AXIS_SHORT = {
 CONTOUR_DIAGNOSTICS = [
     ('tgas', 'T<sub>gas</sub> (cloud edge)'),
     ('tgas_col', 'T<sub>gas</sub> (column avg)'),
+    ('atten_mass_frac', 'f<sub>att</sub> (CR-attenuated mass fraction)'),
+    ('clump_column_N_H', 'N<sub>H</sub> = N(H) + 2N(H₂) + N(H⁺) (clump column)'),
     ('tdust', 'T<sub>dust</sub> (cloud edge)'),
     ('nh', 'n<sub>H</sub> (cloud edge)'),
     ('xe', 'x<sub>e</sub> = n(e<sup>-</sup>)/n<sub>H</sub> (cloud edge)'),
@@ -761,7 +774,7 @@ def read_hdf5_grid_physicals(path):
     Missing keys are omitted (not defaulted).
     """
     wanted = {
-        'protdens', 'cmass', 'metal', 'radm_ini', 'cosray', 'zeta',
+        'protdens', 'cmass', 'metal', 'radm_ini', 'cosray', 'zeta_local', 'zeta',
         'av', 'radius', 'distance',
     }
     phys = {}
@@ -779,8 +792,9 @@ def read_hdf5_grid_physicals(path):
             crir = None
             if 'cosray' in fmap:
                 crir = _hdf5_first_float(hf, *fmap['cosray'])
-            if crir is None and 'zeta' in fmap:
-                crir = _hdf5_first_float(hf, *fmap['zeta'])
+            for alt in ('zeta_local', 'zeta'):   # renamed KOSMA-τ ζ (KoSens fd03c61)
+                if crir is None and alt in fmap:
+                    crir = _hdf5_first_float(hf, *fmap[alt])
             if crir is not None:
                 phys['crir'] = abs(crir)
             for key, value in _pdr_config_physicals(hf).items():
@@ -1154,10 +1168,25 @@ def overlay_file(values):
         or _overlay['by_non_atten'].get(tokens[:N_PARAMS - 1])
 
 
+def _charge(token):
+    t = token.strip()
+    return t.count('+') - t.count('-') if t and t[-1] in '+-' else 0
+
+
 def _reaction_label(raw):
-    """Turn a metadata label 'Formation rate CO | A + B > C + D' into 'A + B \u2192 C + D'."""
+    """Turn a metadata label 'Formation rate CO | A + B > C + D' into 'A + B \u2192 C + D'.
+
+    KOSMA-\u03c4 metadata drops the '+' of the last product ('HEH+ + H2 > HE + H3',
+    filed under H3+ formation), so a label one charge short on the right gets
+    it back; balanced labels are never touched.
+    """
     txt = raw.split('|')[-1].strip() if '|' in raw else raw.strip()
-    return txt.replace(' > ', ' \u2192 ')
+    txt = txt.replace(' > ', ' \u2192 ')
+    lhs, arrow, rhs = txt.partition(' \u2192 ')
+    if arrow and (sum(map(_charge, lhs.split(' + ')))
+                  - sum(map(_charge, rhs.split(' + ')))) == 1:
+        txt += '+'
+    return txt
 
 
 def build_chem_structure(sample_file):
@@ -1403,7 +1432,7 @@ def scan_simline(directory, recursive=False):
     """Scan a SIMLINE output directory for per-model ``.smli`` intensity files."""
     global _simline, _smli_cache
     _smli_cache = {}
-    _simline = _scan_simline_directory(directory, recursive, build_by_non_atten=False)
+    _simline = _scan_simline_directory(directory, recursive, build_by_non_atten=True)
     return _simline
 
 
@@ -1941,9 +1970,8 @@ def smli_file(tokens, species, idef, overlay=False):
     path = store['files'].get((file_key, species, idef))
     if path:
         return path
-    if overlay:
-        return store.get('by_non_atten', {}).get((file_key[:N_PARAMS - 1], species, idef))
-    return None
+    # Attenuation token differs from the grid's (e.g. _00 grid, _40 .smli): match on the other axes.
+    return store.get('by_non_atten', {}).get((file_key[:N_PARAMS - 1], species, idef))
 
 
 def model_core_from_token_tuple(tok_tuple):
@@ -2005,8 +2033,8 @@ def _sp_transition_options(tokens, species, quantity='intensity'):
     def _sort_key(tr):
         row = smli_rows.get(tr)
         if row and np.isfinite(row.get('frequency', np.nan)):
-            return float(row['frequency'])
-        return str(tr)
+            return (0, float(row['frequency']), '')
+        return (1, 0.0, str(tr))
 
     opts = []
     for tr in sorted(raw_list, key=_sort_key):
@@ -2023,8 +2051,25 @@ def get_smli_intensity(tokens, species, idef, transition_idx, overlay=False):
         return np.nan
     rows = read_smli_file(path)
     try:
-        return float(rows[int(transition_idx)]['intensity'])
-    except (IndexError, TypeError, ValueError):
+        idx = int(transition_idx)
+    except (TypeError, ValueError):
+        return np.nan
+    # Row order differs between models (and between main / overlay grids), so the
+    # transition is matched by rest frequency when it is known (KoSens
+    # ``_resolve_smli_transition_row``); the index is only a fallback.
+    opts = _simline_transition_options(species, idef)
+    f_ref = opts[idx]['frequency'] if 0 <= idx < len(opts) else np.nan
+    if np.isfinite(f_ref) and f_ref > 0:
+        freqs = np.array([r['frequency'] for r in rows], dtype=float)
+        ok = np.isfinite(freqs)
+        if ok.any():
+            j = int(np.nanargmin(np.where(ok, np.abs(freqs - f_ref), np.inf)))
+            if abs(freqs[j] - f_ref) <= 1e-4 * f_ref:
+                return float(rows[j]['intensity'])
+            return np.nan  # line missing in this model
+    try:
+        return float(rows[idx]['intensity'])
+    except IndexError:
         return np.nan
 
 
@@ -2079,7 +2124,7 @@ def _simline_line_key_options(idef):
 def run_map_fit_job(maps_json, errors_json, output_dir, idef,
                     target_nz, target_ny, target_nx, method,
                     chi2_i, chi2_j, create_ratios, create_model_ratios,
-                    chi2_analysis, uncertainty_maps):
+                    chi2_analysis, uncertainty_maps, atten_refit=False):
     """Build 3-D intensity cubes and run KoSens3D map fit."""
     global _fit_results
     if not _grid:
@@ -2146,6 +2191,26 @@ def run_map_fit_job(maps_json, errors_json, output_dir, idef,
         create_uncertainty_maps=bool(uncertainty_maps and 'unc' in uncertainty_maps),
         axis_config=axis_cfg,
     )
+    if atten_refit and _simline_overlay:
+        # KoSens ``fit_fits_maps_to_grids_3d(grid_dicts_3d_atten=…)``: refit with the
+        # attenuated grids; ε_att = log10(z_atten / z_const) per pixel.
+        grids_att = gf.build_grids_3d_dict(
+            _grid['axis_tokens'], _grid_decode_param, _grid_param_logscale,
+            lambda tokens, sp, idf, ti: get_smli_intensity(tokens, sp, idf, ti, overlay=True),
+            _simline, idef, line_names=line_names, target_shape=shape,
+            method=method or DEFAULT_INTERP_METHOD)
+        att = gf.run_map_fit(
+            observed_fits_files=maps, obs_errors=errors, grid_dicts_3d=grids_att,
+            output_dir=out_dir, target_units=gf.target_units_for_idef(idef),
+            create_ratios=bool(create_ratios and 'ratios' in create_ratios),
+            create_model_ratios=bool(create_model_ratios and 'model_ratios' in create_model_ratios),
+            create_chi2_analysis=False, axis_config=axis_cfg, output_prefix='fitted_atten')
+        shift = gf.attenuation_shift_map(_fit_results['z_param_map'], att['z_param_map'])
+        _fit_results['atten_fit'] = att
+        _fit_results['atten_shift_map'] = shift
+        _fit_results['atten_shift_fits_path'] = gf.write_map_fits(
+            os.path.join(out_dir, f"fitted_{axis_cfg['axis_z']}_atten_shift_dex.fits"),
+            shift, fits_header)
     _fit_results['output_dir'] = out_dir
     _fit_results['grid_shape'] = shape
     _fit_results['lines_fitted'] = line_names
@@ -2226,15 +2291,32 @@ def _chem_labels_for_file(filepath, species, mode):
 
 # --- Profile reading ----------------------------------------------------------
 
-def _read_field(hf, key):
-    """Read a full depth profile for a metadata field key."""
-    if key not in _field_map:
-        return None
-    path, idx = _field_map[key]
-    arr = np.asarray(hf[path][:], dtype=float)
-    if arr.ndim == 1:
-        return arr
-    return arr[:, idx]
+# Newer KOSMA-τ stores the ζ(r) profile as ``zeta_local`` (Auxiliary) instead of a
+# ``cosray`` column in Gas state; a grid can mix both layouts (KoSens fd03c61).
+_FIELD_FALLBACKS = {KEY_COSRAY: ('zeta_local',)}
+_PROFILE_FIELD_KEYS = {KEY_NH, KEY_AV, KEY_TGAS, KEY_TDUST, KEY_NELECTR, KEY_COSRAY,
+                       'zeta_local', KEY_NH2_PROFILE, KEY_NHI_PROFILE, KEY_RADIUS}
+
+
+def _read_field(hf, key, fmap=None):
+    """Read a full depth profile for a metadata field key.
+
+    ``fmap`` is this file's own field map (column layouts differ between files of
+    one grid); it defaults to the grid-wide ``_field_map``.
+    """
+    fmap = _field_map if fmap is None else fmap
+    for name in (key, *_FIELD_FALLBACKS.get(key, ())):
+        if name not in fmap:
+            continue
+        path, idx = fmap[name]
+        try:
+            arr = np.asarray(hf[path][:], dtype=float)
+        except (KeyError, TypeError, OSError, ValueError):
+            return None
+        if arr.ndim == 1:
+            return arr
+        return arr[:, idx] if idx < arr.shape[1] else None
+    return None
 
 
 def _read_optional(hf, path):
@@ -2262,7 +2344,8 @@ def get_model(filepath):
     if filepath in _profile_cache:
         return _profile_cache[filepath]
     with h5py.File(filepath, 'r') as hf:
-        nH = _read_field(hf, KEY_NH)
+        fmap = _hdf5_wanted_field_map(hf, _PROFILE_FIELD_KEYS) or _field_map
+        nH = _read_field(hf, KEY_NH, fmap)
         dens = _read_optional(hf, DENS_PATH)
         rel = _read_optional(hf, RELDENS_PATH)
         if rel is None and dens is not None and nH is not None:
@@ -2272,14 +2355,15 @@ def get_model(filepath):
         if dens is None:
             dens = np.zeros((0, 0))
         model = dict(
-            av     = _read_field(hf, KEY_AV),
+            av     = _read_field(hf, KEY_AV, fmap),
             nH     = nH,
-            tgas   = _read_field(hf, KEY_TGAS),
-            tdust  = _read_field(hf, KEY_TDUST),
-            nelectr = _read_field(hf, KEY_NELECTR),
-            cosray = _read_field(hf, KEY_COSRAY),
-            nh2_profile = _read_field(hf, KEY_NH2_PROFILE),
-            radius = _read_field(hf, KEY_RADIUS),
+            tgas   = _read_field(hf, KEY_TGAS, fmap),
+            tdust  = _read_field(hf, KEY_TDUST, fmap),
+            nelectr = _read_field(hf, KEY_NELECTR, fmap),
+            cosray = _read_field(hf, KEY_COSRAY, fmap),
+            nh2_profile = _read_field(hf, KEY_NH2_PROFILE, fmap),
+            nh_profile = _read_field(hf, KEY_NHI_PROFILE, fmap),
+            radius = _read_field(hf, KEY_RADIUS, fmap),
             rel    = rel,
             dens   = dens,
             heat   = _read_optional(hf, HEATING_PATH),
@@ -2351,6 +2435,15 @@ def _integrate_sphere_columns(radius_pc, dens):
     return np.trapezoid(integrand, radius_cm, axis=0)
 
 
+def _total_h_nuclei(model):
+    """∫4πr² n_H dr with n_H = protdens = n(H)+2n(H₂)+n(H⁺) (KoSens Abundance_Calculator)."""
+    nh = model.get('nH') if model else None
+    if nh is None or model.get('radius') is None:
+        return np.nan
+    tot = _integrate_sphere(model['radius'], np.asarray(nh, dtype=float))
+    return tot if np.isfinite(tot) and tot > 0 else np.nan
+
+
 def _integrated_x_for_species(model, species_names):
     """Clump-integrated X for many species from one dens array."""
     out = {sp: np.nan for sp in species_names}
@@ -2375,7 +2468,9 @@ def _integrated_x_for_species(model, species_names):
         return out
     masses = _integrate_sphere_columns(model['radius'], dens[:, cols])
     mass_of = {c: masses[i] for i, c in enumerate(cols)}
-    m_total = mass_of.get(idx_h, np.nan) + 2.0 * mass_of.get(idx_h2, np.nan)
+    m_total = _total_h_nuclei(model)
+    if not np.isfinite(m_total):
+        m_total = mass_of.get(idx_h, np.nan) + 2.0 * mass_of.get(idx_h2, np.nan)
     if not np.isfinite(m_total) or m_total <= 0:
         return out
     for sp in species_names:
@@ -2483,7 +2578,9 @@ def integrated_rel_abundance(model, species):
     m_h = _integrate_sphere(radius, dens[:, idx_h])
     m_h2 = _integrate_sphere(radius, dens[:, idx_h2])
     m_sp = _integrate_sphere(radius, dens[:, idx])
-    m_total = m_h + 2.0 * m_h2
+    m_total = _total_h_nuclei(model)
+    if not np.isfinite(m_total):
+        m_total = m_h + 2.0 * m_h2
     if not np.isfinite(m_total) or m_total <= 0:
         return np.nan
     return m_sp / m_total
@@ -2526,6 +2623,14 @@ def total_column_density(filepath, species):
         return np.nan
 
 
+def clump_column_nh(filepath):
+    """Clump column N_H = cd_h + 2 cd_h2 + cd_hp [cm⁻²] (KoSens ``clump_column_N_H``)."""
+    n_h, n_h2, n_hp = (total_column_density(filepath, sp) for sp in ('H', 'H2', 'H+'))
+    if not (np.isfinite(n_h) and np.isfinite(n_h2)):
+        return np.nan
+    return float(n_h + 2.0 * n_h2 + (n_hp if np.isfinite(n_hp) else 0.0))
+
+
 def column_averaged_tgas(model):
     """n_H-weighted column-averaged gas temperature (KoSens LOS convention).
 
@@ -2551,6 +2656,24 @@ def column_averaged_tgas(model):
     if not np.isfinite(denom) or denom <= 0:
         return np.nan
     return float(np.trapezoid(tgas_cm * nH_cm, radius_cm) / denom)
+
+
+def atten_mass_fraction(model):
+    """CR-attenuated mass fraction f_att of one model (KoSens ``atten_mass_frac``).
+
+    Shells past N_eff = N(H2) + N(H)/2 = 1e20 cm⁻², weighted by 4πr² n_H on the same
+    LOS grid as ``column_averaged_tgas``.  NaN for outputs without ``cd_prof_h``.
+    """
+    radius, nH = model.get('radius'), model.get('nH')
+    nh2, nh = model.get('nh2_profile'), model.get('nh_profile')
+    if any(v is None for v in (radius, nH, nh2, nh)):
+        return np.nan
+    n = min(len(radius), len(nH), len(nh2), len(nh))
+    if n < 2:
+        return np.nan
+    radius_cm, nH_cm = _los_profiles(radius[:n], nH[:n])
+    _, n_eff = _los_profiles(radius[:n], cra.effective_column(nh2[:n], nh[:n]))
+    return cra.attenuated_mass_fraction(radius_cm, 4.0 * np.pi * radius_cm ** 2 * nH_cm, n_eff)
 
 
 def electron_fraction_edge(model):
@@ -2689,28 +2812,32 @@ def _gas_grain_shell_split(rate_combined, tgas, tdust):
     return np.maximum(rate, 0.0), np.maximum(-rate, 0.0)
 
 
-def _grid_heat_cool_dataframes(values):
+def _grid_heat_cool_dataframes(values, overlay=False, y_param='density'):
     """Integrate heating/cooling per model over the (density, CRIR) subgrid.
 
     FUV / mass / metallicity / attenuation are held at the current slider tokens;
     density and CRIR vary. Each component is volume-integrated KoSens-style
-    (``4*pi*r^2 * rate * n dr`` with radius flipped, prepended, converted pc->cm),
+    (``4*pi*r^2 * rate dr``, rates already per volume, with radius flipped, prepended, converted pc->cm),
     and the gas-grain cooling channel is split into cooling vs dust->gas heating.
 
     Returns ``dict(n=..., crir=..., heat={label: arr}, cool={label: arr})`` with
-    one entry per model, or ``None`` when unavailable.
+    one entry per model, or ``None`` when unavailable.  ``overlay=True`` reads the
+    attenuated twin of every main-grid model from the HDF5 overlay instead.
+    ``y_param`` (e.g. ``'fuv'``) varies in place of density; ``n`` then holds its log10.
     """
-    if not (_grid and _grid.get('has_hdf5')):
+    if not (_grid and _grid.get('has_hdf5')) or (overlay and not _overlay):
         return None
     base = _tokens_from_values(values)
     if base is None:
         return None
-    idx_dens = _PARAM_IDX['density']
+    idx_dens = _PARAM_IDX[y_param]
     idx_crir = _PARAM_IDX['crir']
     fixed = tuple((i, base[i]) for i in range(N_PARAMS)
                   if i not in (idx_dens, idx_crir))
-    if fixed in _heatcool_crir_cache:
-        return _heatcool_crir_cache[fixed]
+    fixed = fixed + (('overlay', _overlay.get('directory')),) if overlay else fixed
+    cache_key = fixed + (('y', y_param),)
+    if cache_key in _heatcool_crir_cache:
+        return _heatcool_crir_cache[cache_key]
 
     dens_def = PARAM_DEFS[idx_dens]
     crir_def = PARAM_DEFS[idx_crir]
@@ -2720,8 +2847,12 @@ def _grid_heat_cool_dataframes(values):
     cool_acc = {lbl: [] for lbl, _ in _cool_components}
 
     for tokens, path in _grid['files'].items():
-        if any(tokens[i] != tok for i, tok in fixed):
+        if any(tokens[i] != tok for i, tok in fixed[:len(fixed) - int(bool(overlay))]):
             continue
+        if overlay:
+            path = _overlay_path_for_tokens(tokens)
+            if not path:
+                continue
         model = get_model(path)
         if model is None or model.get('heat') is None or model.get('radius') is None:
             continue
@@ -2730,10 +2861,10 @@ def _grid_heat_cool_dataframes(values):
         if radius.size == 0 or nH.size == 0:
             continue
         r_comb = np.insert(radius[::-1], 0, 0.0) * PC_TO_CM
-        d_comb = np.insert(nH[::-1], 0, nH[::-1][0])
-        m = min(r_comb.size, d_comb.size)
-        r_comb, d_comb = r_comb[:m], d_comb[:m]
-        shell = 4.0 * np.pi * r_comb ** 2 * d_comb
+        m = r_comb.size
+        # Rates are already per volume (erg cm⁻³ s⁻¹): no density weight
+        # (KoSens ``total_heating_cooling_calculation``).
+        shell = 4.0 * np.pi * r_comb ** 2
 
         def _integrate(col):
             c_comb = np.insert(col[::-1], 0, col[::-1][0])
@@ -2782,7 +2913,7 @@ def _grid_heat_cool_dataframes(values):
     gg = result['heat'].get(_GAS_GRAIN_HEAT_LABEL)
     if gg is None or not np.any(np.isfinite(gg) & (gg != 0.0)):
         result['heat'].pop(_GAS_GRAIN_HEAT_LABEL, None)
-    _heatcool_crir_cache[fixed] = result
+    _heatcool_crir_cache[cache_key] = result
     return result
 
 
@@ -2840,6 +2971,200 @@ def _apply_crir_layout(fig, theme, height, title='', legends='single'):
                      tickfont=ps.tick_font(t['font']))
     _apply_title_box(fig, title, theme, yshift=34)
     return fig
+
+
+def fig_heat_cool_share_bars(datasets, densities, min_rate=0.0, min_points=2,
+                             top_n=None, label_min=10.0, theme='light'):
+    """Stacked % share of each channel in total heating (top) / cooling (bottom) vs CRIR.
+
+    KoSens ``plot_heating_cooling_share_bars``: ``datasets`` = ``[(label, data), …]``
+    from ``_grid_heat_cool_dataframes`` (main grid, then the attenuated overlay).
+    At each ζ the grids stand side by side, the first plain, the next hatched.
+    Share = |rate| / Σ|rates| of that model.  The stacked channels are those the
+    absolute figure draws for the first grid; the rest of the total is grey "Other".
+    Heating keeps the line-figure colours; cooling takes palette colours heating
+    does not use.
+    """
+    dens_list = [float(d) for d in (densities or [])]
+    datasets = [(lbl, d) for lbl, d in datasets if d]
+    if not dens_list or not datasets:
+        return placeholder_fig('Select at least one density', theme=theme)
+    first = datasets[0][1]
+    rows_all = np.concatenate([o for o in (_select_density(first, d)[0] for d in dens_list)
+                               if o is not None] or [np.array([], dtype=int)])
+    shown, colour = {}, {}
+    for kind in ('heat', 'cool'):
+        cols = list(first[kind])
+        keep = [c for c in cols if first[kind][c].size
+                and np.nanmax(np.abs(first[kind][c])) >= min_rate
+                and any(int(np.sum(np.abs(first[kind][c][o]) >= min_rate)) >= min_points
+                        for o in (_select_density(first, d)[0] for d in dens_list)
+                        if o is not None)]
+        shown[kind] = _top_n_rate_channels(first[kind], keep, rows_all, top_n, min_rate)
+        if kind == 'heat':
+            for c in shown[kind]:
+                colour['heat', c] = _DISTINCT_PALETTE[cols.index(c) % len(_DISTINCT_PALETTE)]
+    used = {colour['heat', c].lower() for c in shown['heat']}
+    free = iter(c for c in _DISTINCT_PALETTE if c.lower() not in used)
+    for c in shown['cool']:
+        colour['cool', c] = next(free, '#888888')
+
+    n_cols = len(dens_list)
+    fig = make_subplots(rows=2, cols=n_cols, shared_yaxes=True, shared_xaxes=True,
+                        subplot_titles=[f'log\u2081\u2080(n) = {d:.1f}' for d in dens_list],
+                        vertical_spacing=0.09, horizontal_spacing=0.04)
+    width = 0.88 / len(datasets)
+    patterns = ['', '/', 'x', '.']
+    seen = set()
+    for row, kind in enumerate(('heat', 'cool'), start=1):
+        names = _HEAT_NAME_DICT if kind == 'heat' else _COOL_NAME_DICT
+        legend = 'legend' if kind == 'heat' else 'legend2'
+        for ci, n_val in enumerate(dens_list, start=1):
+            for k, (label, data) in enumerate(datasets):
+                order, x = _select_density(data, n_val)
+                if order is None:
+                    continue
+                mat = np.abs(np.array([data[kind][c][order] for c in data[kind]], float))
+                total = np.nansum(mat, axis=0)
+                xpos = np.arange(len(order)) + (k - (len(datasets) - 1) / 2) * (width + 0.01)
+                bottom = np.zeros(len(order))
+                for c in shown[kind] + ['_other']:
+                    if c == '_other':
+                        v = np.clip(100.0 - bottom, 0, None)
+                        name, color = 'Other', '#d9d9d9'
+                    else:
+                        if c not in data[kind]:
+                            continue
+                        with np.errstate(invalid='ignore', divide='ignore'):
+                            v = np.nan_to_num(100.0 * np.abs(data[kind][c][order]) / total)
+                        name, color = names.get(c, c), colour[kind, c]
+                    key = (kind, c)
+                    text = [f'{vi:.0f}%' if label_min is not None and vi >= label_min
+                            and c != '_other' else '' for vi in v]
+                    fig.add_trace(go.Bar(
+                        x=xpos, y=v, base=bottom, width=width, name=name,
+                        marker=dict(color=color, line=dict(color='black', width=0.4),
+                                    pattern=dict(shape=patterns[k % len(patterns)])),
+                        text=text, textposition='inside', insidetextanchor='middle',
+                        textfont=dict(size=10), legendgroup=f'{kind}:{c}',
+                        showlegend=key not in seen, legend=legend,
+                        customdata=np.stack([x, np.full(len(x), k)], axis=-1),
+                        hovertemplate=(f'{label}<br>{name}: %{{y:.1f}}%<br>'
+                                       'log ζ = %{customdata[0]:.2f}<extra></extra>')),
+                        row=row, col=ci)
+                    seen.add(key)
+                    bottom = bottom + v
+            ticks = _select_density(first, n_val)[1]
+            if ticks is not None:
+                fig.update_xaxes(tickvals=list(range(len(ticks))),
+                                 ticktext=[f'{t:.1f}' for t in ticks], row=row, col=ci)
+            if row == 2:
+                fig.update_xaxes(title_text=_CRIR_XLABEL, row=2, col=ci)
+    fig.update_layout(barmode='overlay', bargap=0.1)
+    fig.update_yaxes(range=[0, 100], row=1, col=1, title_text='Heating share [%]')
+    fig.update_yaxes(range=[0, 100], row=2, col=1, title_text='Cooling share [%]')
+    title = 'Heating / cooling share per channel vs CRIR'
+    if len(datasets) > 1:
+        title += '  ·  ' + '  vs  '.join(
+            f'{lbl} ({"plain" if k == 0 else "hatched"})' for k, (lbl, _d) in enumerate(datasets))
+    return _apply_crir_layout(fig, theme, height=900, legends='heat_cool', title=title)
+
+
+_REGIME_COLORS = ('#1f77b4', '#d62728', '#ff7f0e', '#e377c2')
+
+
+def _regime_diff_grid(data, kind, label_1, label_2, xs, ys):
+    """``rate_1 − rate_2`` on the (y, x) = (n or χ, ζ) model grid (NaN where no model)."""
+    block = data[kind]
+    grid = np.full((len(ys), len(xs)), np.nan)
+    if label_1 not in block or label_2 not in block:
+        return grid
+    ix = {round(v, 6): j for j, v in enumerate(xs)}
+    iy = {round(v, 6): i for i, v in enumerate(ys)}
+    for k, (yv, xv) in enumerate(zip(data['n'], data['crir'])):
+        i, j = iy.get(round(float(yv), 6)), ix.get(round(float(xv), 6))
+        if i is not None and j is not None:
+            grid[i, j] = block[label_1][k] - block[label_2][k]
+    return grid
+
+
+def _cell_edge_range(vals, lim):
+    """Axis range covering whole cells of the grid values inside ``lim`` (log10)."""
+    v = np.asarray(vals, float)
+    if v.size < 2:
+        return None
+    mid = 0.5 * (v[1:] + v[:-1])
+    edges = np.concatenate(([2 * v[0] - mid[0]], mid, [2 * v[-1] - mid[-1]]))
+    inside = np.nonzero((v >= lim[0] - 1e-9) & (v <= lim[1] + 1e-9))[0] if lim else np.arange(v.size)
+    if not inside.size:
+        return None
+    return [float(edges[inside[0]]), float(edges[inside[-1] + 1])]
+
+
+def fig_rate_regime_boundary(data, label_1, label_2, kind='heat', data_atten=None,
+                             y_label='log\u2081\u2080(n) [cm\u207B\u00B3]', x_lim=None,
+                             y_lim=None, theme='light'):
+    """Where does ``label_1`` beat ``label_2``? KoSens ``plot_rate_regime_boundary``.
+
+    One flat cell per model on the (ζ, y) grid: blue ``label_1 < label_2``, red
+    ``label_1 > label_2``.  With the attenuated grid (``data_atten``) cells whose
+    dominant channel flips are orange (``label_2`` → ``label_1`` when ζ is
+    attenuated, e.g. PE → CR) or magenta (the reverse).  ``label_2='all'`` draws
+    one panel per other channel.  ``x_lim`` / ``y_lim`` (log10) are widened to
+    whole cells.
+    """
+    if not data or label_1 not in data[kind]:
+        return placeholder_fig('Pick a channel present in this grid', theme=theme)
+    block = data[kind]
+    others = ([c for c in block if c != label_1 and np.any(np.isfinite(block[c]) & (block[c] != 0))]
+              if label_2 == 'all' else [label_2])
+    others = [c for c in others if c in block]
+    if not others:
+        return placeholder_fig('Pick a second channel', theme=theme)
+    names = _HEAT_NAME_DICT if kind == 'heat' else _COOL_NAME_DICT
+    xs, ys = np.unique(np.round(data['crir'], 6)), np.unique(np.round(data['n'], 6))
+    n_cols = min(3, len(others))
+    n_rows = int(np.ceil(len(others) / n_cols))
+    fig = make_subplots(rows=n_rows, cols=n_cols,
+                        subplot_titles=[f'{names.get(label_1, label_1)} vs {names.get(c, c)}'
+                                        for c in others],
+                        horizontal_spacing=0.08, vertical_spacing=0.12)
+    scale = [[b / 4, c] for i, c in enumerate(_REGIME_COLORS) for b in (i, i + 1)]  # stepped
+    present = set()
+    for p, other in enumerate(others):
+        row, col = p // n_cols + 1, p % n_cols + 1
+        diff = _regime_diff_grid(data, kind, label_1, other, xs, ys)
+        regime = np.where(np.isfinite(diff), (diff > 0).astype(float), np.nan)
+        if data_atten:
+            d_att = _regime_diff_grid(data_atten, kind, label_1, other, xs, ys)
+            regime = np.where((diff < 0) & (d_att > 0), 2.0, regime)
+            regime = np.where((diff > 0) & (d_att < 0), 3.0, regime)
+        present |= {int(v) for v in np.unique(regime[np.isfinite(regime)])}
+        fig.add_trace(go.Heatmap(
+            x=xs, y=ys, z=regime, zmin=-0.5, zmax=3.5, colorscale=scale, showscale=False,
+            opacity=0.75, xgap=1, ygap=1, customdata=diff,
+            hovertemplate=('log ζ = %{x:.2f}<br>y = %{y:.2f}<br>'
+                           'rate₁ − rate₂ = %{customdata:.3g}<extra></extra>')),
+            row=row, col=col)
+        fig.update_xaxes(title_text=_CRIR_XLABEL if row == n_rows else None,
+                         range=_cell_edge_range(xs, x_lim), row=row, col=col)
+        fig.update_yaxes(title_text=y_label if col == 1 else None,
+                         range=_cell_edge_range(ys, y_lim), row=row, col=col)
+    l1 = names.get(label_1, label_1)
+    l2 = names.get(label_2, label_2) if label_2 != 'all' else 'other'
+    legend = {1: f'{l1} > {l2}', 0: f'{l1} < {l2}',
+              2: f'{l2} \u2192 {l1} (\u03B6 atten.)', 3: f'{l1} \u2192 {l2} (\u03B6 atten.)'}
+    for k, text in legend.items():
+        if k in present:
+            fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers', name=text,
+                                     marker=dict(symbol='square', size=14,
+                                                 color=_REGIME_COLORS[k])))
+    kind_name = 'heating' if kind == 'heat' else 'cooling'
+    title = f'Dominant {kind_name} channel per model'
+    if data_atten:
+        title += '  ·  orange / magenta: flips when ζ is attenuated'
+    return _apply_crir_layout(fig, theme, height=max(520, 420 * n_rows), legends='single',
+                              title=title)
 
 
 def _empty_panel_note(fig, row, col, text='No models'):
@@ -2902,8 +3227,26 @@ def fig_heating_contributions_vs_crir(data, densities, threshold=0.01, theme='li
                               title='Normalized heating / cooling contributions vs CRIR')
 
 
-def fig_absolute_heating_cooling_vs_crir(data, densities, min_rate=1e23,
-                                         min_points=2, show_totals=True, theme='light'):
+def _top_n_rate_channels(block, cols, rows, top_n, min_rate):
+    """Channels in the top ``top_n`` by |rate| in at least one model of ``rows``.
+
+    KoSens ``plot_absolute_heating_cooling_vs_crir(top_n=…)``: entries below
+    ``min_rate`` are ignored for the ranking; totals still sum every channel.
+    """
+    if not top_n or top_n <= 0 or not cols or rows.size == 0:
+        return list(cols)
+    mat = np.abs(np.array([block[c][rows] for c in cols], dtype=float))
+    mat = np.where(np.isfinite(mat) & (mat >= min_rate) & (mat > 0), mat, -np.inf)
+    keep = set()
+    for j in range(mat.shape[1]):
+        top = np.argsort(mat[:, j])[::-1][:int(top_n)]
+        keep.update(int(i) for i in top if np.isfinite(mat[i, j]))
+    return [c for i, c in enumerate(cols) if i in keep]
+
+
+def fig_absolute_heating_cooling_vs_crir(data, densities, min_rate=0.0,
+                                         min_points=2, show_totals=True, theme='light',
+                                         top_n=None):
     """Absolute heating (top row) and cooling (bottom row) vs CRIR, log y."""
     dens_list = [float(d) for d in (densities or [])]
     if not dens_list:
@@ -2918,6 +3261,12 @@ def fig_absolute_heating_cooling_vs_crir(data, densities, min_rate=1e23,
                  if data['heat'][c].size and np.nanmax(np.abs(data['heat'][c])) >= min_rate]
     cool_keep = [c for c in cool_cols
                  if data['cool'][c].size and np.nanmax(np.abs(data['cool'][c])) >= min_rate]
+    heat_all, cool_all = list(heat_keep), list(cool_keep)
+    if top_n:
+        rows = np.concatenate([o for o in (_select_density(data, d)[0] for d in dens_list)
+                               if o is not None] or [np.array([], dtype=int)])
+        heat_keep = _top_n_rate_channels(data['heat'], heat_keep, rows, top_n, min_rate)
+        cool_keep = _top_n_rate_channels(data['cool'], cool_keep, rows, top_n, min_rate)
     n_cols = len(dens_list)
     titles = [f'log\u2081\u2080(n) = {d:.1f}' for d in dens_list]
     fig = make_subplots(rows=2, cols=n_cols, shared_xaxes=True, shared_yaxes='rows',
@@ -2945,7 +3294,7 @@ def fig_absolute_heating_cooling_vs_crir(data, densities, min_rate=1e23,
                           name=_HEAT_NAME_DICT.get(c, c), legendgroup=key,
                           showlegend=show, legend='legend'), row=1, col=ci)
         if show_totals:
-            tot = np.abs(np.nansum([data['heat'][c][order] for c in heat_keep], axis=0))
+            tot = np.abs(np.nansum([data['heat'][c][order] for c in heat_all], axis=0))
             tot = np.where(tot >= min_rate, tot, np.nan)
             fig.add_trace(go.Scatter(x=x, y=tot, mode='lines',
                           line=dict(color='#111111', width=3),
@@ -2967,7 +3316,7 @@ def fig_absolute_heating_cooling_vs_crir(data, densities, min_rate=1e23,
                           name=_COOL_NAME_DICT.get(c, c), legendgroup=key,
                           showlegend=show, legend='legend2'), row=2, col=ci)
         if show_totals:
-            tot = np.abs(np.nansum([data['cool'][c][order] for c in cool_keep], axis=0))
+            tot = np.abs(np.nansum([data['cool'][c][order] for c in cool_all], axis=0))
             tot = np.where(tot >= min_rate, tot, np.nan)
             fig.add_trace(go.Scatter(x=x, y=tot, mode='lines',
                           line=dict(color='#111111', width=3),
@@ -3508,8 +3857,8 @@ def _title_box(text, theme, yshift=8):
         showarrow=False, align='left',
         font=dict(size=ps.PLOT_TITLE_FONT_SIZE + 2, color=t['title'],
                   family=ps.PLOT_FONT_FAMILY),
-        bgcolor=('#0E2A5C' if dark else '#EAF2FF'),
-        bordercolor=t['accent'], borderwidth=1.2, borderpad=5,
+        bgcolor=('#1F1F23' if dark else '#EAF2FF'),
+        bordercolor=('#52525B' if dark else t['accent']), borderwidth=1.2, borderpad=5,
     )
 
 
@@ -3517,6 +3866,14 @@ def _apply_title_box(fig, text, theme, yshift=8):
     """Add the shared bold/boxed title annotation to *fig* (no-op if blank)."""
     if text:
         fig.add_annotation(**_title_box(text, theme, yshift=yshift))
+    return fig
+
+
+def _apply_subject_box(fig, text, theme):
+    """Boxed species/quantity label at the top right of a grid-slice panel."""
+    if text:
+        fig.add_annotation(**{**_title_box(text, theme, yshift=6),
+                              'x': 1.0, 'xanchor': 'right', 'align': 'right'})
     return fig
 
 
@@ -3865,7 +4222,7 @@ _REACT_TABLE_STYLE = {
     'marginTop': '8px',
 }
 _REACT_TABLE_CELL = {
-    'padding': '4px 8px', 'borderBottom': '1px solid #e0e0e0',
+    'padding': '4px 8px', 'borderBottom': '1px solid var(--border)',
     'verticalAlign': 'top',
 }
 
@@ -3911,7 +4268,7 @@ def _reaction_contribution_table(order, labels, stats, mode, ranking_metric):
     rate_label = 'formation' if mode == 'formation' else 'destruction'
     ranking_metric = _parse_react_ranking(ranking_metric)
     if not order:
-        return html.P('No reactions to rank.', style={'fontSize': '12px', 'color': '#666'})
+        return html.P('No reactions to rank.', style={'fontSize': '12px', 'color': 'var(--text-muted)'})
 
     vol_method = next((stats[j]['method'] for j in order if j in stats), 'volume')
     if vol_method == 'volume':
@@ -3943,7 +4300,7 @@ def _reaction_contribution_table(order, labels, stats, mode, ranking_metric):
         wrate = st.get('weighted_rate', np.nan)
         pct = st.get('fraction_pct', np.nan)
         rows.append(html.Tr([
-            html.Td(f'{i}.', style={**_REACT_TABLE_CELL, 'width': '28px', 'color': '#666'}),
+            html.Td(f'{i}.', style={**_REACT_TABLE_CELL, 'width': '28px', 'color': 'var(--text-muted)'}),
             html.Td(lab, style={**_REACT_TABLE_CELL, 'fontFamily': 'monospace'}),
             html.Td(f'{wrate:.2e}' if np.isfinite(wrate) else '\u2014',
                     style={**_REACT_TABLE_CELL, 'whiteSpace': 'nowrap'}),
@@ -3953,7 +4310,7 @@ def _reaction_contribution_table(order, labels, stats, mode, ranking_metric):
 
     return html.Div([
         html.P(f'{rank_note} {weight_note}',
-               style={'fontSize': '11px', 'color': '#666', 'margin': '0 0 6px'}),
+               style={'fontSize': '11px', 'color': 'var(--text-muted)', 'margin': '0 0 6px'}),
         html.Table([
             html.Thead(html.Tr([
                 html.Th('#', style=_REACT_TABLE_CELL),
@@ -4118,7 +4475,8 @@ def make_reaction_plots(values, species, xscale, yscale, top_n,
                         chain_include_isotopes=False, chain_include_ice=False,
                         network_highlight=None, network_hidden=None,
                         partner_label_size=None, species_label_size=None,
-                        network_mode='full', dominant_k=3, cr_only=False):
+                        network_mode='full', dominant_k=3, cr_only=False,
+                        network_max_nodes=None, network_branches=None):
     """Return formation/destruction figures, tables, and pathway network.
 
     ``network_mode='dominant'`` keeps only each species' top-``dominant_k``
@@ -4207,7 +4565,9 @@ def make_reaction_plots(values, species, xscale, yscale, top_n,
         partner_label_size=partner_pt,
         species_label_size=species_pt,
         reaction_picker=picker,
-        cr_only=bool(cr_only) and picker is not None,
+        cr_only=bool(cr_only),
+        max_nodes=network_max_nodes,
+        branch_limit=network_branches,
     )
     return (fig_f, tbl_f, fig_d, tbl_d, fig_net,
             chem_network.status_message(net_meta))
@@ -4402,6 +4762,15 @@ def _build_probe_grids_3d(
             if k % step == 0 or k == n_models:
                 _p(0.06 + 0.70 * k / n_models,
                    f'Reading column densities ({k}/{n_models})…')
+    elif quantity in ('atten_mass_frac', 'clump_column_N_H'):
+        for k, (tokens, (iz, iy, ix)) in enumerate(tok_to_ijk.items(), 1):
+            path = _hdf5_path(tokens)
+            if path:
+                value = get_grid_scalar(path, quantity)
+                for sp in tracers:
+                    cubes[sp][iz, iy, ix] = value
+            if k % step == 0 or k == n_models:
+                _p(0.06 + 0.70 * k / n_models, f'Reading {quantity} ({k}/{n_models})…')
     else:
         if not _grid_has_hdf5():
             raise RuntimeError(
@@ -4458,7 +4827,7 @@ def _build_probe_grids_3d(
                     interpolation_method='linear',
                     smoothing_order=2,
                     clip_to_bounds=False,
-                    log_values=True,
+                    log_values=quantity not in _LINEAR_INTERP_QUANTITIES,
                 )
 
                 z_mesh, y_mesh, x_mesh = np.meshgrid(
@@ -4600,37 +4969,69 @@ def run_atten_impact_job(quantity, tracers, include_ratios, slider_values, idef,
     idef = idef or SIMLINE_DEFAULT_IDEF
     p = progress if callable(progress) else (lambda f, m: None)
     n_dens = len(_probe_axis_tokens('density'))
-    # KoSens resampling of ζ × χ; n_H keeps its native number of slices.
-    shape = (max(int(interp_n), 2),) * 2 + (n_dens,) if interp_n and n_dens >= 2 else None
+    # KoSens resampling, (ζ, χ, n_H): the 3-D workflow resamples all three axes to one
+    # cube (target_shape = (n, n, n)); a single slice keeps the native densities.
+    n_res = max(int(interp_n), 2) if interp_n else None
+    shape = ((n_res, n_res, n_res if mode == '3d' else n_dens)
+             if n_res and n_dens >= 2 else None)
+    # KoSens native_slopes: D reads the slopes of the models themselves, Δ the resampled cube.
+    want_native = mode == '3d' and shape is not None
+
+    def _cubes(qty, names, **kw):
+        """(resampled, native) grids; native is None unless it is a separate grid."""
+        out = _build_probe_grids_3d(qty, names, slider_values, idef, interp_target_shape=shape,
+                                    return_native=want_native, **kw)
+        return out if want_native else (out, None)
+
     cubes = []
     for k, (overlay, name) in enumerate(((False, 'reference'), (True, 'attenuated'))):
         lo = 0.02 + 0.24 * k
-        cubes.append(_build_probe_grids_3d(
-            quantity, tracers, slider_values, idef, interp_target_shape=shape,
-            overlay=overlay,
+        cubes.append(_cubes(
+            quantity, tracers, overlay=overlay,
             progress=lambda f, m, lo=lo, name=name: p(lo + 0.24 * f, f'{name} grid: {m}')))
-    ref, att = cubes
+    (ref, ref_native), (att, att_native) = cubes
     if include_ratios:
         pairs = _probe_ratio_pairs(quantity, tracers)
-        pr.add_ratio_grids(ref, pairs)
-        pr.add_ratio_grids(att, pairs)
+        for grids in (ref, att, ref_native, att_native):
+            if grids is not None:
+                pr.add_ratio_grids(grids, pairs)
     missing = [s for s in ref if not np.isfinite(np.asarray(att[s]['grid'], float)).any()]
     if len(missing) == len(ref):
         raise RuntimeError('No attenuated model matched the reference grid — check that the '
                            'overlay directory is the attenuated twin of the main grid.')
     densities = ac.cube_densities(next(iter(ref.values())))
+    # CR-attenuated mass fraction of the attenuated models (needs their HDF5 grid).
+    f_att = nh_cube = f_att_native = nh_native = None
+    if _overlay:
+        f_att, f_att_native = (None if g is None else g['f_att'] for g in _cubes(
+            'atten_mass_frac', ['f_att'], overlay=True,
+            progress=lambda f, m: p(0.48 + 0.01 * f, m)))
+        # Clump column N_H per cell (KoSens ``log_N_H``): shown with the box medians.
+        try:
+            nh_cube, nh_native = (None if g is None else g['N_H'] for g in _cubes(
+                'clump_column_N_H', ['N_H'], overlay=True,
+                progress=lambda f, m: p(0.49 + 0.01 * f, m)))
+        except Exception:
+            nh_cube = nh_native = None
     idx = None
     if mode == 'single':
         target = _parse_optional_float(density) or float(np.median(densities))
         idx = [int(np.argmin(np.abs(np.log10(densities) - np.log10(target))))]
     pixels = ac.collect_pixels(
         ref, att, density_indices=idx, match_rtol=match_rtol, scan_direction=scan_direction,
-        obs_limit=obs_limit if quantity == 'intensity' else None,
-        progress=lambda f, m: p(0.5 + 0.49 * f, m))
+        obs_limit=obs_limit if quantity == 'intensity' else None, f_att_cube=f_att,
+        nh_cube=nh_cube, progress=lambda f, m: p(0.5 + (0.39 if want_native else 0.49) * f, m))
     if pixels is None or not len(pixels):
         raise RuntimeError('The shift search produced no cells.')
+    native = None
+    if want_native:
+        native = {'ref_cubes': ref_native, 'pixels': ac.collect_pixels(
+            ref_native, att_native, match_rtol=match_rtol, scan_direction=scan_direction,
+            obs_limit=obs_limit if quantity == 'intensity' else None, f_att_cube=f_att_native,
+            nh_cube=nh_native, progress=lambda f, m: p(0.89 + 0.1 * f, f'Native grid: {m}'))}
     _atten_results = {
         'pixels': pixels, 'quantity': quantity, 'idef': idef, 'mode': mode,
+        'ref_cubes': ref, 'native': native,
         'densities': densities, 'missing_overlay': missing, 'workflow': None,
         'scan_direction': scan_direction, 'interp': shape,
     }
@@ -4705,6 +5106,10 @@ def _quantity_label(quantity):
         return 'T<sub>gas</sub> (K)'
     if quantity == 'tgas_col':
         return '⟨T<sub>gas</sub>⟩<sub>N</sub> (K)'
+    if quantity == 'atten_mass_frac':
+        return 'f<sub>att</sub> = M<sub>att</sub>/M<sub>clump</sub>'
+    if quantity == 'clump_column_N_H':
+        return 'N<sub>H</sub> (cm<sup>-2</sup>)'
     if quantity == 'tdust':
         return 'T<sub>dust</sub> (K)'
     if quantity == 'nh':
@@ -4847,12 +5252,16 @@ def get_grid_scalar(filepath, quantity):
     try:
         if str(quantity).startswith('cdens:'):
             val = total_column_density(filepath, quantity.split(':', 1)[1])
+        elif quantity == 'clump_column_N_H':
+            val = clump_column_nh(filepath)
         else:
             model = get_model(filepath)
             if quantity == 'tgas':
                 val = float(np.asarray(model['tgas'], float)[0])
             elif quantity == 'tgas_col':
                 val = column_averaged_tgas(model)
+            elif quantity == 'atten_mass_frac':
+                val = atten_mass_fraction(model)
             elif quantity == 'tdust':
                 val = float(np.asarray(model['tdust'], float)[0])
             elif quantity == 'nh':
@@ -5884,6 +6293,17 @@ def _ie_analysis_config(ny, nx, x_lim, y_lim, method, clip,
     return cfg
 
 
+# Bounded quantities where 0 is physical (f_att = 0: nothing attenuated): resampled in
+# linear space, since log interpolation floors zeros to the smallest positive value.
+_LINEAR_INTERP_QUANTITIES = frozenset({'atten_mass_frac'})
+
+
+def _interp_for(quantity, interp_config):
+    if quantity in _LINEAR_INTERP_QUANTITIES:
+        return {**interp_config, 'log_values': False}
+    return interp_config
+
+
 def resample_slice_grid(x_phys, y_phys, Z, xdef, ydef,
                         target_shape=(DEFAULT_INTERP_NY, DEFAULT_INTERP_NX),
                         x_lim=None, y_lim=None,
@@ -6082,8 +6502,14 @@ def fig_triple_atten_grid(plane, slice_title, Z_ref, Z_atten, x_phys, y_phys,
                           shift_rtol=X_SHIFT_MATCH_RTOL,
                           shift_scan_direction=X_SHIFT_SCAN_DIRECTION,
                           colorscale=DEFAULT_GRID_COLORMAP, theme='light',
-                          line_contours=None):
-    """Three side-by-side square panels: reference, overlay, horizontal x-shift (dex)."""
+                          line_contours=None, obs_limit=None):
+    """Four side-by-side square panels: reference, overlay, horizontal x-shift Δ and vertical R (dex).
+
+    The shift panel carries the per-row median |Δ| as a line on a top axis spanning the
+    colour bar (KoSens ``overplot_delta_median``), over the cells of the rankings:
+    unmatched cells, and cells below ``obs_limit`` in either grid, count as 0.
+    Click its legend entry to hide it.
+    """
     ny, nx = Z_ref.shape
     x_mesh = np.broadcast_to(np.asarray(x_phys, dtype=float), (ny, nx)).copy()
     scan_dir = _parse_shift_scan_direction(shift_scan_direction)
@@ -6100,7 +6526,8 @@ def fig_triple_atten_grid(plane, slice_title, Z_ref, Z_atten, x_phys, y_phys,
     cbar_ref = quantity_cbar_title
 
     fin3 = shift[np.isfinite(shift)]
-    rmax = float(np.nanpercentile(np.abs(fin3), 99.0)) if fin3.size else 0.5
+    # KoSens: full max|Δ|; a 99th-percentile limit saturated the tail at one colour.
+    rmax = float(np.nanmax(np.abs(fin3))) if fin3.size else 0.5
     rmax = max(rmax, 0.02)
     if scan_dir == 'rightward':
         shift_cmap = 'YlOrRd'
@@ -6108,6 +6535,12 @@ def fig_triple_atten_grid(plane, slice_title, Z_ref, Z_atten, x_phys, y_phys,
     else:
         shift_cmap = 'RdBu_r'
         shift_vmin, shift_vmax = -rmax, rmax
+
+    # R = log10(I_atten / I_ref) at fixed (x, y): the vertical counterpart of the x-shift.
+    with np.errstate(divide='ignore', invalid='ignore'):
+        r_map = np.where((Z_ref > 0) & (Z_atten > 0), np.log10(Z_atten / Z_ref), np.nan)
+    fin_r = r_map[np.isfinite(r_map)]
+    r_lim = max(float(np.nanmax(np.abs(fin_r))), 0.02) if fin_r.size else 0.5
 
     xlab, ylab = _axis_label_contour(xdef), _axis_label_contour(ydef)
     t = _theme_colors(theme)
@@ -6118,14 +6551,15 @@ def fig_triple_atten_grid(plane, slice_title, Z_ref, Z_atten, x_phys, y_phys,
 
     panel = 380
     fig = make_subplots(
-        rows=1, cols=3,
+        rows=1, cols=4,
         subplot_titles=[
             'Main grid (reference)',
             'Overlay grid (attenuated)',
-            'Horizontal x-shift (dex)',
+            'Horizontal x-shift Δ (dex)',
+            'Vertical shift R (dex)',
         ],
         horizontal_spacing=0.05,
-        column_widths=[1, 1, 1],
+        column_widths=[1, 1, 1, 1],
     )
     shift_trace_kw = dict(
         zmin=shift_vmin, zmax=shift_vmax,
@@ -6136,20 +6570,25 @@ def fig_triple_atten_grid(plane, slice_title, Z_ref, Z_atten, x_phys, y_phys,
         flux_z = dict(zmin=min(z0min, z1min), zmax=max(z0max, z1max), zauto=False)
     fig.add_trace(go.Contour(
         x=x_plot, y=y_plot, z=p0, colorscale=cmap,
-        colorbar=_subplot_colorbar(cbar_ref, 0.308, theme, zscale),
+        colorbar=_subplot_colorbar(cbar_ref, 0.2185, theme, zscale),
         **flux_z, **contour_kw), row=1, col=1)
     fig.add_trace(go.Contour(
         x=x_plot, y=y_plot, z=p1, colorscale=cmap,
-        colorbar=_subplot_colorbar(cbar_ref, 0.658, theme, zscale),
+        colorbar=_subplot_colorbar(cbar_ref, 0.4810, theme, zscale),
         **flux_z, **contour_kw), row=1, col=2)
     fig.add_trace(go.Contour(
         x=x_plot, y=y_plot, z=shift, colorscale=shift_cmap,
-        colorbar=_subplot_colorbar(_shift_panel_colorbar_title(xdef), 1.006, theme,
+        colorbar=_subplot_colorbar(_shift_panel_colorbar_title(xdef), 0.7435, theme,
                                    zscale='linear'),
         **shift_trace_kw, **contour_kw), row=1, col=3)
+    fig.add_trace(go.Contour(
+        x=x_plot, y=y_plot, z=r_map, colorscale='RdBu_r', zmin=-r_lim, zmax=r_lim, zmid=0,
+        colorbar=_subplot_colorbar('R = log<sub>10</sub>(I<sub>atten</sub>/I<sub>ref</sub>) [dex]',
+                                   1.006, theme, zscale='linear'),
+        **contour_kw), row=1, col=4)
 
     axis_kw = _subplot_axis_kw(theme)
-    for col in (1, 2, 3):
+    for col in (1, 2, 3, 4):
         xanchor = f'x{col}' if col > 1 else 'x'
         fig.update_xaxes(title_text=xlab, row=1, col=col, **axis_kw)
         fig.update_yaxes(
@@ -6158,9 +6597,29 @@ def fig_triple_atten_grid(plane, slice_title, Z_ref, Z_atten, x_phys, y_phys,
             row=1, col=col, **axis_kw,
         )
 
+    obs = None if obs_limit is None else (Z_ref >= obs_limit) & (Z_atten >= obs_limit)
+    d_row, row_ok = ac.row_median_delta(shift, Z_ref, Z_atten, x_mesh, obs)
+    if d_row.size:
+        fig.add_trace(go.Scatter(
+            x=d_row, y=np.asarray(y_plot)[row_ok], xaxis='x5', yaxis='y3',
+            mode='lines+markers', name='row median |Δ| (top axis)',
+            line=dict(color='cyan', width=3),
+            marker=dict(size=7, color='cyan', line=dict(color='black', width=1)),
+            hovertemplate='row median |Δ| = %{x:.3f} dex<extra></extra>'))
+        fig.update_layout(
+            xaxis5=dict(overlaying='x3', anchor='y3', side='top',
+                        range=[0.0 if scan_dir == 'rightward' else shift_vmin, shift_vmax],
+                        showgrid=False, tickfont=dict(size=10, color=t['font']),
+                        title=dict(text='row median |Δ| [dex]', standoff=2,
+                                   font=dict(size=10, color=t['font']))),
+            showlegend=True,
+            legend=dict(orientation='h', x=0.74, xanchor='right', y=-0.16, yanchor='top'))
+        for tr in fig.data[:-1]:
+            tr.showlegend = False
+
     layout_kw = _multi_panel_layout_kw(theme, height=panel + 95)
     layout_kw.update(
-        margin=dict(l=62, r=80, t=70, b=48),
+        margin=dict(l=62, r=80, t=88 if d_row.size else 70, b=78 if d_row.size else 48),
         font=ps.layout_font(t['font']),
         title=dict(text=slice_title, font=ps.title_font(t['title']),
                    x=0.01, xanchor='left'),
@@ -6168,8 +6627,20 @@ def fig_triple_atten_grid(plane, slice_title, Z_ref, Z_atten, x_phys, y_phys,
     )
     fig.update_layout(**layout_kw)
     if line_contours:
-        _add_contour_level_lines(fig, x_plot, y_plot, p0, line_contours, row=1, col=1)
-        _add_contour_level_lines(fig, x_plot, y_plot, p1, line_contours, row=1, col=2)
+        # KoSens ``plot_triple_grid_ratio``: the detection line is the 0.5 contour of
+        # the joint mask (line detected in both grids), drawn on every panel.
+        obs_specs = [c for c in line_contours if str(c.get('label', '')).startswith('obs. limit')]
+        others = [c for c in line_contours if c not in obs_specs]
+        if obs_specs and obs is not None:
+            mask = obs.astype(float)
+            spec = {**obs_specs[0], 'level': 0.5}
+            for col in (1, 2, 3, 4):
+                _add_contour_level_lines(fig, x_plot, y_plot, mask, [spec], row=1, col=col)
+            for tr in fig.data[-4:]:
+                tr.contours.showlabels = False
+        if others:
+            _add_contour_level_lines(fig, x_plot, y_plot, p0, others, row=1, col=1)
+            _add_contour_level_lines(fig, x_plot, y_plot, p1, others, row=1, col=2)
     return fig
 
 
@@ -6202,7 +6673,7 @@ def build_slice_grid(plane, slice_token, quantity, interp_config=None):
     )
 
     if interp_config:
-        return resample_slice_grid(x_phys, y_phys, Z, xdef, ydef, **interp_config)
+        return resample_slice_grid(x_phys, y_phys, Z, xdef, ydef, **_interp_for(quantity, interp_config))
     return x_phys, y_phys, Z, xdef, ydef
 
 
@@ -6235,7 +6706,7 @@ def build_overlay_slice_grid(plane, slice_token, quantity, interp_config=None):
     )
 
     if interp_config:
-        return resample_slice_grid(x_phys, y_phys, Z, xdef, ydef, **interp_config)
+        return resample_slice_grid(x_phys, y_phys, Z, xdef, ydef, **_interp_for(quantity, interp_config))
     return x_phys, y_phys, Z, xdef, ydef
 
 
@@ -6305,7 +6776,7 @@ def build_slice_grids_for_quantities(plane, slice_token, quantities, interp_conf
             y_logscale=ydef['logscale'],
         )
         if interp_config:
-            results[q] = resample_slice_grid(xp, yp, Zq, xdef, ydef, **interp_config)
+            results[q] = resample_slice_grid(xp, yp, Zq, xdef, ydef, **_interp_for(q, interp_config))
         else:
             results[q] = (xp, yp, Zq, xdef, ydef)
     return results
@@ -6352,8 +6823,7 @@ def fig_contour_plane(plane, slice_idx, quantity, zscale,
     unit = f' {sdef["unit"]}' if sdef['unit'] else ''
     qlabel = _quantity_label(quantity)
     slice_title = (f'{plane["title"]}<br>'
-                   f'<sup style="font-size:11px">{sdef["name"]} = {slice_disp}{unit}'
-                   f'  \u2014  {qlabel}</sup>')
+                   f'<sup style="font-size:11px">{sdef["name"]} = {slice_disp}{unit}</sup>')
 
     if zscale == 'log':
         cbar_title = f'log<sub>10</sub>({qlabel})'
@@ -6368,10 +6838,10 @@ def fig_contour_plane(plane, slice_idx, quantity, zscale,
         _, _, Z_ov, _, _ = build_overlay_slice_grid(
             plane, slice_token, quantity, interp_config=interp_config)
     if Z_ov is not None and np.any(np.isfinite(Z_ov)):
-        return fig_triple_atten_grid(
+        return _apply_subject_box(fig_triple_atten_grid(
             plane, slice_title, Z, Z_ov, x_phys, y_phys, xdef, ydef, zscale, cbar_title,
             shift_rtol=shift_rtol, shift_scan_direction=shift_scan_direction,
-            colorscale=cmap, theme=theme)
+            colorscale=cmap, theme=theme), qlabel, theme)
 
     Zplot, zmin, zmax = _apply_zscale(Z, zscale)
 
@@ -6387,10 +6857,11 @@ def fig_contour_plane(plane, slice_idx, quantity, zscale,
         colorbar=_contour_colorbar(cbar_title, theme=theme, zscale=zscale),
         **trace_kw,
     ))
-    return _apply_square_contour_layout(
+    _apply_square_contour_layout(
         fig, x_plot, y_plot, xdef, ydef, slice_title,
         fixed_size=True, theme=theme, zscale=zscale,
     )
+    return _apply_subject_box(fig, qlabel, theme)
 
 
 def make_contour_plots(quantity, zscale, slice_indices,
@@ -6526,8 +6997,8 @@ def fig_intensity_contour_plane(plane, slice_idx, species, idef, transition_idx,
     slice_disp = _param_token_disp(sdef, slice_token)
     slice_unit = f' {sdef["unit"]}' if sdef['unit'] else ''
     slice_title = (f'{plane["title"]}<br>'
-                   f'<sup style="font-size:11px">{sdef["name"]} = {slice_disp}{slice_unit}'
-                   f'  \u2014  {sp_html} {tlabel}</sup>')
+                   f'<sup style="font-size:11px">{sdef["name"]} = {slice_disp}{slice_unit}</sup>')
+    subject = f'{sp_html} {tlabel}'.strip()
 
     cmap = _parse_grid_colorscale(colorscale)
     if _simline_overlay:
@@ -6535,10 +7006,12 @@ def fig_intensity_contour_plane(plane, slice_idx, species, idef, transition_idx,
             plane, slice_token, species, idef, transition_idx, overlay=True,
             interp_config=interp_config, slider_values=slider_values)
         if np.any(np.isfinite(Z_ov)):
-            return fig_triple_atten_grid(
+            return _apply_subject_box(fig_triple_atten_grid(
                 plane, slice_title, Z, Z_ov, x_phys, y_phys, xdef, ydef, zscale, cbar_title,
                 shift_rtol=shift_rtol, shift_scan_direction=shift_scan_direction,
-                colorscale=cmap, theme=theme, line_contours=line_contours)
+                colorscale=cmap, theme=theme, line_contours=line_contours,
+                obs_limit=INT_OBS_BOUNDARY_JTEMP if idef == 'jtemp' else None),
+                subject, theme)
 
     Zplot, zmin, zmax = _apply_zscale(Z, zscale)
 
@@ -6556,10 +7029,11 @@ def fig_intensity_contour_plane(plane, slice_idx, species, idef, transition_idx,
     ))
     if line_contours:
         _add_contour_level_lines(fig, x_plot, y_plot, Zplot, line_contours)
-    return _apply_square_contour_layout(
+    _apply_square_contour_layout(
         fig, x_plot, y_plot, xdef, ydef, slice_title,
         fixed_size=True, theme=theme, zscale=zscale,
     )
+    return _apply_subject_box(fig, subject, theme)
 
 
 def make_intensity_contour_plots(species, idef, transition_idx, zscale, slice_indices,
@@ -6612,13 +7086,12 @@ def _slice_token_from_index(plane, slice_idx):
         return slice_tokens[0]
 
 
-def _rgb_slice_title(plane, slice_token, subtitle):
+def _rgb_slice_title(plane, slice_token):
     sdef = _param_def(plane['slice'])
     slice_disp = _param_token_disp(sdef, slice_token)
     unit = f' {sdef["unit"]}' if sdef['unit'] else ''
     return (f'{plane["title"]}<br>'
-            f'<sup style="font-size:11px">{sdef["name"]} = {slice_disp}{unit}'
-            f'  \u2014  {subtitle}</sup>')
+            f'<sup style="font-size:11px">{sdef["name"]} = {slice_disp}{unit}</sup>')
 
 
 def _default_rgb_grid_species(species_list):
@@ -6765,8 +7238,13 @@ def _intensity_rgb_transition_layers(plane, slice_token, flags, idef,
 
 
 def fig_grid_rgb_plane(plane, slice_idx, species_trio, transition_flags,
-                       interp_config=None, theme='light', conv_factors=None):
-    """RGB abundance dominance map for one grid slice plane."""
+                       interp_config=None, theme='light', conv_factors=None,
+                       extra_species=None):
+    """RGB abundance dominance map for one grid slice plane.
+
+    ``extra_species`` (e.g. JCO) are unscaled further channels in
+    ``RGB_EXTRA_COLORS`` that join the fractional total.
+    """
     if not plane.get('active'):
         return placeholder_fig(theme=theme)
     if not _grid or not _grid_has_hdf5():
@@ -6780,32 +7258,36 @@ def fig_grid_rgb_plane(plane, slice_idx, species_trio, transition_flags,
     if slice_token is None:
         return placeholder_fig('No slice axis', theme=theme)
 
+    extras = [sp for sp in dict.fromkeys(extra_species or [])
+              if sp and sp not in species_trio[:3]][:len(RGB_EXTRA_COLORS)]
+    channels = species_trio[:3] + extras
     grids = []
     x_phys = y_phys = xdef = ydef = None
-    for sp in species_trio[:3]:
+    for sp in channels:
         x_phys, y_phys, Z, xdef, ydef = build_slice_grid(
             plane, slice_token, f'species:{sp}', interp_config=interp_config)
         grids.append(Z)
     if not any(np.any(np.isfinite(g)) for g in grids):
         return placeholder_fig('No abundance data for this RGB slice', theme=theme)
 
-    labels = [format_species_html(sp) for sp in species_trio[:3]]
+    labels = [format_species_html(sp) for sp in channels]
     subtitle = ' / '.join(labels)
     transitions = _grid_rgb_transition_layers(
         plane, slice_token, transition_flags, interp_config,
         species_trio=species_trio[:3], conv_factors=cfs)
     x_plot = _axis_plot_coords(x_phys, xdef)
     y_plot = _axis_plot_coords(y_phys, ydef)
-    title = _rgb_slice_title(plane, slice_token, subtitle)
+    title = _rgb_slice_title(plane, slice_token)
     fig = rgb_phase.build_rgb_figure(
         grids, x_plot, y_plot,
         xlabel=_axis_label_contour(xdef),
         ylabel=_axis_label_contour(ydef),
         title=title,
         channel_labels=labels,
+        colors=tuple(rgb_phase.DEFAULT_RGB_COLORS) + RGB_EXTRA_COLORS[:len(extras)],
         transitions=transitions,
         theme_colors=_theme_colors(theme),
-        conv_factors=cfs,
+        conv_factors=list(cfs) + [1.0] * len(extras),
         width=COMPACT_FIG_WIDTH,
         height=COMPACT_FIG_HEIGHT,
     )
@@ -6816,7 +7298,7 @@ def fig_grid_rgb_plane(plane, slice_idx, species_trio, transition_flags,
         theme=theme, uirevision=f'rgb|{_parse_plot_theme(theme)}',
         x_range=xr, y_range=yr, showgrid=False,
     ))
-    return fig
+    return _apply_subject_box(fig, subtitle, theme)
 
 
 def fig_intensity_rgb_plane(plane, slice_idx, line_keys, idef, transition_flags,
@@ -6858,7 +7340,8 @@ def fig_intensity_rgb_plane(plane, slice_idx, line_keys, idef, transition_flags,
         interp_config, slider_values, conv_factors=cfs)
     x_plot = _axis_plot_coords(x_phys, xdef)
     y_plot = _axis_plot_coords(y_phys, ydef)
-    title = _rgb_slice_title(plane, slice_token, ' / '.join(labels))
+    subtitle = ' / '.join(labels)
+    title = _rgb_slice_title(plane, slice_token)
     fig = rgb_phase.build_rgb_figure(
         grids, x_plot, y_plot,
         xlabel=_axis_label_contour(xdef),
@@ -6878,15 +7361,17 @@ def fig_intensity_rgb_plane(plane, slice_idx, line_keys, idef, transition_flags,
         theme=theme, uirevision=f'rgb-int|{_parse_plot_theme(theme)}',
         x_range=xr, y_range=yr, showgrid=False,
     ))
-    return fig
+    return _apply_subject_box(fig, subtitle, theme)
 
 
 def make_grid_rgb_plots(species_trio, transition_flags, slice_indices,
-                        interp_config=None, theme='light', conv_factors=None):
+                        interp_config=None, theme='light', conv_factors=None,
+                        extra_species=None):
     return tuple(
         fig_grid_rgb_plane(
             plane, slice_indices[i], species_trio, transition_flags,
-            interp_config=interp_config, theme=theme, conv_factors=conv_factors)
+            interp_config=interp_config, theme=theme, conv_factors=conv_factors,
+            extra_species=extra_species)
         if plane.get('active') else placeholder_fig(theme=theme)
         for i, plane in enumerate(active_slice_planes())
     )
@@ -7164,7 +7649,7 @@ def _obs_fit_summary_layout(result):
         html.Th('v₀ (km/s)', style=center),
         html.Th('σ (km/s)', style=center),
         html.Th('∫I dv (K km/s)', style=center),
-    ], style={'backgroundColor': '#EAF2FF'})
+    ], style={'backgroundColor': 'var(--accent-soft)'})
 
     rows = [header_row]
     errs = result.param_errors
@@ -7191,7 +7676,7 @@ def _obs_fit_summary_layout(result):
         html.Td('Total ∫I dv', style={**cell, 'fontWeight': '600'}),
         html.Td(f'{tot} K km/s', colSpan=4,
                 style={**center, 'fontWeight': '600'}),
-    ], style={'backgroundColor': '#f0f8f0'}))
+    ], style={'backgroundColor': 'rgba(34, 197, 94, 0.10)'}))
 
     meta = [
         html.P([
@@ -7576,8 +8061,13 @@ def fig_cube_map(path, hdu, metric, v_low, v_high, colorscale, zscale,
     fig = go.Figure(go.Heatmap(**heat_kw))
 
     rows = _cv_row_selection(cube, selection, spec_mode)
-    # Whole-map mean uses every filled cell — skip the X overlay (it would cover the map).
-    if rows and _cv_spec_mode(spec_mode) != 'mean' and len(rows) < cube.n_spectra:
+    shapes = [{**sh, 'editable': True,
+               'line': {**(sh.get('line') or {}), 'color': cv.region_color(i), 'width': 2}}
+              for i, sh in enumerate((selection or {}).get('shapes') or [])]
+    # Whole-map mean uses every filled cell — skip the X overlay (it would cover the map);
+    # region masks show their outline instead of per-pixel markers.
+    if (rows and not shapes and _cv_spec_mode(spec_mode) != 'mean'
+            and len(rows) < cube.n_spectra):
         fig.add_trace(go.Scatter(
             x=cube.ra_off_deg[rows] * 60.0,
             y=cube.dec_off_deg[rows] * 60.0,
@@ -7627,27 +8117,211 @@ def fig_cube_map(path, hdu, metric, v_low, v_high, colorscale, zscale,
         'clickmode': 'event+select',
         'uirevision': f'cv-map|{cube.path}',
         'showlegend': False,
+        'shapes': shapes,
+        'newshape': dict(line=dict(color='#22c55e', width=2),
+                         fillcolor='rgba(34,197,94,0.08)'),
     })
     return fig
 
 
-def fig_cube_ppv(path, hdu, colorscale, theme='light'):
-    """3-D position–position–velocity volume; colorbar is intensity."""
+_CV_CHMAP_COLS = 5
+_CV_CHMAP_ROW_PX = 270
+
+
+def fig_cube_channel_maps(path, hdu, v_start, v_end, bin_kms, colorscale, zscale,
+                          theme='light'):
+    """Grid of velocity channel maps (∫T dv per velocity bin), one shared colour scale."""
     cube, err = _load_cv_cube(path, hdu)
     if cube is None:
         return placeholder_fig(err, theme=theme)
-    if cube.nchan < 2 or cube.ny < 2 or cube.nx < 2:
-        return placeholder_fig(
-            'Need a 3-D cube (at least 2×2 pixels and 2 channels) for PPV',
-            theme=theme)
+    if cube.nchan < 2:
+        return placeholder_fig('Channel maps need a cube with velocity channels', theme=theme)
+    if v_start is None or v_end is None:
+        return placeholder_fig('Enter a velocity range for the channel maps', theme=theme)
     try:
-        arr = cv.ppv_volume_arrays(cube)
+        panels = cv.channel_maps(cube, v_start, v_end,
+                                 float(bin_kms) if bin_kms not in (None, '') else None)
     except Exception as exc:
         return placeholder_fig(str(exc), theme=theme)
+    if not panels:
+        v = cube.velocity_kms
+        return placeholder_fig(
+            f'No channels in {v_start}–{v_end} km/s '
+            f'(cube covers {np.nanmin(v):.3g}–{np.nanmax(v):.3g} km/s)', theme=theme)
+
+    t = _theme_colors(theme)
+    stack, zmin, zmax = _apply_zscale(np.stack([m for _, _, m in panels]), zscale or 'linear')
+    z_label = '∫T dv (K km/s)'
+    if zscale == 'log':
+        z_label = f'log<sub>10</sub> {z_label}'
+    n = len(panels)
+    ncols = min(n, _CV_CHMAP_COLS)
+    nrows = -(-n // ncols)
+    fig = make_subplots(rows=nrows, cols=ncols,
+                        horizontal_spacing=0.012, vertical_spacing=0.03)
+    ra, dec = cube.ra_axis_arcmin, cube.dec_axis_arcmin
+    step_ra = abs(ra[1] - ra[0]) / 2 if ra.size > 1 else 0.5
+    step_dec = abs(dec[1] - dec[0]) / 2 if dec.size > 1 else 0.5
+    x_rng = [float(np.nanmax(ra)) + step_ra, float(np.nanmin(ra)) - step_ra]  # RA reversed
+    y_rng = [float(np.nanmin(dec)) - step_dec, float(np.nanmax(dec)) + step_dec]
+    ax = {k: v for k, v in _axis_style(theme).items()
+          if k not in ('exponentformat', 'showexponent', 'showgrid')}
+    for k, ((a, b, _m), z) in enumerate(zip(panels, stack)):
+        r, c = divmod(k, ncols)
+        fig.add_trace(go.Heatmap(
+            x=ra, y=dec, z=z, coloraxis='coloraxis', hoverongaps=False,
+            hovertemplate=(f'{a:.3g} – {b:.3g} km/s<br>ΔRA = %{{x:.3f}}′<br>'
+                           'ΔDec = %{y:.3f}′<br>%{z:.4g}<extra></extra>'),
+        ), row=r + 1, col=c + 1)
+        sfx = '' if k == 0 else str(k + 1)
+        bottom = k + ncols >= n
+        fig.layout[f'xaxis{sfx}'].update(
+            **ax, range=x_rng, showgrid=False, showticklabels=bottom,
+            title=dict(text='ΔRA (arcmin)', font=ps.axis_title_font())
+            if bottom and c == 0 else None)
+        fig.layout[f'yaxis{sfx}'].update(
+            **ax, range=y_rng, showgrid=False, showticklabels=c == 0,
+            scaleanchor=f'x{sfx}', scaleratio=1, constrain='domain',
+            title=dict(text='ΔDec (arcmin)', font=ps.axis_title_font())
+            if bottom and c == 0 else None)
+        fig.add_annotation(
+            text=f'{a:.2f} – {b:.2f} km/s', showarrow=False,
+            xref=f'x{sfx} domain', yref=f'y{sfx} domain', x=0.03, y=0.97,
+            xanchor='left', yanchor='top', font=dict(size=11, color='#f8fafc'),
+            bgcolor='rgba(15,23,42,0.55)', borderpad=2)
+    coloraxis = dict(colorscale=colorscale or DEFAULT_GRID_COLORMAP,
+                     colorbar=_contour_colorbar(z_label, theme=theme,
+                                                zscale=zscale or 'linear', compact=False))
+    if zmin is not None:
+        coloraxis.update(cmin=zmin, cmax=zmax)
+    fig.update_layout(**{
+        **_base_layout(theme),
+        'height': 90 + nrows * _CV_CHMAP_ROW_PX,
+        'margin': dict(l=70, r=90, t=58, b=58),
+        'title': dict(text=f'{cube.species_label}  ·  channel maps  ·  {n} panels',
+                      font=ps.title_font(t['title']), x=0.02, xanchor='left'),
+        'coloraxis': coloraxis,
+        'showlegend': False,
+        'uirevision': f'cv-chmap|{cube.path}',
+    })
+    return fig
+
+
+def _cv_float(x):
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return None
+    return f if np.isfinite(f) else None
+
+
+def fig_cube_pv_cut(path, hdu, ra0, dec0, ra1, dec1, width, v_low, v_high,
+                    colorscale, zscale, theme='light'):
+    """Integrated map with the cut drawn on it (left) + PV diagram along the cut (right)."""
+    cube, err = _load_cv_cube(path, hdu)
+    if cube is None:
+        return placeholder_fig(err, theme=theme)
+    if cube.nchan < 2:
+        return placeholder_fig('PV cuts need a cube with velocity channels', theme=theme)
+    ends = [_cv_float(x) for x in (ra0, dec0, ra1, dec1)]
+    if None in ends:  # incomplete cut -> horizontal cut through the map centre
+        (ends[0], ends[1]), (ends[2], ends[3]) = cv.default_pv_cut(cube)
+    lo, hi = _cv_velocity_window(v_low, v_high)
+    try:
+        pv = cv.pv_cut(cube, ends[:2], ends[2:], width_arcmin=_cv_float(width) or 0.0)
+        mom0 = cv.collapse_map(cube, lo, hi, metric='moment0')
+    except Exception as exc:
+        return placeholder_fig(str(exc), theme=theme)
+    if not np.any(np.isfinite(pv['pv'])):
+        return placeholder_fig('The cut does not cross any filled map cells', theme=theme)
+    # crop to the line-core window so the colour scale follows it too
+    in_win = (pv['velocity_kms'] >= lo) & (pv['velocity_kms'] <= hi)
+    if not np.any(in_win):
+        v = pv['velocity_kms']
+        return placeholder_fig(
+            f'No channels in {lo:.3g}–{hi:.3g} km/s '
+            f'(cube covers {v.min():.3g}–{v.max():.3g} km/s)', theme=theme)
+
+    t = _theme_colors(theme)
+    unit = cube.intensity_unit or 'K'
+    zpv, zmin, zmax = _apply_zscale(pv['pv'][in_win], zscale or 'linear')
+    z_label = f'T ({unit})' if zscale != 'log' else f'log<sub>10</sub> T ({unit})'
+    zmap, _, _ = _apply_zscale(mom0, zscale or 'linear')
+    cs = colorscale or DEFAULT_GRID_COLORMAP
+    fig = make_subplots(rows=1, cols=2, column_widths=[0.38, 0.62],
+                        horizontal_spacing=0.09,
+                        subplot_titles=(f'∫T dv ({lo:.3g} – {hi:.3g} km/s) with cut',
+                                        'PV diagram along the cut'))
+    fig.add_trace(go.Heatmap(
+        x=cube.ra_axis_arcmin, y=cube.dec_axis_arcmin, z=zmap, colorscale=cs,
+        showscale=False, hoverongaps=False,
+        hovertemplate='ΔRA = %{x:.3f}′<br>ΔDec = %{y:.3f}′<br>%{z:.4g}<extra></extra>',
+    ), row=1, col=1)
+    # cut = editable line shape (drag it / its ends; update_cv_pv_inputs syncs the
+    # inputs); width band edges dotted; the start (offset 0) is the red dot
+    fig.add_trace(go.Scatter(x=pv['path_ra'][:1], y=pv['path_dec'][:1], mode='markers',
+                             marker=dict(size=10, color='#ef4444'),
+                             hoverinfo='skip'), row=1, col=1)
+    if pv['width_arcmin'] > 0:
+        d = np.array([pv['path_ra'][1] - pv['path_ra'][0],
+                      pv['path_dec'][1] - pv['path_dec'][0]])
+        n = np.array([-d[1], d[0]]) / np.hypot(*d) * pv['width_arcmin'] / 2
+        for sgn in (1, -1):
+            fig.add_trace(go.Scatter(x=pv['path_ra'] + sgn * n[0],
+                                     y=pv['path_dec'] + sgn * n[1], mode='lines',
+                                     line=dict(color='#f8fafc', width=1, dash='dot'),
+                                     hoverinfo='skip'), row=1, col=1)
+    heat_kw = dict(
+        x=pv['offset_arcsec'], y=pv['velocity_kms'][in_win], z=zpv, colorscale=cs,
+        hoverongaps=False,
+        colorbar=_contour_colorbar(z_label, theme=theme, zscale=zscale or 'linear',
+                                   compact=False),
+        hovertemplate='offset = %{x:.1f}″<br>v = %{y:.3g} km/s<br>%{z:.4g}<extra></extra>',
+    )
+    if zmin is not None:
+        heat_kw.update(zmin=zmin, zmax=zmax, zauto=False)
+    fig.add_trace(go.Heatmap(**heat_kw), row=1, col=2)
+
+    ax = {k: v for k, v in _axis_style(theme).items()
+          if k not in ('exponentformat', 'showexponent', 'showgrid')}
+    fig.update_xaxes(**ax, showgrid=False)
+    fig.update_yaxes(**ax, showgrid=False)
+    fig.update_xaxes(title=dict(text='ΔRA (arcmin)', font=ps.axis_title_font()),
+                     autorange='reversed', row=1, col=1)
+    fig.update_yaxes(title=dict(text='ΔDec (arcmin)', font=ps.axis_title_font()),
+                     scaleanchor='x', scaleratio=1, constrain='domain', row=1, col=1)
+    fig.update_xaxes(title=dict(text='Offset along cut (arcsec)', font=ps.axis_title_font()),
+                     row=1, col=2)
+    fig.update_yaxes(title=dict(text='Velocity (km/s)', font=ps.axis_title_font()),
+                     range=[lo, hi], row=1, col=2)
+    w_txt = f'  ·  width {pv["width_arcmin"] * 60:.3g}″' if pv['width_arcmin'] > 0 else ''
+    fig.update_layout(**{
+        **_base_layout(theme),
+        'height': 520,
+        'margin': dict(l=70, r=90, t=80, b=58),
+        'title': dict(text=(f'{cube.species_label}  ·  PV cut  ·  '
+                            f'({ends[0]:.2f}′, {ends[1]:.2f}′) → '
+                            f'({ends[2]:.2f}′, {ends[3]:.2f}′){w_txt}'),
+                      font=ps.title_font(t['title']), x=0.02, xanchor='left'),
+        'showlegend': False,
+        'uirevision': f'cv-pvcut|{cube.path}|{lo}|{hi}',
+        'shapes': [dict(type='line', xref='x', yref='y', editable=True,
+                        x0=ends[0], y0=ends[1], x1=ends[2], y1=ends[3],
+                        line=dict(color='#f8fafc', width=3))],
+        'newshape': dict(line=dict(color='#22c55e', width=3)),
+    })
+    return fig
+
+
+def _ppv_volume_trace(cube, shift=(0.0, 0.0), **style):
+    """``go.Volume`` for one cube (offsets shifted into the reference frame), or None."""
+    if cube.nchan < 2 or cube.ny < 2 or cube.nx < 2:
+        return None
+    arr = cv.ppv_volume_arrays(cube)
     vol = np.asarray(arr['intensity'], dtype=float)
     finite = np.isfinite(vol)
     if not np.any(finite):
-        return placeholder_fig('Cube has no finite voxels', theme=theme)
+        return None
     isomin = float(arr['isomin'])
     isomax = float(arr['isomax'])
     if not np.isfinite(isomax) or isomax <= isomin:
@@ -7655,33 +8329,76 @@ def fig_cube_ppv(path, hdu, colorscale, theme='light'):
     fill = np.where(finite, vol, isomin - abs(isomax - isomin) - 1.0)
     # vol is (ny, nx, nchan) matching (Dec, RA, v)
     dec, ra, vel = np.meshgrid(
-        arr['dec_arcmin'], arr['ra_arcmin'], arr['velocity_kms'], indexing='ij')
-    t = _theme_colors(theme)
+        arr['dec_arcmin'] + shift[1], arr['ra_arcmin'] + shift[0],
+        arr['velocity_kms'], indexing='ij')
     unit = cube.intensity_unit or 'K'
-    ny_s, nx_s, nz_s = fill.shape
-    fig = go.Figure(data=go.Volume(
-        x=ra.ravel(),
-        y=dec.ravel(),
-        z=vel.ravel(),
-        value=fill.ravel(),
-        isomin=isomin,
-        isomax=isomax,
-        opacity=0.12,
-        opacityscale='max',
-        surface_count=15,
-        colorscale=colorscale or DEFAULT_GRID_COLORMAP,
-        colorbar=_contour_colorbar(f'I ({unit})', theme=theme, zscale='linear',
-                                   compact=False),
-        caps=dict(x_show=False, y_show=False, z_show=False),
-        hovertemplate=(
+    return go.Volume(**{
+        'x': ra.ravel(), 'y': dec.ravel(), 'z': vel.ravel(), 'value': fill.ravel(),
+        'isomin': isomin, 'isomax': isomax,
+        'opacity': 0.12, 'opacityscale': 'max', 'surface_count': 15,
+        'caps': dict(x_show=False, y_show=False, z_show=False),
+        'hovertemplate': (
+            f'{cube.species_label}<br>'
             'ΔRA = %{x:.3f}′<br>ΔDec = %{y:.3f}′<br>'
             'v = %{z:.3g} km/s<br>'
-            f'I = %{{value:.4g}} {unit}<extra></extra>'
-        ),
-        name='PPV',
-    ))
+            f'I = %{{value:.4g}} {unit}<extra></extra>'),
+        'name': cube.species_label or os.path.basename(cube.path),
+        **style,
+    }), fill.shape
+
+
+def fig_cube_ppv(path, hdu, colorscale, theme='light', overlays=None):
+    """3-D position–position–velocity volume; colorbar is intensity.
+
+    ``overlays``: extra cube paths drawn in the same scene, one solid colour
+    each (the main cube switches to a solid colour too, with a legend).
+    """
+    cube, err = _load_cv_cube(path, hdu)
+    if cube is None:
+        return placeholder_fig(err, theme=theme)
+    overlays = [p for p in (overlays or []) if p and p != cube.path]
+    t = _theme_colors(theme)
+    unit = cube.intensity_unit or 'K'
+
+    def solid(i):
+        c = cv.region_color(i)
+        return dict(colorscale=[[0, c], [1, c]], showscale=False, showlegend=True)
+
+    if overlays:
+        main_style = solid(0)
+    else:
+        main_style = dict(colorscale=colorscale or DEFAULT_GRID_COLORMAP,
+                          colorbar=_contour_colorbar(f'I ({unit})', theme=theme,
+                                                     zscale='linear', compact=False))
+    try:
+        res = _ppv_volume_trace(cube, **main_style)
+    except Exception as exc:
+        return placeholder_fig(str(exc), theme=theme)
+    if res is None:
+        return placeholder_fig(
+            'Need a 3-D cube (at least 2×2 pixels and 2 channels, finite voxels) for PPV',
+            theme=theme)
+    trace, (ny_s, nx_s, nz_s) = res
+    fig = go.Figure(trace)
+    skipped = []
+    for i, opath in enumerate(overlays, start=1):
+        ocube, oerr = _load_cv_cube(opath, cv.default_hdu_index(opath))
+        try:
+            ores = None if ocube is None else _ppv_volume_trace(
+                ocube, cv.sky_shift_arcmin(cube, ocube), **solid(i))
+        except Exception:
+            ores = None
+        if ores is None:
+            skipped.append(os.path.basename(opath))
+            continue
+        fig.add_trace(ores[0])
+
     title = (f'{cube.species_label}  ·  PPV volume  '
              f'{nx_s}×{ny_s}×{nz_s} (downsampled)')
+    if overlays:
+        title = f'PPV volume  ·  {len(fig.data)} cubes (downsampled)'
+    if skipped:
+        title += f'  ·  skipped: {", ".join(skipped)}'
     axis_kw = dict(
         backgroundcolor=t['plot_bg'],
         gridcolor=t['grid'],
@@ -7712,7 +8429,9 @@ def fig_cube_ppv(path, hdu, colorscale, theme='light'):
             camera=dict(eye=dict(x=1.55, y=1.55, z=1.15)),
         ),
         'uirevision': f'cv-ppv|{cube.path}',
-        'showlegend': False,
+        'showlegend': bool(overlays),
+        'legend': {**_base_layout(theme).get('legend', {}),
+                   'x': 0.01, 'y': 0.98, 'xanchor': 'left', 'yanchor': 'top'},
     })
     return fig
 
@@ -7748,7 +8467,7 @@ def fig_cube_spectrum(path, hdu, selection, v_low, v_high, n_gauss, do_fit,
         cube, line_catalog, v_source, eu_max)
     line_table = _line_id_table_layout(cube, win, line_rows, line_err, v_source)
     if cube is None:
-        return placeholder_fig(err, theme=theme), html.Div(), line_table
+        return placeholder_fig(err, theme=theme), html.Div(), line_table, None
     mode = _cv_spec_mode(spec_mode)
     rows = _cv_row_selection(cube, selection, mode)
     if not rows:
@@ -7760,7 +8479,7 @@ def fig_cube_spectrum(path, hdu, selection, v_low, v_high, n_gauss, do_fit,
         ], style={'fontSize': '13px'})
         return placeholder_fig(
             'Click a map pixel, or box/lasso a region in the toolbar',
-            theme=theme), empty_stats, line_table
+            theme=theme), empty_stats, line_table, None
     try:
         v, y = cv.extract_spectrum(cube, rows)
         lo, hi = _cv_velocity_window(v_low, v_high)
@@ -7768,7 +8487,7 @@ def fig_cube_spectrum(path, hdu, selection, v_low, v_high, n_gauss, do_fit,
         sky = cv.selection_sky(cube, rows)
     except Exception as exc:
         return placeholder_fig(str(exc), theme=theme), html.Span(
-            str(exc), style={'color': '#d62728'}), line_table
+            str(exc), style={'color': '#d62728'}), line_table, None
 
     freq = cube.frequency_ghz
     use_freq = (xaxis == 'frequency') and freq is not None
@@ -7794,6 +8513,8 @@ def fig_cube_spectrum(path, hdu, selection, v_low, v_high, n_gauss, do_fit,
         spec_name = f'Map mean ({n_pix} pixels)'
     elif n_pix == 1:
         spec_name = 'Pixel spectrum'
+    elif len((selection or {}).get('shapes') or []) > 1:
+        spec_name = f'All regions mean ({n_pix} pixels)'
     else:
         spec_name = f'Region mean ({n_pix} pixels)'
     fig.add_trace(go.Scatter(
@@ -7802,6 +8523,20 @@ def fig_cube_spectrum(path, hdu, selection, v_low, v_high, n_gauss, do_fit,
         name=spec_name,
         hovertemplate=x_hover + '<br>T = %{y:.4g} K<extra></extra>',
     ))
+    shapes = (selection or {}).get('shapes') or []
+    if mode != 'mean' and len(shapes) > 1:
+        # One mean spectrum per region, in the colour of its outline on the map.
+        for i, sh in enumerate(shapes):
+            rows_i = [int(r) for r in cv.rows_in_shape(cube, sh)]
+            if not rows_i:
+                continue
+            _v_i, y_i = cv.extract_spectrum(cube, rows_i)
+            fig.add_trace(go.Scatter(
+                x=x, y=y_i, mode='lines',
+                line=dict(color=cv.region_color(i), width=1.6),
+                name=f'Region {i + 1} ({len(rows_i)} px)',
+                hovertemplate=x_hover + f'<br>Region {i + 1}: ' + 'T = %{y:.4g} K<extra></extra>',
+            ))
 
     if cube.nchan >= 1:
         ich = cv.clamp_channel(cube, channel_index)
@@ -7916,13 +8651,77 @@ def fig_cube_spectrum(path, hdu, selection, v_low, v_high, n_gauss, do_fit,
             meas['nu_peak_ghz'] = float(freq[ipeak])
         meas['nu_min_ghz'] = float(np.nanmin(freq))
         meas['nu_max_ghz'] = float(np.nanmax(freq))
-    summary = _cube_stats_layout(cube, sky, meas, fit_result, lo, hi, spec_mode=mode)
+    summary = _cube_stats_layout(cube, sky, meas, fit_result, lo, hi, spec_mode=mode,
+                                 regions=(selection or {}).get('shapes'))
     if fit_error:
         summary = html.Div([
             html.Span(f'Fit failed: {fit_error}', style={'color': '#d62728'}),
             summary,
         ])
-    return fig, summary, line_table
+    return fig, summary, line_table, _fit_guess_values(fit_result)
+
+
+def _fit_guess_values(fit_result):
+    """Fitted Peak / v0 / FWHM per component, rounded for the guess boxes; None if no fit."""
+    if fit_result is None:
+        return None
+    return {
+        'amp': [float(f'{a:.4g}') for a in fit_result.amplitudes],
+        'v0': [round(float(c), 3) for c in fit_result.centers],
+        'fwhm': [round(float(osf.sigma_to_fwhm(sg)), 3) for sg in fit_result.sigmas],
+    }
+
+
+_GUESS_KEYS = ('amp', 'v0', 'fwhm')
+
+
+def _same_number(a, b):
+    try:
+        a, b = float(a), float(b)
+    except (TypeError, ValueError):
+        return False
+    return abs(a - b) <= 1e-9 * max(1.0, abs(b))
+
+
+def _is_auto_box(value, shown, i):
+    """A box is 'auto' when empty or still showing the number the last fit put there."""
+    return value in (None, '') or (i < len(shown) and _same_number(value, shown[i]))
+
+
+def user_guesses(columns, shown):
+    """Starting values for the fit: only numbers the user typed or changed.
+    Boxes that are empty or still show the last fitted number count as auto
+    (None), so every new fit starts from a fresh auto-guess of the current spectrum."""
+    shown = shown or {}
+    return [[None if _is_auto_box(v, shown.get(k) or [], i) else v
+             for i, v in enumerate(col or [])]
+            for k, col in zip(_GUESS_KEYS, columns)]
+
+
+def guess_boxes_after_fit(fit, columns, shown, reset=False):
+    """Box values after a fit plus the record of what the fit wrote.
+
+    Auto boxes (see ``user_guesses``; all of them on Reset) show the new fitted
+    number, or go empty when the fit failed; boxes holding the user's own number
+    get ``dash.no_update``. Returns ``(columns_out, shown_new)``.
+    """
+    shown = shown or {}
+    fit = fit or {}
+    out, new_shown = [], {}
+    for k, col in zip(_GUESS_KEYS, columns):
+        vals, prev = fit.get(k) or [], shown.get(k) or []
+        col_out, rec = [], []
+        for i, v in enumerate(col or []):
+            if reset or _is_auto_box(v, prev, i):
+                new = vals[i] if i < len(vals) else None
+                col_out.append(new)
+                rec.append(new)
+            else:
+                col_out.append(dash.no_update)
+                rec.append(None)
+        out.append(col_out)
+        new_shown[k] = rec
+    return out, new_shown
 
 
 def _fmt_cv(val, unit='', decimals=3):
@@ -7938,10 +8737,11 @@ def _fmt_cv(val, unit='', decimals=3):
     return f'{text} {unit}'.strip()
 
 
-def _cube_stats_layout(cube, sky, meas, fit_result, v_low, v_high, spec_mode='pixel'):
+def _cube_stats_layout(cube, sky, meas, fit_result, v_low, v_high, spec_mode='pixel',
+                       regions=None):
     """Small table of position + line measurements for the cube-viewer selection."""
     cell = {'padding': '3px 10px', 'borderBottom': '1px solid #DDE4EE'}
-    left = {**cell, 'textAlign': 'left', 'color': '#5A6B85', 'whiteSpace': 'nowrap'}
+    left = {**cell, 'textAlign': 'left', 'color': 'var(--text-muted)', 'whiteSpace': 'nowrap'}
     right = {**cell, 'textAlign': 'right', 'fontVariantNumeric': 'tabular-nums'}
 
     def row(label, value):
@@ -7958,6 +8758,11 @@ def _cube_stats_layout(cube, sky, meas, fit_result, v_low, v_high, spec_mode='pi
     cal = 'T_mb' if cube.is_main_beam else 'T (CLASS)'
     pos_rows = [
         row('Selection', kind),
+        *([html.Tr([html.Td(f'Region {i + 1}', style={**left, 'color': cv.region_color(i),
+                                                          'fontWeight': '600'}),
+                    html.Td(cv.shape_summary(sh), style=right)])
+           for i, sh in enumerate(regions)]
+          if regions and mode != 'mean' else []),
         row('ΔRA, ΔDec',
             f'{_fmt_cv((sky or {}).get("ra_off_arcmin"), "′")} , '
             f'{_fmt_cv((sky or {}).get("dec_off_arcmin"), "′")}'),
@@ -8012,7 +8817,7 @@ def _cube_stats_layout(cube, sky, meas, fit_result, v_low, v_high, spec_mode='pi
             html.Th('FWHM (km/s)', style=fcenter),
             html.Th('σ (km/s)', style=fcenter),
             html.Th('∫I dv (K km/s)', style=fcenter),
-        ], style={'backgroundColor': '#EAF2FF'})
+        ], style={'backgroundColor': 'var(--accent-soft)'})
         grow = [head]
         errs = fit_result.param_errors
         for j in range(fit_result.n_components):
@@ -8039,7 +8844,7 @@ def _cube_stats_layout(cube, sky, meas, fit_result, v_low, v_high, spec_mode='pi
             html.Td('Total ∫I dv', style={**fcell, 'fontWeight': '600'}),
             html.Td(f'{tot} K km/s', colSpan=5,
                     style={**fcenter, 'fontWeight': '600'}),
-        ], style={'backgroundColor': '#f0f8f0'}))
+        ], style={'backgroundColor': 'rgba(34, 197, 94, 0.10)'}))
         fit_block = html.Div([
             html.P('Gaussian fit', style={'margin': '10px 0 4px', 'fontWeight': '600'}),
             html.Table(grow, style={'borderCollapse': 'collapse', 'width': '100%'}),
@@ -8120,7 +8925,7 @@ def _line_id_table_layout(cube, freq_window, line_rows, error, v_source):
     if show_v:
         heads.append(html.Th('v (km/s)', style=center))
     heads.append(html.Th('E_u (K)', style=center))
-    body = [html.Tr(heads, style={'backgroundColor': '#EAF2FF'})]
+    body = [html.Tr(heads, style={'backgroundColor': 'var(--accent-soft)'})]
     for rec in line_rows:
         eu = rec.get('eu_k')
         eu_s = f'{eu:.1f}' if eu is not None and np.isfinite(eu) else '—'
@@ -8312,7 +9117,7 @@ def _cr_atten_profile_curve(model, x_axis='nh2', extrapolate=True):
         x = model.get('av')
         x_label_kind = 'av'
     else:
-        x = model.get('nh2_profile')
+        x = _cr_atten_nh_column(model)
         x_label_kind = 'nh2'
     if x is None:
         return None, None
@@ -8324,8 +9129,20 @@ def _cr_atten_profile_curve(model, x_axis='nh2', extrapolate=True):
     if x.size == 0:
         return None, None
     if extrapolate and x_label_kind == 'nh2':
-        x, zeta = cra.extrapolate_profile_loglog(x, zeta)
+        x, zeta = cra.extrapolate_profile_loglog(x, zeta, x_max=2.0 * cra.DEFAULT_NH2_MAX)
     return x, zeta
+
+
+def _cr_atten_nh_column(model):
+    """N_H = N(H) + 2 N(H₂) profile (KoSens ``CRIR_ratio`` x-axis)."""
+    nh2, nh = model.get('nh2_profile'), model.get('nh_profile')
+    if nh2 is None:
+        return None
+    nh2 = np.asarray(nh2, dtype=float)
+    if nh is None:
+        return 2.0 * nh2
+    n = min(nh2.size, len(nh))
+    return np.asarray(nh, dtype=float)[:n] + 2.0 * nh2[:n]
 
 
 def _add_padovani_band(fig, n_h2, zeta, color, name, show_legend=True):
@@ -8338,7 +9155,7 @@ def _add_padovani_band(fig, n_h2, zeta, color, name, show_legend=True):
         name=name,
         legendgroup=name,
         showlegend=show_legend,
-        hovertemplate='N<sub>H₂</sub> = %{x:.3g} cm⁻²<br>ζ = %{y:.3g} s⁻¹<extra></extra>',
+        hovertemplate='N<sub>H</sub> = %{x:.3g} cm⁻²<br>ζ = %{y:.3g} s⁻¹<extra></extra>',
     ))
     fig.add_trace(go.Scatter(
         x=np.concatenate([n_h2, n_h2[::-1]]),
@@ -8366,6 +9183,19 @@ def _hex_to_rgba(color, alpha):
     return f'rgba(128,128,128,{alpha})'
 
 
+def _cr_atten_onset(model, x_axis, stopping_rate):
+    """(x, ζ_H2) where N_eff = N(H2) + N(H)/2 first reaches ``stopping_rate`` (KoSens onset)."""
+    nh2, nh, cosray = model.get('nh2_profile'), model.get('nh_profile'), model.get('cosray')
+    x = model.get('av') if x_axis == 'av' else _cr_atten_nh_column(model)
+    if any(v is None for v in (nh2, nh, cosray, x)) or stopping_rate <= 0:
+        return None
+    n = min(len(nh2), len(nh), len(cosray), len(x))
+    hit = np.flatnonzero(cra.effective_column(nh2[:n], nh[:n]) >= stopping_rate)
+    if not hit.size:
+        return None
+    return float(x[hit[0]]), float(cra.zeta_h2_from_cosray(cosray[hit[0]]))
+
+
 def fig_cr_attenuation(profiles, active_keys, x_axis='nh2', show_padovani=True,
                        extrapolate=True, stopping_rate=None, show_threshold=True,
                        theme='light'):
@@ -8380,12 +9210,8 @@ def fig_cr_attenuation(profiles, active_keys, x_axis='nh2', show_padovani=True,
         n_ref, (z_l, z_h, z_u) = cra.padovani_reference_grid()
         for _tag, _coef, color, name in cra.PADOVANI_MODELS:
             zeta = {'L': z_l, 'H': z_h, 'U': z_u}[_tag]
-            _add_padovani_band(fig, n_ref, zeta, color, name)
-
-    threshold_x = None
-    if show_threshold and x_axis == 'nh2' and stopping_rate > 0:
-        # Match CR_atten_plot.ipynb: axvline(stopping_rate), not profile-derived N_H2.
-        threshold_x = float(stopping_rate)
+            # Padovani curves are in N(H₂); fully molecular gas has N_H = 2 N(H₂).
+            _add_padovani_band(fig, 2.0 * n_ref, zeta, color, name)
 
     n_plotted = 0
     for entry in profiles or []:
@@ -8404,14 +9230,27 @@ def fig_cr_attenuation(profiles, active_keys, x_axis='nh2', show_padovani=True,
             continue
         color = COLORS[n_plotted % len(COLORS)]
         label = _cr_atten_profile_label(entry.get('tokens'))
+        f_att = atten_mass_fraction(model)
+        if np.isfinite(f_att):
+            label += f' · f<sub>att</sub> = {f_att:.2f}'
         fig.add_trace(go.Scatter(
             x=x, y=zeta, mode='lines',
             line=dict(color=color, width=3),
-            name=label,
+            name=label, legendgroup=label,
             hovertemplate=(
                 'x = %{x:.3g}<br>ζ<sub>H₂</sub> = %{y:.3g} s⁻¹<extra></extra>'
             ),
         ))
+        onset = _cr_atten_onset(model, x_axis, stopping_rate) if show_threshold else None
+        if onset is not None:
+            fig.add_trace(go.Scatter(
+                x=[onset[0]], y=[onset[1]], mode='markers', legendgroup=label,
+                showlegend=False,
+                marker=dict(color=color, size=12, symbol='diamond',
+                            line=dict(color='black', width=1.5)),
+                hovertemplate=('attenuation onset: N<sub>eff</sub> = N(H₂) + N(H)/2 = '
+                               f'{stopping_rate:.3g} cm⁻²<br>x = %{{x:.3g}}<extra></extra>'),
+            ))
         n_plotted += 1
 
     if not fig.data:
@@ -8420,20 +9259,14 @@ def fig_cr_attenuation(profiles, active_keys, x_axis='nh2', show_padovani=True,
             msg = 'Load a grid directory on the Load tab'
         return placeholder_fig(msg, theme=theme)
 
-    if show_threshold and threshold_x is not None and np.isfinite(threshold_x):
-        fig.add_vline(
-            x=threshold_x,
-            line=dict(color='black', dash='dashdot', width=1.5),
-        )
-
     if x_axis == 'av':
         x_title = 'A<sub>V</sub> (mag)'
         x_type = 'log'
         x_range = _plotly_log_range(1e-2, 1e3)
     else:
-        x_title = 'N<sub>H₂</sub> (cm⁻²)'
+        x_title = 'N<sub>H</sub> = N(H) + 2N(H₂) (cm⁻²)'
         x_type = 'log'
-        x_range = _plotly_log_range(cra.DEFAULT_NH2_MIN, cra.DEFAULT_NH2_MAX)
+        x_range = _plotly_log_range(2.0 * cra.DEFAULT_NH2_MIN, 2.0 * cra.DEFAULT_NH2_MAX)
 
     y_range = _plotly_log_range(cra.DEFAULT_ZETA_MIN, cra.DEFAULT_ZETA_MAX)
 
@@ -8528,7 +9361,9 @@ app = dash.Dash(
 )
 server = app.server
 
-_RADIO = dict(labelStyle={'display': 'block', 'marginBottom': '3px', 'fontSize': '13px'})
+# Options side by side, wrapping (layout lives in theme.css .radio-inline: Dash 4
+# applies labelStyle to the inner text span, not the option row).
+_RADIO = dict(className='radio-inline', labelStyle={'fontSize': '13px'})
 _SEG = dict(
     className='seg-control',
     inputClassName='seg-input',
@@ -8541,6 +9376,43 @@ _SEG_STACK = dict(
     labelClassName='seg-btn',
     labelStyle={'display': 'inline-flex', 'margin': '0'},
 )
+
+
+def _option_text(label):
+    """Plain-text form of an option label (strings, or html.Span('log', ...))."""
+    if isinstance(label, str):
+        return label.strip()
+    kids = getattr(label, 'children', None)
+    if isinstance(kids, str):
+        return kids.strip()
+    return label
+
+
+def _choice(*, id, options=None, value=None, style=None, multi=False,
+            persistence=None, persistence_type=None, **_radio_styling):
+    """Dropdown standing in for RadioItems (single) or a multi-option Checklist
+    (``multi=True``: pick any number). Same ``value`` shape as the control it
+    replaces, so callbacks are unchanged; radio-only styling kwargs
+    (``**_RADIO``, ``**_SEG``, labelStyle, ...) are accepted and ignored.
+    """
+    if isinstance(options, list):
+        options = [{**o, 'label': _option_text(o.get('label'))} if isinstance(o, dict) else o
+                   for o in options]
+        labels = [o['label'] for o in options
+                  if isinstance(o, dict) and isinstance(o.get('label'), str)]
+    else:
+        labels = []
+    longest = max((len(t) for t in labels), default=14)
+    min_w = min(max(int(longest * 7.2) + (70 if multi else 52), 110), 340)
+    kw = {} if persistence is None else {'persistence': persistence,
+                                          'persistence_type': persistence_type or 'local'}
+    return dcc.Dropdown(
+        id=id, options=options, value=value, multi=multi,
+        clearable=multi, searchable=False,
+        # min(...,100%): preferred width, but never wider than its own field box
+        style={'minWidth': f'min({min_w}px, 100%)', 'fontSize': '13px', **(style or {})},
+        **kw,
+    )
 
 _SCALE_OPTIONS = [
     {'label': html.Span('log', className='seg-opt'), 'value': 'log'},
@@ -8560,9 +9432,9 @@ def _math_label(tex):
     return dcc.Markdown(tex, mathjax=True, className='probe-math-label')
 
 
-_CTRL_LABEL = {'fontWeight': '600', 'fontSize': '13px', 'display': 'block', 'marginBottom': '5px'}
+_CTRL_LABEL = {'fontWeight': '600', 'fontSize': '12px', 'display': 'block', 'marginBottom': '3px'}
 _ALL_BTN_STYLE = {'marginTop': '22px'}
-_CTRL_BOX = {'flex': '1', 'minWidth': '110px', 'marginRight': '18px'}
+_CTRL_BOX = {'flex': '1', 'minWidth': '110px', 'marginRight': '12px'}
 _GRAPH_CFG = {
     'toImageButtonOptions': {'format': 'png', 'scale': 2},
     'displaylogo': False,
@@ -8575,6 +9447,9 @@ _CUBE_MAP_CFG = {
     'toImageButtonOptions': {'format': 'png', 'scale': 2},
     'displaylogo': False,
     'scrollZoom': True,
+    # CARTA-style region tools: box, circle/ellipse, polygon, erase.
+    'modeBarButtonsToAdd': ['drawrect', 'drawcircle', 'drawclosedpath', 'eraseshape'],
+    'edits': {'shapePosition': True},
     'modeBarButtonsToRemove': [
         'autoScale2d', 'hoverClosestCartesian',
         'hoverCompareCartesian', 'toggleSpikelines',
@@ -8589,7 +9464,7 @@ _PAGE_INTRO = {'margin': '0 0 14px', 'fontSize': '13px', 'lineHeight': '1.5',
                'color': 'inherit', 'opacity': 0.88}
 _PANEL_ROW = {
     'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
-    'padding': '12px 18px', 'marginBottom': '12px',
+    'padding': '10px 14px', 'marginBottom': '10px',
 }
 _INPUT_STYLE = {
     'padding': '8px 10px', 'fontSize': '13px',
@@ -8647,26 +9522,37 @@ def _gaussian_guess_rows(kind, n, amps=None, centers=None, fwhms=None):
                 dcc.Input(id={'type': f'{kind}-g-fwhm', 'index': i},
                           type='number', value=_kept(fwhms, i),
                           placeholder='auto', debounce=True, step=0.1,
-                          min=0, style=inp),
+                          min=0, max=NUM_INPUT_MAX, style=inp),
             ], style={'flex': '1', 'minWidth': '110px'}),
         ], style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
                   'marginBottom': '8px'}))
     return rows
 
 
-def _gaussian_guess_panel(kind, n=1):
+def _gaussian_guess_panel(kind, n=1, autofill=False):
+    intro = ('Optional Gaussian values — leave a field blank to auto-guess it. '
+             'Filled values are starting points for the fit. Enable lock to hold '
+             'filled values fixed (useful when a component is well known). Width '
+             'is FWHM, not σ.')
+    if autofill:
+        intro += (' After each fit the boxes left on auto show the fitted numbers; they '
+                  'stay auto (the next fit guesses afresh). Change a number to make it '
+                  'your own starting value (or lock it); Reset to auto drops your numbers.')
+    lock = dcc.Checklist(
+        id=f'{kind}-g-lock',
+        options=[{'label': ' Lock filled values (do not fit them)', 'value': 'on'}],
+        value=[],
+        style={'fontSize': '13px'},
+    )
+    if autofill:
+        lock = html.Div([
+            lock,
+            html.Button('Reset to auto', id=f'{kind}-g-reset', n_clicks=0,
+                        className='btn btn-ghost btn-sm'),
+        ], style={'display': 'flex', 'alignItems': 'center', 'gap': '16px'})
     return html.Div([
-        html.P('Optional Gaussian values — leave a field blank to auto-guess it. '
-               'Filled values are starting points for the fit. Enable lock to hold '
-               'filled values fixed (useful when a component is well known). Width '
-               'is FWHM, not σ.',
-               style={**_PAGE_INTRO, 'marginBottom': '8px'}),
-        dcc.Checklist(
-            id=f'{kind}-g-lock',
-            options=[{'label': ' Lock filled values (do not fit them)', 'value': 'on'}],
-            value=[],
-            style={'fontSize': '13px', 'marginBottom': '8px'},
-        ),
+        html.P(intro, style={**_PAGE_INTRO, 'marginBottom': '8px'}),
+        html.Div(lock, style={'marginBottom': '8px'}),
         html.Div(id=f'{kind}-gauss-params',
                  children=_gaussian_guess_rows(kind, n)),
     ])
@@ -8762,6 +9648,14 @@ _PATH_BROWSE = (
         'button': 'btn-browse-cv-path',
         'input': 'cv-path',
         'title': 'Select any FITS cube in the folder you want to load',
+        'filetypes': _FITS_FILETYPES,
+        'keep': 'folder',
+        'mode': 'file',
+    },
+    {
+        'button': 'btn-browse-cv-ppv-ovl-path',
+        'input': 'cv-ppv-ovl-path',
+        'title': 'Pick any FITS cube in the folder to overlay from',
         'filetypes': _FITS_FILETYPES,
         'keep': 'folder',
         'mode': 'file',
@@ -9142,11 +10036,8 @@ def _probe_table(rows, columns, *, max_rows=40, empty='Compute a ranking to fill
                 missing = val is None or (isinstance(val, float) and not np.isfinite(val))
                 text = '—' if missing else ('yes' if val else 'no')
             elif fmt == 'err':
-                # '>' = lower limit: some cells behind this median are censored.
-                cens = row.get('frac_censored')
-                mark = '>' if cens is not None and np.isfinite(cens) and cens > 0 else ''
                 text = pr.format_score(val) if val is None or not np.isfinite(val) \
-                    else f'{mark}{val:.3f}'
+                    else f'{val:.3f}'
             elif fmt == 'verdict':
                 text = html.Span(str(val), style={
                     'background': ac.VERDICT_COLORS.get(str(val), '#e2e8f0'),
@@ -9171,8 +10062,6 @@ def _probe_table(rows, columns, *, max_rows=40, empty='Compute a ranking to fill
 # Fields in a row start at the top, and every label reserves two lines with its text
 # on the bottom line, so input boxes line up whatever the label or hint length.
 _AI_ROW = {**_PANEL_ROW, 'alignItems': 'flex-start'}
-_AI_LABEL = {**_CTRL_LABEL, 'minHeight': '34px', 'display': 'flex', 'alignItems': 'flex-end'}
-_AI_BTN_STYLE = {'marginTop': '39px'}
 
 _DOCS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'docs')
 
@@ -9211,14 +10100,28 @@ def _doc_details(summary, fname, heading=None, open_=False):
     ], className='kosma-details', open=open_)
 
 
-def _ai_field(label, control, hint, min_width='150px'):
-    """Label + control + one-line explanation (also the tooltip)."""
+def _ai_field(label, control, hint):
+    """Label + control; the explanation is the tooltip of the ⓘ and of the whole field."""
     return html.Div([
-        html.Label(label, style=_AI_LABEL),
+        html.Label([label, html.Span(' ⓘ', className='ai-hint-mark')], className='ai-label'),
         control,
-        html.Span(hint, className='kosma-muted',
-                  style={'fontSize': '11px', 'display': 'block', 'marginTop': '4px'}),
-    ], title=hint, style={**_CTRL_BOX, 'minWidth': min_width})
+    ], title=hint, className='ai-field')
+
+
+def _ai_card(number, title, *children):
+    """One numbered step of the setup panel."""
+    return html.Div([
+        html.Div([html.Span(number, className='ai-step-num'), html.Span(title)],
+                 className='ai-step-head'),
+        *children,
+    ], className='kosma-panel ai-step')
+
+
+def _ai_options(title, *fields):
+    """The controls of one figure, shown beside that figure."""
+    return html.Div([html.Div(title, className='ai-options-title'),
+                     html.Div(list(fields), className='ai-grid')],
+                    className='ai-options')
 
 
 def _ai_number(id_, value, **kw):
@@ -9284,167 +10187,110 @@ def _atten_impact_page():
                className='kosma-muted', style={'margin': '0'}),
     ])])
 
-    data_row = html.Div([
-        html.Div([
-            html.Label('Quantity', style=_AI_LABEL),
-            dcc.RadioItems(id='ai-quantity', options=PROBE_QUANTITY_OPTIONS,
-                           value='rel_abund', **_RADIO),
-            html.Span('Line intensities need a SIMLINE directory and a SIMLINE overlay; '
-                      'abundances and column densities use the HDF5 grid and its overlay.',
-                      className='kosma-muted', style={'fontSize': '11px', 'display': 'block'}),
-        ], style={'flex': '1.2', 'minWidth': '200px', 'marginRight': '18px'}),
-        html.Div([
-            html.Label('Tracers', style=_AI_LABEL),
-            dcc.Dropdown(id='ai-tracers', options=[], value=[], multi=True,
-                         placeholder='Load a grid… then pick species or lines',
-                         style={'fontSize': '13px'}),
-            html.Span('Each tracer costs one shift search per density slice. “Add all” for a '
-                      'full survey (slower) — the point of the procedure is to find the movers.',
-                      className='kosma-muted', style={'fontSize': '11px', 'display': 'block',
-                                                      'marginTop': '4px'}),
-        ], style={'flex': '2.4', 'minWidth': '260px', 'marginRight': '8px'}),
-        html.Button('Typical', id='ai-btn-typical', n_clicks=0,
-                    className='btn btn-ghost btn-sm', style=_AI_BTN_STYLE),
-        html.Button('Add all', id='ai-btn-all', n_clicks=0, className='btn btn-primary btn-sm',
-                    style={**_AI_BTN_STYLE, 'marginLeft': '6px'}),
+    selection = _ai_card('1', 'What to compare', html.Div([
+        _ai_field('Quantity', _choice(id='ai-quantity', options=PROBE_QUANTITY_OPTIONS,
+                                             value='rel_abund', **_RADIO),
+                  'Line intensities need a SIMLINE directory and a SIMLINE overlay; abundances '
+                  'and column densities use the HDF5 grid and its overlay.'),
+        html.Div(id='ai-idef-wrap', style={'display': 'none'}, children=_ai_field(
+            'Intensity units', _choice(id='ai-idef', options=SIMLINE_MAPFIT_IDEF_OPTIONS,
+                                              value=SIMLINE_DEFAULT_IDEF, **_RADIO),
+            'Units of the line intensities.')),
+        _ai_field('Filters', _choice(multi=True, id='ai-filters', value=['ice', 'catalog'], options=[
+            {'label': ' exclude ice (J-species)', 'value': 'ice'},
+            {'label': ' exclude isotopologues', 'value': 'iso'},
+            {'label': ' 3-D: only species in CDMS/JPL', 'value': 'catalog'}], **_RADIO),
+            'Ice species have no line emission. Run once with and once without isotopologues '
+            'to separate the two investigations. In 3-D mode only species (and ratios whose '
+            'both sides) have laboratory spectroscopy in CDMS or JPL are graded, as nothing '
+            'else can be observed (KoSens require_catalog; H3+ and a few IR species are kept).'),
         _ai_field('Ratios', dcc.Checklist(id='ai-include-ratios',
                                           options=[{'label': ' include pairs', 'value': 'on'}],
                                           value=[], **_RADIO),
-                  'Also test ratios of the selected tracers (KoSens pairing rules). Ratios that '
-                  'share a species are capped in the rankings, and den_contrib tells when a '
-                  'ratio only restates its numerator.', '170px'),
-        html.Div(id='ai-idef-wrap', children=[
-            html.Label('Intensity units', style=_AI_LABEL),
-            dcc.RadioItems(id='ai-idef', options=SIMLINE_MAPFIT_IDEF_OPTIONS,
-                           value=SIMLINE_DEFAULT_IDEF, **_RADIO),
-        ], style={**_CTRL_BOX, 'minWidth': '160px', 'display': 'none'}),
-    ], className='kosma-panel', style=_AI_ROW)
+                  'Also test ratios of the selected tracers (KoSens pairing rules); den_contrib '
+                  'tells when a ratio only restates its numerator.'),
+        _ai_field('Species per figure', _ai_number('ai-max-species', 10, min=1, step=1),
+                  'Steps 1 and 2 draw every selected species (after the filters) in as many '
+                  'figures as it takes, all on one scale.'),
+    ], className='ai-grid'), _ai_field('Tracers', html.Div([
+        dcc.Dropdown(id='ai-tracers', options=[], value=[], multi=True,
+                     placeholder='Load a grid… then pick species or lines',
+                     style={'fontSize': '13px', 'flex': '1', 'minWidth': '240px'}),
+        html.Button('Typical', id='ai-btn-typical', n_clicks=0, className='btn btn-ghost btn-sm'),
+        html.Button('Add all', id='ai-btn-all', n_clicks=0, className='btn btn-primary btn-sm'),
+    ], className='ai-tracer-row'),
+        'Each tracer costs one shift search per density slice. “Add all” for a full survey '
+        '(slower) — the point of the procedure is to find the movers.'))
 
-    setup_row = html.Div([
-        _ai_field('Mode', dcc.RadioItems(id='ai-mode', value='single', options=[
+    setup = _ai_card('2', 'Grid and resolution', html.Div([
+        _ai_field('Mode', _choice(id='ai-mode', value='single', options=[
             {'label': ' single n_H slice (as KoSens)', 'value': 'single'},
             {'label': ' full 3-D grid (n_H × χ × ζ)', 'value': '3d'}], **_RADIO),
             'Single: the (ζ, χ) plane at one density — exactly the KoSens procedure. 3-D: every '
-            'density slice, pooled, plus verdicts per density and per environment.', '230px'),
+            'density slice, pooled, plus verdicts per (n_H, χ, ζ) environment.'),
         html.Div(id='ai-density-wrap', children=_ai_field(
             'Density n_H [cm⁻³]',
             dcc.Dropdown(id='ai-density', options=[], value=None, clearable=False),
-            'Slice used in single mode (the nearest native or resampled density).', '170px')),
-        _ai_field('Resample ζ × χ', html.Div([
+            'Slice used in single mode (the nearest native or resampled density).')),
+        _ai_field('Resample to n per axis', html.Div([
             dcc.Checklist(id='ai-interp-enable', options=[{'label': ' on', 'value': 'on'}],
                           value=['on'], **_RADIO),
             _ai_number('ai-interp-n', 60, min=2, max=200, step=1)]),
-            'KoSens interpolates each plane to n × n (60 × 60) before the shift search. Off = '
-            'native models only: faster, every cell a real model, but fractions over fewer '
-            'cells. n_H always keeps its native slices.', '200px'),
-        _ai_field('Scan direction', dcc.Dropdown(id='ai-scan-dir', value='rightward',
-                                                 options=X_SHIFT_DIRECTION_OPTIONS,
-                                                 clearable=False),
-                  'Rightward only (default) is the one that gives Δ its meaning as the ζ error: '
-                  'attenuation dims the line, so a constant-CR fit lands at a lower ζ. The '
-                  'others are diagnostics.', '210px'),
-        _ai_field('Match tolerance (rtol)', _ai_number('ai-rtol', ac.X_SHIFT_MATCH_RTOL,
-                                                       min=0, max=0.5, step=0.005),
-                  'A match needs |I − I_target| ≤ rtol · I_target. Default 0.02 (2 %). Larger = '
-                  'more matches, coarser Δ.', '150px'),
-        _ai_field('Detection limit', _ai_number('ai-obs-limit', ac.OBS_INTENSITY_LIMIT, min=0),
-                  'Line intensities only, in grid units (0.1 = 100 mK for a grid in K). A cell '
-                  'counts only where every line behind the key clears it in both grids — ratios '
-                  'are judged on their two lines. Blank = no limit.', '180px'),
-    ], className='kosma-panel', style=_AI_ROW)
-
-    env_row = html.Div(id='ai-env-wrap', style={'display': 'none'}, className='kosma-panel',
-                       children=[html.Div([
-        _ai_field('n_H edges', _ai_text('ai-env-n', 'auto'),
-                  '“auto” splits once at the log midpoint → low / high n_H; “full” = no split; '
-                  'or comma-separated values, e.g. 1e3, 1e4.', '200px'),
-        _ai_field('χ edges', _ai_text('ai-env-chi', 'auto'),
-                  'The same for the FUV field χ (Draine).', '160px'),
-        _ai_field('ζ edges', _ai_text('ai-env-zeta', 'auto'),
-                  'The same for ζ [s⁻¹]. “auto” on all three axes gives 8 environments such as '
-                  '“low n_H · high χ · high ζ”.', '220px'),
-        _ai_field('Min cells per environment', _ai_number('ai-min-env-cells', 10, min=1, step=1),
-                  'Fewer cells for a species, or fewer than two (n_H, χ) rows, grades it “too few '
-                  'models” instead of a noisy verdict.', '190px'),
-    ], style=_AI_ROW)])
+            'KoSens interpolates before the shift search: a single slice to n × n in ζ × χ '
+            '(60 × 60, native densities), the 3-D grid to an n × n × n cube in ζ × χ × n_H '
+            '(24³; the cost scales with n³). Off = native models only: faster, every cell a '
+            'real model, but fractions over fewer cells.'),
+    ], className='ai-grid'), html.Div(id='ai-env-wrap', style={'display': 'none'}, children=[
+        html.Div('3-D bins — environments and step 1', className='ai-options-title'),
+        html.Div([
+            _ai_field('n_H bins', _ai_text('ai-env-n', '2'),
+                      'A number = that many equal-log-width bins between the axis min and max '
+                      '(3 → low / mid / high, as KoSens); “full” = no split; or comma-separated '
+                      'edge values, e.g. 1e3, 1e4. Also the bins of the step-1 heatmaps and '
+                      'winner map.'),
+            _ai_field('χ bins', _ai_text('ai-env-chi', '2'),
+                      'The same for the FUV field χ (Draine).'),
+            _ai_field('ζ bins', _ai_text('ai-env-zeta', '2'),
+                      'The same for ζ [s⁻¹]. 3 on all three axes gives 27 boxes such as '
+                      '“low n_H · high χ · mid ζ”.'),
+        ], className='ai-grid'),
+    ]))
 
     thresholds = html.Details([
-        html.Summary('Thresholds — applied instantly to the computed cells (no recompute)'),
+        html.Summary('Advanced — shift search and verdict thresholds'),
         html.Div([
-            html.P('Each threshold is entered once and used by every step, so the steps can never '
-                   'disagree (workflow §9). Hover a field for its explanation.',
-                   className='kosma-muted', style={'margin': '0 0 8px', 'fontSize': '12px'}),
-            html.Strong('Which cells count'),
-            html.Div([
-                _ai_field('min |S| [dex/dex]', _ai_number('ai-min-slope', 0.1, min=0, step=0.05),
-                          'Cells whose reference row moves less than this per dex of ζ are not '
-                          'trusted: there |Δ| ≈ |R|/|S| blows up because the line stopped '
-                          'responding. 0.1 ≈ 26 % per decade. Counts ignore it, medians use it. '
-                          'Larger = stricter.'),
-                _ai_field('“shifted” if |Δ| ≥ [dex]',
-                          _ai_number('ai-min-abs-shift', 0.1, min=0, step=0.05),
-                          'Threshold for counting a cell as moved (n_shifted, frac_shifted). '
-                          '0.1 dex ≈ 26 % in ζ.'),
-                _ai_field('|Δ| bin edges [dex]', _ai_text('ai-shift-edges', '0.1, 0.3, 0.5, 1.0'),
-                          'Bins of the step-1 stacked bars. 0.3 dex = ×2, 0.5 = ×3, 1 = ×10 in ζ.',
-                          '180px'),
-                _ai_field('min observable fraction',
-                          _ai_number('ai-min-obs-frac', 0.5, min=0, max=1, step=0.05),
-                          'A species above the detection limit over less of the grid is not '
-                          'ranked and is graded “unobservable”. Needs a detection limit.'),
-            ], style=_AI_ROW),
-            html.Strong('Is the number measured? (honesty gates)'),
-            html.Div([
-                _ai_field('max unmatched fraction',
-                          _ai_number('ai-max-unmatched', 0.5, min=0, max=1, step=0.05),
-                          'More of the map without a match → not ranked in step 1 and graded '
-                          '“unmeasurable”: moved everywhere, measured nowhere. 1 disables. '
-                          'Smaller = stricter.'),
-                _ai_field('max censored fraction',
-                          _ai_number('ai-max-censored', 0.5, min=0, max=1, step=0.05),
-                          'Censored cells enter the ζ error at a lower bound. Above 0.5 the median '
-                          'itself is an imputed bound, not a measurement. 1 disables.'),
-            ], style=_AI_ROW),
-            html.Strong('The verdict cascade'),
-            html.Div([
-                _ai_field('min shifted fraction (broad)',
-                          _ai_number('ai-min-frac-shifted', 0.5, min=0, max=1, step=0.05),
-                          'Does attenuation touch a useful part of the grid? Below → “CR-led, '
-                          'narrow”.'),
-                _ai_field('response floor [dex]',
+            html.P('Every cell with a model counts, for every species: unmatched cells and cells '
+                   'below the detection limit enter at Δ = 0 (and R = 0). No species is excluded; '
+                   'the thresholds are labels on numbers, not cuts, and apply instantly.',
+                   className='kosma-muted', style={'margin': '0 0 10px', 'fontSize': '12px'}),
+            _ai_options(
+                'Shift search — needs a new Compute',
+                _ai_field('Scan direction', dcc.Dropdown(id='ai-scan-dir', value='rightward',
+                                                         options=X_SHIFT_DIRECTION_OPTIONS,
+                                                         clearable=False,
+                                                         style={'fontSize': '13px'}),
+                          'Rightward only (default) is the one that gives Δ its meaning as the ζ '
+                          'error: attenuation dims the line, so a constant-CR fit lands at a '
+                          'lower ζ. The others are diagnostics.'),
+                _ai_field('Match tolerance (rtol)', _ai_number('ai-rtol', ac.X_SHIFT_MATCH_RTOL,
+                                                               min=0, max=0.5, step=0.005),
+                          'A match needs |I − I_target| ≤ rtol · I_target. Default 0.02 (2 %). '
+                          'Larger = more matches, coarser Δ.'),
+                _ai_field('Detection limit', _ai_number('ai-obs-limit', ac.OBS_INTENSITY_LIMIT,
+                                                        min=0),
+                          'Line intensities only, in grid units (0.1 = 100 mK for a grid in K). '
+                          'A cell counts only where every line behind the key clears it in both '
+                          'grids — ratios are judged on their two lines. Blank = no limit.')),
+            _ai_options(
+                'Verdict cascade',
+                _ai_field('Response floor [dex]',
                           _ai_number('ai-response-floor', 0.1, min=0, step=0.05),
                           '|R| below this (0.1 ≈ 26 %) = the line barely responds → “no response”; '
                           'also the dotted line of the probe plane.'),
                 _ai_field('ζ error that matters [dex]',
                           _ai_number('ai-min-error', 0.3, min=0, step=0.05),
                           'Is the ζ error worth correcting? 0.3 dex = factor 2. Below → “CR-led, '
-                          'small bias”. Not applied to the Best-CR-probes list.'),
-            ], style=_AI_ROW),
-            html.Strong('Display'),
-            html.Div([
-                _ai_field('species per panel', _ai_number('ai-max-species', 8, min=1, step=1),
-                          'Species drawn in step 2: largest ζ error (left), largest margin (right).'),
-                _ai_field('max per constituent', _ai_number('ai-max-per-const', 2, min=1, step=1),
-                          'At most this many drawn entries may share a species — ratios on one '
-                          'numerator with inert denominators are one finding. Tables keep all.'),
-                _ai_field('top species (step 1)', _ai_number('ai-top-summary', 12, min=1, step=1),
-                          'Species on the step-1 bars and heatmaps, by median |Δ|.'),
-                _ai_field('ζ bins', _ai_number('ai-nx-bins', 4, min=1, max=20, step=1),
-                          'Log-spaced ζ bins of the heatmaps and winner map.', '110px'),
-                _ai_field('χ bins', _ai_number('ai-ny-bins', 4, min=1, max=20, step=1),
-                          'Log-spaced χ bins of the heatmaps and winner map.', '110px'),
-                _ai_field('top models per species', _ai_number('ai-top-models', 8, min=1, step=1),
-                          'Largest-|Δ| trusted cells kept per species (Top models table).'),
-                _ai_field('probe-plane axis max [dex]',
-                          _ai_number('ai-probe-axis-max', 1.5, min=0.2, step=0.1),
-                          'Fixed, equal axes so two runs compare by eye; raised automatically so '
-                          'nothing is clipped.'),
-                _ai_field('Filters', dcc.Checklist(id='ai-filters', value=['ice'], options=[
-                    {'label': ' exclude ice (J-species)', 'value': 'ice'},
-                    {'label': ' exclude isotopologues', 'value': 'iso'}], **_RADIO),
-                    'Ice species have no line emission. Run once with and once without '
-                    'isotopologues to separate the two investigations.', '210px'),
-            ], style=_AI_ROW),
+                          'small bias”. Not applied to the Best-CR-probes list.')),
         ], className='kosma-details-body'),
     ], className='kosma-details', open=True)
 
@@ -9452,14 +10298,28 @@ def _atten_impact_page():
         return html.P(text, style=_PAGE_INTRO)
 
     breadth = [
-        step_intro('Which species move, and where? Species are ranked by how many models moved '
-                   '(an unmatched cell counts as movement here). Breadth, not magnitude.'),
+        step_intro('Which species move, and where? Species are ranked by their median |Δ| over '
+                   'every cell with a model — unmatched and unobservable cells count as 0.'),
         _doc_details('How to read step 1', 'attenuation_workflow.md', '5. Stage 4'),
         _doc_details('Good values for step 1', 'attenuation_good_values.md', 'Step 1'),
-        _ai_graph('ai-fig-bars'), _ai_graph('ai-fig-heat'), _ai_graph('ai-fig-winner'),
+        _ai_options(
+            'Figure options',
+            _ai_field('|Δ| bin edges [dex]', _ai_text('ai-shift-edges', '0.1, 0.3, 0.5, 1.0'),
+                      'Bins of the stacked bars. 0.3 dex = ×2, 0.5 = ×3, 1 = ×10 in ζ.'),
+            _ai_field('ζ bins (single slice)', _ai_number('ai-nx-bins', 4, min=1, max=20, step=1),
+                      'Log-spaced ζ bins of the heatmaps and winner map in single-slice mode. '
+                      'In 3-D the bins of the setup panel apply.'),
+            _ai_field('χ bins (single slice)', _ai_number('ai-ny-bins', 4, min=1, max=20, step=1),
+                      'Log-spaced χ bins of the heatmaps and winner map in single-slice mode. '
+                      'In 3-D the bins of the setup panel apply.'),
+            _ai_field('Top models per species', _ai_number('ai-top-models', 8, min=1, step=1),
+                      'Largest-|Δ| cells kept per species (Top models table).')),
+        dcc.Loading(type='circle', children=html.Div(
+            id='ai-step1-figs', children=_probe_table([], [], empty='Compute to fill these figures.'))),
+        _ai_graph('ai-fig-winner'),
         html.Strong('Species summary'), _ai_table_slot('ai-tbl-summary'),
         html.Strong('Regime winners'), _ai_table_slot('ai-tbl-winners'),
-        html.Strong('Top models (largest trusted |Δ| per species)'), _ai_table_slot('ai-tbl-top'),
+        html.Strong('Top models (largest |Δ| per species; check S before following one up)'), _ai_table_slot('ai-tbl-top'),
         _doc_details('Column guide', 'attenuation_workflow.md',
                      '`species_summary` and regime tables'),
     ]
@@ -9469,21 +10329,43 @@ def _atten_impact_page():
                    'ideal probe has a large response on a steep row and therefore a small error.'),
         _doc_details('How to read step 2', 'attenuation_workflow.md', '6. Stage 5'),
         _doc_details('Reading the error panel, bar by bar', 'probe_margin_explained.md',
-                     'Reading the left panel'),
+                     '9. The left panel'),
         _doc_details('Reading the probe plane', 'probe_margin_explained.md',
-                     'Where it lands on the real plot'),
+                     '13. The right panel'),
         _doc_details('Good values for step 2', 'attenuation_good_values.md', 'Step 2'),
-        # Square figures (height fixed in atten_compare, width capped here) side by side.
-        # Probe panel is wider: its legend sits to the right of the square plot.
-        html.Div([html.Div(_ai_graph(i), style={'flex': f'1 1 {w}px', 'maxWidth': f'{mw}px'})
-                  for i, w, mw in (('ai-fig-err', 560, 680), ('ai-fig-probe', 760, 920))],
-                 style={**_AI_ROW, 'gap': '16px'}),
+        _ai_options(
+            'Figure options',
+            _ai_field('Probe-plane axes', _choice(
+                id='ai-probe-scale', value='log', options=[
+                    {'label': ' logarithmic', 'value': 'log'},
+                    {'label': ' linear', 'value': 'linear'}], **_RADIO),
+                'Both axes share one range so the diagonal stays at 45°. Log zooms to the data; '
+                'a zero swing is pinned to the lower edge.'),
+            _ai_field('Probe-plane min [dex]', _ai_number('ai-probe-min', None, min=0),
+                      'Lower limit of both axes. Blank = automatic (log needs > 0).'),
+            _ai_field('Probe-plane max [dex]', _ai_number('ai-probe-max', None, min=0),
+                      'Upper limit of both axes. Blank = automatic. Fix it to compare runs by '
+                      'eye; species beyond it are clipped.'),
+            _ai_field('Profile χ axis', _choice(
+                id='ai-profile-scale', value='log', options=[
+                    {'label': ' logarithmic', 'value': 'log'},
+                    {'label': ' linear', 'value': 'linear'}], **_RADIO),
+                'X axis of the R and Δ profiles.')),
+        html.P('Profiles along χ: the curve the swing summarises. Left, the median change R at '
+               'the same cell; right, the median shift Δ along ζ needed to match. A flat R '
+               'profile is a clean probe; R that drifts or flips sign is not. Long lists split '
+               'over several figures on one scale; a probe figure and the profiles below it '
+               'hold the same species.',
+               className='kosma-muted', style={'fontSize': '12px', 'margin': '10px 0 4px'}),
+        dcc.Loading(type='circle', children=html.Div(
+            id='ai-step2-figs', children=_probe_table([], [], empty='Compute to fill these figures.'))),
         html.Strong('Response table'), _ai_table_slot('ai-tbl-response'),
         _doc_details('Column guide', 'attenuation_workflow.md', 'Response table'),
     ]
     verdicts = [
-        step_intro('One verdict per species from four questions asked in order — broad, honest, '
-                   'CR-led, matters. The first failing question names the verdict.'),
+        step_intro('One verdict per species from three questions asked in order — responds, '
+                   'CR-led, matters. The first failing question names the verdict. No species '
+                   'is excluded.'),
         _doc_details('How to read step 3', 'attenuation_workflow.md', '7. Stage 6'),
         _doc_details('Good values and verdicts', 'attenuation_good_values.md', 'Step 3'),
         html.Div(id='ai-tally', style={'display': 'flex', 'flexWrap': 'wrap', 'gap': '6px',
@@ -9491,47 +10373,174 @@ def _atten_impact_page():
         html.Div([
             html.Div([
                 html.Strong('Best CR probes — line selection'),
-                html.P('CR-led verdicts sorted by probe margin. The “matters” cut is not applied: '
+                html.P('CR-led verdicts sorted by |R|. The “matters” cut is not applied: '
                        'a clean probe with a small ζ error is still a clean probe.',
                        className='kosma-muted', style={'fontSize': '12px', 'margin': '4px 0'}),
                 _ai_table_slot('ai-tbl-tracers'),
-            ], style={'flex': '1', 'minWidth': '380px', 'marginRight': '18px'}),
+            ], style={'flex': '1', 'minWidth': '380px', 'marginRight': '12px'}),
             html.Div([
                 html.Strong('Lines that mislead most — correction priority'),
-                html.P('Honest species (measured, not imputed) sorted by ζ error. An FUV tracer '
-                       'can lead it: the error is real, its cause is not cosmic rays.',
+                html.P('Every species sorted by ζ error. A G0-modulated '
+                       'species can lead it: the error is real, its cause is not cosmic rays.',
                        className='kosma-muted', style={'fontSize': '12px', 'margin': '4px 0'}),
                 _ai_table_slot('ai-tbl-problematic'),
             ], style={'flex': '1', 'minWidth': '380px'}),
         ], style=_AI_ROW),
         html.Strong('All species, graded (cascade order)'), _ai_table_slot('ai-tbl-verdicts'),
         _doc_details('Column guide', 'attenuation_workflow.md', 'Reconciliation'),
-        html.Strong('Where to follow up the CRIR probes'),
-        html.P('Step-1 regime winners restricted to species graded CRIR probe.',
+        html.H4('Where does each species become CR-led? (ζ regimes)'),
+        html.P('The ζ axis is cut into equal-log regimes and the three steps re-run on each; '
+               'the χ swing still spans its full range inside a regime. A line inert at low ζ '
+               'grades “no response” over the whole grid yet can be a clean probe at high ζ. '
+               'Cell text: verdict and |R| [dex]. The top regime has less room for a rightward '
+               'match, so it holds more Δ = 0 cells and its errors are conservative — a grid '
+               'limit.',
+               className='kosma-muted', style={'fontSize': '12px'}),
+        _ai_options(
+            'Figure options',
+            _ai_field('ζ regimes', _ai_number('ai-zeta-bins', 3, min=1, max=8, step=1),
+                      'Equal-log-width ζ regimes of this matrix.')),
+        _ai_graph('ai-fig-zeta'),
+        html.Strong('Best regime per species (CR-led in at least one regime)'),
+        _ai_table_slot('ai-tbl-zeta'),
+        html.Strong('Where to follow up the robust attenuation probes'),
+        html.P('Step-1 regime winners restricted to species graded robust attenuation probe.',
                className='kosma-muted', style={'fontSize': '12px', 'margin': '4px 0'}),
         _ai_table_slot('ai-tbl-followup'),
         _doc_details('Where to go next', 'attenuation_workflow.md', '8. Stage 7'),
+    ]
+    three_d_tab = [
+        step_intro('The same three steps re-run per (n_H, χ, ζ) box, the '
+                   'attenuation impact matrix and the scope of each probe. Needs Mode = full '
+                   '3-D grid and a Compute; it is only calculated when this sub-tab is open.'),
+        _ai_options(
+            'Impact matrix options',
+            _ai_field('D grid', _choice(
+                id='ai-d-grid', value='native', options=[
+                    {'label': ' native models (as KoSens)', 'value': 'native'},
+                    {'label': ' resampled cube', 'value': 'interp'}], **_RADIO),
+                'The grid behind the D matrix, its ranking and the observer table: the '
+                'slopes of the models themselves, or of the resampled cube. The |Δ| matrix '
+                'always uses the resampled cube. With resampling off they are the same grid.'),
+            _ai_field('Metric', _choice(
+                id='ai-impact-metric', value='error_dex', options=[
+                    {'label': ' |Δ| (ζ error)', 'value': 'error_dex'},
+                    {'label': ' |R| (response)', 'value': 'abs_response_dex'}], **_RADIO),
+                '|Δ| is the dex error in ζ made by ignoring attenuation; |R| the change in '
+                'the line at fixed conditions. |Δ| ≈ |R| / |S|, so |R| can rank a steep line '
+                'above one whose ζ is more biased.'),
+            _ai_field('Rows from D', dcc.Checklist(
+                id='ai-impact-pair', value=['on'],
+                options=[{'label': ' pair with D matrix', 'value': 'on'}], **_RADIO),
+                'KoSens notebook: the impact matrix takes its rows from the CR-dominance (D) '
+                'matrix, so each species sits in the same row of both.'),
+            _ai_field('Rows', _ai_number('ai-impact-top', 15, min=1, step=1),
+                      'Species drawn: the largest median over the attenuated boxes (KoSens '
+                      'top_n).'),
+            _ai_field('Exclude', _ai_text('ai-impact-exclude', ''),
+                      'Comma-separated species dropped before the ranking (KoSens '
+                      'exclude_species), e.g. CH3OH.'),
+            _ai_field('min f_att', _ai_number('ai-min-f-att', 0.0, min=0, max=1, step=0.01),
+                      'Boxes whose median CR-attenuated mass fraction is ≤ this never '
+                      'switched attenuation on: blank in the impact matrix, left out of its '
+                      'ranking and of the probe scope. Needs the attenuated grid as HDF5 '
+                      'overlay.')),
+        html.Div(id='ai-3d-hint', className='kosma-muted',
+                 children='Compute in 3-D mode to fill this page.'),
         html.Div(id='ai-3d-wrap', style={'display': 'none'}, children=[
-            html.H4('3-D · does the verdict depend on density?'),
-            html.P('One column per density slice (the whole procedure re-run on it) plus the '
-                   'pooled grid. A row that keeps its colour is a verdict you can quote at any '
-                   'density; a row that changes is density-specific.',
-                   className='kosma-muted', style={'fontSize': '12px'}),
-            _ai_graph('ai-fig-dens-matrix'),
             html.H4('3-D · verdicts per environment'),
-            html.P('Each column is an environment from the edges in the setup panel: the three '
-                   'steps re-run on its cells, the swing measured only across its own (n_H, χ) '
-                   'rows. Read a row to see where a species is a good or a bad tracer; pick an '
-                   'environment below for its own lists.',
+            html.P('Each column is a box from the bins in the setup panel: the three '
+                   'steps re-run on its cells. The verdict tests only the χ part of the swing '
+                   '(across χ at fixed n_H); the n_H part is largely the attenuation itself and '
+                   'is reported, not penalised. Read a row to see where a species is a good or a bad tracer; pick an '
+                   'environment below for its own lists. The strips under the matrix give each '
+                   'column\'s n_H, χ and ζ level (light → dark = low → high); hover a cell for '
+                   'the box and the ranges it covers. low / mid / high are cuts of the loaded '
+                   'grid between its own min and max, not physical thresholds.',
                    className='kosma-muted', style={'fontSize': '12px'}),
             _ai_graph('ai-fig-env-matrix'),
-            html.Div(_ai_field('Environment', dcc.Dropdown(id='ai-env-pick', options=[],
-                                                           value=None, clearable=False),
-                               'The lists below are for this environment only.', '340px'),
-                     style=_AI_ROW),
+            html.Strong('Where each species is a CR tracer (most robust-probe boxes first) — '
+                        'the row order of the matrix'),
+            _ai_table_slot('ai-tbl-best-regimes'),
+            html.P('The same matrix as one row per species: in how many of the boxes '
+                   'is it a robust attenuation probe, robust with small bias, or G0-modulated. A species whose '
+                   '"Probe in" sits well below "Graded boxes" is a probe only in the environment '
+                   'named beside it, not one you can quote for the whole grid.',
+                   className='kosma-muted', style={'fontSize': '12px'}),
+            _ai_table_slot('ai-tbl-env-tally'),
+            html.H4('3-D · attenuation impact per environment'),
+            html.P('Median |Δ| (the ζ error made by ignoring attenuation) per species and '
+                   'environment, columns grouped by ζ; rows are the species with the largest '
+                   'median over the boxes. ▲ / ▼: the line gets brighter / fainter '
+                   'when attenuated. Strips under the matrix: χ, n_H and ζ level of each column. '
+                   'With the attenuated grid loaded as HDF5 overlay a fourth strip carries the '
+                   'CR-attenuated mass fraction f_att; columns with f_att ≤ min f_att never switched attenuation '
+                   'on and are blank and left out of the ranking.',
+                   className='kosma-muted', style={'fontSize': '12px'}),
+            html.P('CR dominance D = |S_ζ|/(|S_ζ|+|S_χ|) per species and environment (median over '
+                   'the box, 1-dex windowed slopes): 1 = the line follows ζ only, 0 = χ only. '
+                   'Rows: the largest median D. With “pair with D matrix” the |Δ| matrix below '
+                   'uses the same rows.',
+                   className='kosma-muted', style={'fontSize': '12px'}),
+            _ai_graph('ai-fig-impact-d'),
+            _ai_graph('ai-fig-impact'),
+            html.Strong('Impact ranking (every species, not only the rows drawn)'),
+            _ai_table_slot('ai-tbl-impact'),
+            html.H4('3-D · scope of each probe: everywhere, or only once n_H and χ are known?'),
+            html.P('A box verdict asks whether a line is clean inside one environment; whether '
+                   'its response is the same in every environment is a separate question. Only '
+                   'boxes that respond (|R| ≥ response floor) enter. x: within-box swing / |R| '
+                   '(left panel χ — it sets the class; right panel n_H — reported). y: spread of '
+                   'the signed R between boxes / |R|. Universal probe: both below 1. Conditional '
+                   'probe: clean inside each box, different between boxes — the table names the '
+                   'axis that must be known.',
+                   className='kosma-muted', style={'fontSize': '12px'}),
+            _ai_graph('ai-fig-scope'),
+            _ai_table_slot('ai-tbl-scope'),
+            html.H4('3-D · observer error table (KoSens observer_error_table_3d)'),
+            html.P('Fitting with constant-ζ models at an FUV field off by δ = log χ_adopt − '
+                   'log χ_true gives log(ζ_fit/ζ_true) = −ε_att − r·δ. Per box: Δ (grid-'
+                   'matched shift, unmatched = 0), its linear form Δ_lin = −R/S_ζ, '
+                   'lin_ratio = Δ/Δ_lin (≈ 1 where the linear formula holds), S_ζ, S_χ, '
+                   'r = S_χ/S_ζ and D = |S_ζ|/(|S_ζ|+|S_χ|); medians with 16–84 % ranges in the '
+                   'downloads. Reliable: D ≥ 0.75 and at most half the cells unmatched.',
+                   className='kosma-muted', style={'fontSize': '12px'}),
+            html.Div([
+                html.Button('Download CSV', id='ai-obs-csv', n_clicks=0,
+                            className='btn btn-ghost btn-sm', style={'marginRight': '8px'}),
+                html.Button('Download compact CSV', id='ai-obs-compact', n_clicks=0,
+                            className='btn btn-ghost btn-sm', style={'marginRight': '8px'}),
+                html.Button('Download LaTeX (reliable boxes)', id='ai-obs-tex', n_clicks=0,
+                            className='btn btn-ghost btn-sm'),
+                dcc.Download(id='ai-obs-download'),
+            ], style={'margin': '4px 0 8px'}),
+            _ai_table_slot('ai-tbl-observer'),
+            html.Div([
+                _ai_field('Species to inspect', dcc.Dropdown(id='ai-box-species', options=[],
+                                                             value=[], multi=True),
+                          'One row of figures per species: every box in the probe plane '
+                          '(★ = whole cube), and its response per (n_H, χ) box and ζ level. '
+                          'Default: the conditional probes.'),
+                _ai_field('Slices show', _choice(
+                    id='ai-slice-metric', value='response_dex', options=[
+                        {'label': ' R (signed)', 'value': 'response_dex'},
+                        {'label': ' |Δ| (ζ error)', 'value': 'error_dex'}], **_RADIO),
+                    'Signed R uses a diverging scale, so sign flips between environments '
+                    'stand out.'),
+            ], className='ai-grid'),
+            dcc.Loading(type='circle', children=html.Div(id='ai-box-figs')),
+            html.Strong('Environment'),
+            html.P('The strips of the impact matrix, in the same order: click a column to '
+                   'choose its environment. The lists below are for that environment only.',
+                   className='kosma-muted', style={'fontSize': '12px', 'margin': '4px 0'}),
+            dcc.Store(id='ai-env-pick'),
+            dcc.Graph(id='ai-env-legend', figure=placeholder_fig('Compute in 3-D mode to fill this legend'),
+                      config={'displayModeBar': False}),
+            html.Div(id='ai-env-name', style={'fontSize': '13px', 'fontWeight': '600',
+                                              'margin': '4px 0 10px'}),
             html.Div([
                 html.Div([html.Strong('Best CR probes here'), _ai_table_slot('ai-env-tracers')],
-                         style={'flex': '1', 'minWidth': '380px', 'marginRight': '18px'}),
+                         style={'flex': '1', 'minWidth': '380px', 'marginRight': '12px'}),
                 html.Div([html.Strong('Lines that mislead most here'),
                           _ai_table_slot('ai-env-problematic')],
                          style={'flex': '1', 'minWidth': '380px'}),
@@ -9560,12 +10569,12 @@ def _atten_impact_page():
                'wrong the inferred ζ gets, whether a tracer reports cosmic rays or the radiation '
                'field, and one verdict per tracer — for one density slice or the whole 3-D grid.',
                style=_PAGE_INTRO),
-        info, data_row, setup_row, env_row, thresholds,
+        html.Details([html.Summary('What this page answers'), info], className='kosma-details'),
+        selection, setup,
         html.Div([
-            html.Button('Compute', id='ai-btn-compute', n_clicks=0, className='btn btn-primary',
-                        style={'marginRight': '12px'}),
-            html.Div(id='ai-status', className='load-status', style={'display': 'inline-block'}),
-        ], style={'padding': '0 4px 12px'}),
+            html.Button('Compute', id='ai-btn-compute', n_clicks=0, className='btn btn-primary'),
+            html.Div(id='ai-status', className='load-status'),
+        ], className='ai-run-bar'),
         html.Div(id='ai-progress-wrap', className='probe-progress', style={'display': 'none'},
                  children=[
             html.Div(className='probe-progress-track', children=[
@@ -9575,13 +10584,16 @@ def _atten_impact_page():
         ]),
         dcc.Store(id='ai-state', data=0),
         dcc.Store(id='ai-render', data=0),
+        dcc.Store(id='ai-render-3d', data=0),
         dcc.Interval(id='ai-progress-interval', interval=400, disabled=True, n_intervals=0),
+        thresholds,
         html.Div(id='ai-notes'),
         dcc.Tabs(id='ai-subtabs', value='ai-breadth', style={'marginTop': '4px'},
                  content_style={'paddingTop': '16px'}, children=[
             sub('1 · Breadth', 'ai-breadth', breadth),
             sub('2 · Magnitude & probe', 'ai-magnitude', magnitude),
             sub('3 · Verdicts', 'ai-verdicts', verdicts),
+            sub('4 · 3-D environments', 'ai-3d', three_d_tab),
             sub('Guide', 'ai-guide', guide),
         ]),
     ]
@@ -9712,9 +10724,9 @@ def _probe_ranking_page():
         html.Div([
             html.Div([
                 html.Label('Quantity', style=_CTRL_LABEL),
-                dcc.RadioItems(id='pr-quantity', options=PROBE_QUANTITY_OPTIONS,
+                _choice(id='pr-quantity', options=PROBE_QUANTITY_OPTIONS,
                                value='rel_abund', **_RADIO),
-            ], style={'flex': '1.2', 'minWidth': '180px', 'marginRight': '18px'}),
+            ], style={'flex': '1.2', 'minWidth': '180px', 'marginRight': '12px'}),
             html.Div([
                 html.Label('Tracers', style=_CTRL_LABEL),
                 dcc.Dropdown(id='pr-tracers', options=[], value=[], multi=True,
@@ -9734,7 +10746,7 @@ def _probe_ranking_page():
             ], style={**_CTRL_BOX, 'minWidth': '130px', 'marginLeft': '12px'}),
             html.Div(id='pr-idef-wrap', children=[
                 html.Label('Intensity units', style=_CTRL_LABEL),
-                dcc.RadioItems(id='pr-idef', options=SIMLINE_MAPFIT_IDEF_OPTIONS,
+                _choice(id='pr-idef', options=SIMLINE_MAPFIT_IDEF_OPTIONS,
                                value=SIMLINE_DEFAULT_IDEF, **_RADIO),
             ], style={**_CTRL_BOX, 'minWidth': '160px', 'display': 'none'}),
         ], className='kosma-panel', style=_PANEL_ROW),
@@ -9798,13 +10810,13 @@ def _probe_ranking_page():
                         ], style={**_CTRL_BOX, 'minWidth': '110px'}),
                         html.Div([
                             html.Label('Show', style=_CTRL_LABEL),
-                            dcc.RadioItems(id='pr-tracer-filter',
+                            _choice(id='pr-tracer-filter',
                                            options=PROBE_FILTER_OPTIONS,
                                            value='both', **_SEG),
                         ], style={**_CTRL_BOX, 'minWidth': '200px'}),
                         html.Div([
                             html.Label('Bar colours', style=_CTRL_LABEL),
-                            dcc.RadioItems(id='pr-color-mode',
+                            _choice(id='pr-color-mode',
                                            options=PROBE_COLOR_OPTIONS,
                                            value='quartile', **_RADIO),
                         ], style={**_CTRL_BOX, 'minWidth': '220px', 'marginRight': '0'}),
@@ -9919,7 +10931,7 @@ def _probe_ranking_page():
                         ], style={'flex': '1.3', 'minWidth': '160px', 'marginRight': '12px'}),
                         html.Div([
                             html.Label('Y scale', style=_CTRL_LABEL),
-                            dcc.RadioItems(id='pr-tr-yscale', options=_SCALE_OPTIONS,
+                            _choice(id='pr-tr-yscale', options=_SCALE_OPTIONS,
                                            value='log', **_SEG),
                         ], style={**_CTRL_BOX, 'minWidth': '140px'}),
                         html.Div([
@@ -9939,6 +10951,58 @@ def _probe_ranking_page():
                               figure=placeholder_fig('Compute a ranking, then pick tracers'),
                               config=_GRAPH_CFG, mathjax=True, style={'height': '480px'}),
                 ]),
+                dcc.Tab(label='CR vs FUV dominance', value='pr-dominance',
+                        style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
+                        children=[
+                    html.P('Complement to the ζ-only probe score (KoSens '
+                           'plot_cr_fuv_dominance_3d): at each density, the local slopes '
+                           'S_ζ = dlog X/dlog ζ and S_χ = dlog X/dlog χ₀ over a ±baseline/2 '
+                           'window give D = |S_ζ|/(|S_ζ|+|S_χ|): 1 = X moves with ζ only '
+                           '(clean CR tracer), 0 = with χ₀ only. Black lines are iso-X '
+                           'contours: horizontal → CR tracer, vertical → FUV tracer. Uses the '
+                           'reference (constant-CR) cube of the last ranking run.',
+                           style=_PAGE_INTRO),
+                    html.Div([
+                        html.Div([
+                            html.Label('Species / lines', style=_CTRL_LABEL),
+                            dcc.Dropdown(id='pr-dom-species', options=[], value=[],
+                                         multi=True, style={'fontSize': '13px'}),
+                        ], style={'flex': '2', 'minWidth': '220px', 'marginRight': '12px'}),
+                        html.Div([
+                            html.Label('Densities n_H (cm⁻³)', style=_CTRL_LABEL),
+                            dcc.Input(id='pr-dom-slices', type='text', value='1e3, 1e5',
+                                      debounce=True, style={'width': '120px'}),
+                        ], style={**_CTRL_BOX, 'minWidth': '130px'}),
+                        html.Div([
+                            html.Label('Baseline (dex)', style=_CTRL_LABEL),
+                            dcc.Input(id='pr-dom-baseline', type='number', value=1.0,
+                                      min=0.05, max=NUM_INPUT_MAX, step=0.1, debounce=True, style={'width': '80px'}),
+                        ], style={**_CTRL_BOX, 'minWidth': '100px'}),
+                        html.Div([
+                            html.Label('Dominance ratio', style=_CTRL_LABEL),
+                            dcc.Input(id='pr-dom-ratio', type='number', value=3.0,
+                                      min=1, max=NUM_INPUT_MAX, step=0.5, debounce=True, style={'width': '80px'}),
+                        ], style={**_CTRL_BOX, 'minWidth': '110px'}),
+                        html.Div([
+                            html.Label('Min abundance', style=_CTRL_LABEL),
+                            dcc.Input(id='pr-dom-minab', type='number',
+                                      value=pr.DEFAULT_MIN_ABUNDANCE, debounce=True,
+                                      style={'width': '90px'}),
+                        ], style={**_CTRL_BOX, 'minWidth': '110px'}),
+                        html.Div([
+                            html.Label('Mesh', style=_CTRL_LABEL),
+                            dcc.Checklist(id='pr-dom-smooth',
+                                          options=[{'label': ' fine mesh', 'value': 'on'}],
+                                          value=[], **_RADIO),
+                        ], style={**_CTRL_BOX, 'minWidth': '120px', 'marginRight': '0'}),
+                    ], className='kosma-panel', style=_PANEL_ROW),
+                    dcc.Loading(type='circle', children=[
+                        dcc.Graph(id='pr-plot-dominance',
+                                  figure=placeholder_fig('Compute a ranking, then pick species'),
+                                  config=_GRAPH_CFG),
+                        html.Div(id='pr-dominance-table', style={'marginTop': '10px'}),
+                    ]),
+                ]),
         ]),
     ]
 
@@ -9957,7 +11021,21 @@ def _slider_block(d):
                    tooltip={'placement': 'top', 'always_visible': False}),
         html.Div(id=f'slabel-{d}',
                  style={'textAlign': 'center', 'color': p['color'],
-                        'fontSize': '12px', 'marginTop': '2px', 'fontWeight': '600'}),
+                        'fontSize': '14px', 'marginTop': '2px', 'fontWeight': '600'}),
+    ])
+
+
+def _net_slider_block(d):
+    """Copy of grid slider ``d`` next to the reaction network (kept in sync)."""
+    p = PARAM_DEFS[d]
+    unit = f'  ({p["unit"]})' if p['unit'] else ''
+    return html.Div(id=f'net-slider-wrap-{d}', style={'display': 'none'}, children=[
+        html.Label(f'{p["name"]}{unit}', style=_CTRL_LABEL),
+        dcc.Slider(id=f'net-slider-{d}', min=0, max=1, step=1, value=0, marks={},
+                   tooltip={'placement': 'top', 'always_visible': False}),
+        html.Div(id=f'net-slabel-{d}',
+                 style={'textAlign': 'center', 'color': p['color'],
+                        'fontSize': '14px', 'marginTop': '2px', 'fontWeight': '600'}),
     ])
 
 
@@ -9972,7 +11050,7 @@ def _shift_control_row(prefix=''):
                 id=scan_id, options=X_SHIFT_DIRECTION_OPTIONS,
                 value=X_SHIFT_SCAN_DIRECTION, clearable=False,
                 className='kosma-dropdown', style={'fontSize': '13px'}),
-        ], style={'flex': '2', 'minWidth': '240px', 'marginRight': '18px'}),
+        ], style={'flex': '2', 'minWidth': '240px', 'marginRight': '12px'}),
         html.Div([
             html.Label('Intensity match tolerance (rtol)', style=_CTRL_LABEL),
             dcc.Input(id=rtol_id, type='number', value=X_SHIFT_MATCH_RTOL,
@@ -10001,7 +11079,7 @@ def _int_contour_overlay_row():
             html.Span('  jtemp only — KoSens-style observational limit',
                       className='kosma-muted',
                       style={'fontSize': '11px', 'marginLeft': '8px'}),
-        ], style={'flex': '1.6', 'minWidth': '280px', 'marginRight': '18px'}),
+        ], style={'flex': '1.6', 'minWidth': '280px', 'marginRight': '12px'}),
         html.Div([
             html.Label('Extra contour levels', style=_CTRL_LABEL),
             dcc.Input(
@@ -10013,7 +11091,7 @@ def _int_contour_overlay_row():
                       className='kosma-muted',
                       style={'fontSize': '11px', 'marginTop': '4px',
                              'display': 'block'}),
-        ], style={'flex': '2', 'minWidth': '260px', 'marginRight': '18px'}),
+        ], style={'flex': '2', 'minWidth': '260px', 'marginRight': '12px'}),
         html.Div([
             html.Label('Extra contour color(s)', style=_CTRL_LABEL),
             dcc.Input(
@@ -10044,7 +11122,7 @@ def _rgb_channel_dropdowns(prefix, placeholder):
                        style={**_CTRL_LABEL, 'fontSize': '11px', 'marginTop': '6px'}),
             dcc.Input(
                 id=f'{prefix}rgb-cf{i}',
-                type='number', value=1, min=0, step='any',
+                type='number', value=1, min=0, max=NUM_INPUT_MAX, step='any',
                 debounce=True,
                 style={**_INPUT_STYLE, 'width': '100%'}),
         ], style={'flex': '1', 'minWidth': '150px',
@@ -10083,15 +11161,19 @@ def _rgb_grid_controls():
             _rgb_channel_dropdowns('grid-', 'Load a grid\u2026')
             + [html.Div([
                 html.Label('Transition contours', style=_CTRL_LABEL),
-                dcc.Checklist(
+                _choice(multi=True, 
                     id='grid-rgb-transitions',
                     options=RGB_GRID_TRANSITION_OPTIONS,
                     value=[],
                     style={'fontSize': '13px'}),
+                html.Label('Extra channels (in the total)',
+                           style={**_CTRL_LABEL, 'marginTop': '8px'}),
+                dcc.Dropdown(id='grid-rgb-extra', options=[], value=[], multi=True,
+                             placeholder='e.g. JCO (grey)', style={'fontSize': '13px'}),
             ], style={'flex': '1.4', 'minWidth': '220px'})],
             className='kosma-panel',
             style={'display': 'flex', 'alignItems': 'flex-start',
-                   'padding': '12px 18px', 'marginBottom': '12px', 'flexWrap': 'wrap'}),
+                   'padding': '10px 14px', 'marginBottom': '10px', 'flexWrap': 'wrap'}),
         html.Div(
             [_rgb_slice_panel(p['id'], prefix='rgb-', plot_id=f'plot-rgb-{p["id"]}')
              for p in SLICE_PLANES],
@@ -10116,7 +11198,7 @@ def _rgb_intensity_controls():
             _rgb_channel_dropdowns('int-', 'Load SIMLINE\u2026')
             + [html.Div([
                 html.Label('Transition contours', style=_CTRL_LABEL),
-                dcc.Checklist(
+                _choice(multi=True, 
                     id='int-rgb-transitions',
                     options=RGB_INT_TRANSITION_OPTIONS,
                     value=[],
@@ -10124,7 +11206,7 @@ def _rgb_intensity_controls():
             ], style={'flex': '1.6', 'minWidth': '260px'})],
             className='kosma-panel',
             style={'display': 'flex', 'alignItems': 'flex-start',
-                   'padding': '12px 18px', 'marginBottom': '12px', 'flexWrap': 'wrap'}),
+                   'padding': '10px 14px', 'marginBottom': '10px', 'flexWrap': 'wrap'}),
         html.Div(
             [_rgb_slice_panel(p['id'], prefix='int-rgb-',
                               plot_id=f'plot-int-rgb-{p["id"]}')
@@ -10160,7 +11242,7 @@ def _spaghetti_controls():
                     options=[], value=[], multi=True,
                     placeholder='Load SIMLINE\u2026 then pick lines to seed the text box',
                     style={'fontSize': '13px'}),
-            ], style={'flex': '1.4', 'minWidth': '240px', 'marginRight': '18px'}),
+            ], style={'flex': '1.4', 'minWidth': '240px', 'marginRight': '12px'}),
             html.Div([
                 html.Label('Observed intensities', style=_CTRL_LABEL),
                 dcc.Textarea(
@@ -10176,10 +11258,10 @@ def _spaghetti_controls():
                     className='kosma-muted',
                     style={'fontSize': '11px', 'marginTop': '4px', 'display': 'block'},
                 ),
-            ], style={'flex': '2', 'minWidth': '280px', 'marginRight': '18px'}),
+            ], style={'flex': '2', 'minWidth': '280px', 'marginRight': '12px'}),
             html.Div([
                 html.Label('Options', style=_CTRL_LABEL),
-                dcc.Checklist(
+                _choice(multi=True, 
                     id='int-spaghetti-options',
                     options=[
                         {'label': '  error bands (±σ)', 'value': 'bands'},
@@ -10191,7 +11273,7 @@ def _spaghetti_controls():
             ], style={'flex': '1', 'minWidth': '180px'}),
         ], className='kosma-panel',
            style={'display': 'flex', 'alignItems': 'flex-start', 'flexWrap': 'wrap',
-                  'padding': '12px 18px', 'marginBottom': '8px'}),
+                  'padding': '10px 14px', 'marginBottom': '8px'}),
         html.Div(id='int-spaghetti-status', style={'padding': '0 18px 8px'}),
         # Spaghetti contour plots
         html.Div(
@@ -10243,7 +11325,7 @@ def _interp_control_row(prefix=''):
                 dcc.Input(id=nx_id, type='number', value=DEFAULT_INTERP_NX,
                           min=2, max=500, step=1, className='kosma-input', style=input_style),
             ]),
-        ], style={'flex': '1.1', 'minWidth': '170px', 'marginRight': '18px'}),
+        ], style={'flex': '1.1', 'minWidth': '170px', 'marginRight': '12px'}),
         html.Div([
             html.Label('X-axis log\u2081\u2080 limit (upper)', style=_CTRL_LABEL),
             dcc.Input(id=xlim_id, type='number', value=None, placeholder='no limit',
@@ -10251,7 +11333,7 @@ def _interp_control_row(prefix=''):
             html.Span('  keep points with log\u2081\u2080(x) < limit',
                       className='kosma-muted',
                       style={'fontSize': '11px', 'marginLeft': '6px'}),
-        ], style={'flex': '1.4', 'minWidth': '220px', 'marginRight': '18px'}),
+        ], style={'flex': '1.4', 'minWidth': '220px', 'marginRight': '12px'}),
         html.Div([
             html.Label('Y-axis log\u2081\u2080 limit (upper)', style=_CTRL_LABEL),
             dcc.Input(id=ylim_id, type='number', value=None, placeholder='no limit',
@@ -10259,13 +11341,13 @@ def _interp_control_row(prefix=''):
             html.Span('  keep points with log\u2081\u2080(y) < limit',
                       className='kosma-muted',
                       style={'fontSize': '11px', 'marginLeft': '6px'}),
-        ], style={'flex': '1.4', 'minWidth': '220px', 'marginRight': '18px'}),
+        ], style={'flex': '1.4', 'minWidth': '220px', 'marginRight': '12px'}),
         html.Div([
             html.Label('Interpolation method', style=_CTRL_LABEL),
             dcc.Dropdown(id=method_id, options=INTERP_METHOD_OPTIONS,
                          value=DEFAULT_INTERP_METHOD, clearable=False,
                          className='kosma-dropdown', style={'fontSize': '13px'}),
-        ], style={'flex': '1', 'minWidth': '130px', 'marginRight': '18px'}),
+        ], style={'flex': '1', 'minWidth': '130px', 'marginRight': '12px'}),
         html.Div([
             html.Label('Clip to bounds', style=_CTRL_LABEL),
             dcc.Checklist(id=clip_id, options=[{'label': ' clip overshoot to [0, max]',
@@ -10286,12 +11368,12 @@ def _interp_error_control_row():
             html.Span('  checkerboard decimation (KoSens default: 2)',
                       className='kosma-muted',
                       style={'fontSize': '11px', 'marginLeft': '8px'}),
-        ], style={'flex': '1.3', 'minWidth': '220px', 'marginRight': '18px'}),
+        ], style={'flex': '1.3', 'minWidth': '220px', 'marginRight': '12px'}),
         html.Div([
             html.Label('Error metric', style=_CTRL_LABEL),
-            dcc.RadioItems(id='ie-error-metric', options=ERROR_METRIC_OPTIONS,
+            _choice(id='ie-error-metric', options=ERROR_METRIC_OPTIONS,
                            value=ERROR_METRIC_OPTIONS[0]['value'], **_SEG),
-        ], style={'flex': '1.2', 'minWidth': '200px', 'marginRight': '18px'}),
+        ], style={'flex': '1.2', 'minWidth': '200px', 'marginRight': '12px'}),
         html.Div([
             html.Label('Relative threshold', style=_CTRL_LABEL),
             dcc.Input(id='ie-rel-threshold', type='number',
@@ -10300,12 +11382,12 @@ def _interp_error_control_row():
             html.Span('  mask relative error below this fraction of max',
                       className='kosma-muted',
                       style={'fontSize': '11px', 'marginLeft': '8px'}),
-        ], style={'flex': '1.5', 'minWidth': '260px', 'marginRight': '18px'}),
+        ], style={'flex': '1.5', 'minWidth': '260px', 'marginRight': '12px'}),
         html.Div([
             html.Label('Flux / abundance scale', style=_CTRL_LABEL),
-            dcc.RadioItems(id='ie-flux-scale', options=_SCALE_OPTIONS,
+            _choice(id='ie-flux-scale', options=_SCALE_OPTIONS,
                            value='log', **_SEG),
-        ], style={**_CTRL_BOX, 'marginRight': '18px'}),
+        ], style={**_CTRL_BOX, 'marginRight': '12px'}),
         html.Div([
             html.Label('Contour lines', style=_CTRL_LABEL),
             dcc.Checklist(id='ie-plot-contours',
@@ -10406,7 +11488,7 @@ def _ie_plane_section(slot_id):
     ], style={'padding': '0 4px 8px', 'maxWidth': f'{COMPACT_FIG_WIDTH}px'})
     return html.Div([
         html.H4(id=f'ie-plane-title-{slot_id}', style={'fontSize': '14px', 'margin': '8px 0 4px',
-                                                        'color': '#333', 'fontWeight': '600'}),
+                                                        'color': 'var(--text)', 'fontWeight': '600'}),
         slider_block,
         html.Div(id=f'ie-abund-wrap-{slot_id}', children=[
             dcc.Graph(id=f'plot-ie-abund-{slot_id}', figure=placeholder_fig(),
@@ -10419,15 +11501,172 @@ def _ie_plane_section(slot_id):
                       style={'width': '100%', 'height': 'auto'}),
         ]),
     ], style={'marginBottom': '20px', 'paddingBottom': '12px',
-              'borderBottom': '1px solid #eee'})
+              'borderBottom': '1px solid var(--border)'})
+
+
+# --- Grids -> 3D fronts -------------------------------------------------------
+
+_G3D_AXES = ('density', 'fuv', 'crir')
+
+
+def _grid_3d_layout():
+    level_inputs = [
+        html.Div([
+            html.Label(f'{f["label"]}: {f["rule"]} =',
+                       style={**_CTRL_LABEL, 'color': f['colour']}),
+            dcc.Input(id=f'g3d-level-{f["key"]}', type='number', value=f['default_level'],
+                      min=0, max=1, step=0.01, debounce=True, style={'width': '90px'}),
+        ], style={**_CTRL_BOX, 'minWidth': '150px'})
+        for f in tf.FRONTS
+    ]
+    return [
+        html.P('Photochemical fronts and media over the model grid: H/H\u2082 where '
+               'x(H\u2082) = 0.25, C\u207a/C where x(C\u207a)/x_C = 1/e, and C/CO where CO '
+               'holds half the carbon (x_C = C\u207a + C + CO). The media lie between the '
+               'fronts: ionized (C\u207a), atomic (C) and molecular (CO). '
+               '"Front depth" draws, for every model of a parameter plane, the A_V at which '
+               'each front sits; a hole means the clump is too thin to reach it. '
+               '"Media map" colours a parameter plane by each clump\u2019s dominant medium, '
+               'and "Parameter regimes" does the same over the whole n_H \u00d7 \u03c7 '
+               '\u00d7 \u03b6 cube (column densities; filled points = molecular hydrogen, '
+               'hollow = atomic). "Interpolate grid" resamples linearly in log parameter '
+               'space; model points always show the real simulations. Mass, metallicity and '
+               'attenuation follow the sliders above.',
+               style=_PAGE_INTRO),
+        html.Div([
+            html.Div([
+                html.Label('View', style=_CTRL_LABEL),
+                _choice(id='g3d-mode',
+                               options=[{'label': ' front depth', 'value': 'depth'},
+                                        {'label': ' media map', 'value': 'media'},
+                                        {'label': ' parameter regimes', 'value': 'regime'}],
+                               value='depth', **_RADIO),
+            ], style={**_CTRL_BOX, 'minWidth': '160px'}),
+            html.Div([
+                html.Label('Render', style=_CTRL_LABEL),
+                _choice(id='g3d-style',
+                               options=[{'label': ' filled (contours / volumes)',
+                                         'value': 'filled'},
+                                        {'label': ' model points', 'value': 'points'}],
+                               value='filled', **_RADIO),
+                dcc.Checklist(id='g3d-interp',
+                              options=[{'label': ' interpolate grid', 'value': 'on'}],
+                              value=[], **_RADIO),
+                html.Div([
+                    html.Span('points per axis ', className='kosma-muted',
+                              style={'fontSize': '12px'}),
+                    dcc.Input(id='g3d-interp-n', type='number', value=30, min=10, max=80,
+                              step=5, debounce=True, style={'width': '80px'}),
+                ], style={'marginTop': '4px'}),
+            ], style={**_CTRL_BOX, 'minWidth': '210px'}),
+            html.Div([
+                html.Label('Fronts', style=_CTRL_LABEL),
+                dcc.Checklist(id='g3d-fronts',
+                              options=[{'label': ' ' + f['label'], 'value': f['key']}
+                                       for f in tf.FRONTS],
+                              value=[f['key'] for f in tf.FRONTS], **_RADIO),
+                dcc.Checklist(id='g3d-centre',
+                              options=[{'label': ' show clump centre', 'value': 'on'}],
+                              value=['on'], **_RADIO),
+            ], style={**_CTRL_BOX, 'minWidth': '190px'}),
+            *level_inputs,
+        ], className='kosma-panel',
+           style={'display': 'flex', 'alignItems': 'flex-start', 'flexWrap': 'wrap',
+                  'padding': '10px 14px', 'marginBottom': '10px'}),
+        html.Div(id='g3d-slice-wrap', className='kosma-panel',
+                 style={'display': 'flex', 'alignItems': 'flex-start', 'flexWrap': 'wrap',
+                        'padding': '10px 14px', 'marginBottom': '10px'}, children=[
+            html.Div([
+                html.Label('Slice parameter (held fixed)', style=_CTRL_LABEL),
+                dcc.Dropdown(id='g3d-slice-key',
+                             options=[{'label': _param_def(k)['name'], 'value': k}
+                                      for k in _G3D_AXES],
+                             value='crir', clearable=False, style={'fontSize': '13px'}),
+            ], style={**_CTRL_BOX, 'minWidth': '200px', 'maxWidth': '260px'}),
+            html.Div([
+                html.Label(id='g3d-slice-label', style=_CTRL_LABEL),
+                dcc.Slider(id='g3d-slice', min=0, max=1, step=1, value=0, marks={}),
+            ], style={'flex': '3', 'minWidth': '320px'}),
+        ]),
+        dcc.Loading(id='loading-g3d', type='circle', children=[
+            dcc.Graph(id='g3d-fig', config=_GRAPH_CFG, style={'height': '700px'}),
+        ]),
+    ]
+
+
+def _g3d_axis(key):
+    """Plot coordinates (log10) and label for one 3-D axis."""
+    pdef = _param_def(key)
+    toks = list(_grid['axis_tokens'][key])
+    phys = np.array([_physical_param_value(key, t) for t in toks], dtype=float)
+    coords = _axis_plot_coords(phys, pdef)
+    order = np.argsort(coords)
+    return [toks[i] for i in order], coords[order], _axis_label_contour(pdef)
+
+
+def _g3d_front_depths(slice_key, slice_idx, slider_values, fronts, levels, want_centre):
+    """Mode A data: A_V of each front over the two free axes at a fixed slice."""
+    xk, yk = [k for k in _G3D_AXES if k != slice_key]
+    xt, x, xl = _g3d_axis(xk)
+    yt, y, yl = _g3d_axis(yk)
+    stoks = list(_grid['axis_tokens'][slice_key])
+    s_tok = stoks[min(max(int(slice_idx or 0), 0), len(stoks) - 1)]
+    base = _token_list_from_sliders(slider_values)
+    base[_PARAM_IDX[slice_key]] = s_tok
+    depth = {k: np.full((len(y), len(x)), np.nan) for k in fronts}
+    centre = np.full((len(y), len(x)), np.nan)
+    for ix, xtok in enumerate(xt):
+        for iy, ytok in enumerate(yt):
+            toks = list(base)
+            toks[_PARAM_IDX[xk]] = xtok
+            toks[_PARAM_IDX[yk]] = ytok
+            path = _grid['files'].get(tuple(toks))
+            if not path:
+                continue
+            model = get_model(path)
+            av = np.asarray(model['av'], dtype=float)
+            if av.size:
+                centre[iy, ix] = np.nanmax(av)
+            fr = tf.front_fractions(model['rel'], _grid['species_idx'])
+            for k in fronts:
+                if k in fr:
+                    depth[k][iy, ix] = tf.front_depth(av, fr[k], levels[k],
+                                                   tf.FRONT_BY_KEY[k]['rising'])
+    sdef = _param_def(slice_key)
+    s_disp = _param_token_disp(sdef, s_tok)
+    s_unit = f' {sdef["unit"]}' if sdef['unit'] else ''
+    return (x, y, depth, centre if want_centre else None,
+            (xl, yl, 'A<sub>V</sub> (mag)'), f'{sdef["name"]} = {s_disp}{s_unit}')
+
+
+def _g3d_regime_cube(slider_values, fronts):
+    """Mode B data: column-integrated front fractions over the full n x chi x zeta cube."""
+    axes = [_g3d_axis(k) for k in _G3D_AXES]
+    base = _token_list_from_sliders(slider_values)
+    shape = tuple(len(a[1]) for a in axes)
+    cube = {k: np.full(shape, np.nan) for k in fronts}
+    for ijk in np.ndindex(shape):
+        toks = list(base)
+        for key, (atoks, _, _), i in zip(_G3D_AXES, axes, ijk):
+            toks[_PARAM_IDX[key]] = atoks[i]
+        path = _grid['files'].get(tuple(toks))
+        if not path:
+            continue
+        cols = {sp: get_grid_scalar(path, f'cdens:{sp}') for sp in tf.FRONT_SPECIES}
+        fr = tf.column_fractions(cols)
+        for k in fronts:
+            if k in fr:
+                cube[k][ijk] = fr[k]
+    return [a[1] for a in axes], cube, tuple(a[2] for a in axes)
 
 
 app.layout = html.Div(
     id='app-root',
-    className='theme-light',
+    className=f'theme-{DEFAULT_PLOT_THEME}',
     style={'fontFamily': UI_FONT, 'maxWidth': APP_MAX_WIDTH,
-           'margin': '0 auto', 'padding': '12px 24px 28px', 'backgroundColor': '#F2F5FA',
-           'color': '#22314A', 'minHeight': '100vh'},
+           'margin': '0 auto', 'padding': '12px 24px 28px',
+           'backgroundColor': PLOT_THEMES[DEFAULT_PLOT_THEME]['page_bg'],
+           'color': PLOT_THEMES[DEFAULT_PLOT_THEME]['font'], 'minHeight': '100vh'},
     children=[
 
     # Header + compact theme toggle
@@ -10461,6 +11700,7 @@ app.layout = html.Div(
                 id='plot-theme',
                 options=PLOT_THEME_OPTIONS,
                 value=DEFAULT_PLOT_THEME,
+                persistence=True, persistence_type='local',
                 className='theme-seg',
                 inputClassName='theme-seg-input',
                 labelClassName='theme-seg-btn',
@@ -10485,22 +11725,22 @@ app.layout = html.Div(
                 dcc.Dropdown(id='grid-colorscale', options=GRID_COLORMAP_OPTIONS,
                              value=DEFAULT_GRID_COLORMAP, clearable=False,
                              className='kosma-dropdown', style={'fontSize': '13px'}),
-            ], style={'flex': '1.2', 'minWidth': '140px', 'marginRight': '18px'}),
+            ], style={'flex': '1.2', 'minWidth': '140px', 'marginRight': '12px'}),
             html.Div([
                 html.Label('X-axis', style=_CTRL_LABEL),
-                dcc.RadioItems(id='xvar-choice', options=_XVAR_OPTIONS, value='Av', **_SEG),
+                _choice(id='xvar-choice', options=_XVAR_OPTIONS, value='Av', **_SEG),
             ], style=_CTRL_BOX),
             html.Div([
                 html.Label('X scale', style=_CTRL_LABEL),
-                dcc.RadioItems(id='xscale', options=_SCALE_OPTIONS, value='log', **_SEG),
+                _choice(id='xscale', options=_SCALE_OPTIONS, value='log', **_SEG),
             ], style=_CTRL_BOX),
             html.Div([
                 html.Label('Y scale', style=_CTRL_LABEL),
-                dcc.RadioItems(id='yscale', options=_SCALE_OPTIONS, value='log', **_SEG),
+                _choice(id='yscale', options=_SCALE_OPTIONS, value='log', **_SEG),
             ], style=_CTRL_BOX),
             html.Div([
                 html.Label('X-axis min', style=_CTRL_LABEL),
-                dcc.Input(id='x-min', type='number', value=None, min=0, debounce=True,
+                dcc.Input(id='x-min', type='number', value=None, min=0, max=NUM_INPUT_MAX, debounce=True,
                           placeholder=f'full HDF5 (e.g. {AV_FLOOR:g})',
                           style={'width': '100%', 'fontSize': '13px'}),
             ], style={**_CTRL_BOX, 'marginRight': '0'}),
@@ -10520,7 +11760,9 @@ app.layout = html.Div(
         value='load',
         className='prisma-tabs',
         style={'marginTop': '0'},
-        colors={'border': '#DDE4EE', 'primary': '#1560CE', 'background': '#ffffff'},
+        colors={'border': PLOT_THEMES[DEFAULT_PLOT_THEME]['tab_border'],
+                'primary': PLOT_THEMES[DEFAULT_PLOT_THEME]['accent'],
+                'background': PLOT_THEMES[DEFAULT_PLOT_THEME]['tab_bg']},
         children=[
 
         # --- Page 1: grid loaders -------------------------------------------
@@ -10834,28 +12076,34 @@ app.layout = html.Div(
                                              multi=True,
                                              placeholder='Load a grid\u2026 then pick densities',
                                              style={'fontSize': '13px'}),
-                            ], style={'flex': '2', 'minWidth': '240px', 'marginRight': '18px'}),
+                            ], style={'flex': '2', 'minWidth': '240px', 'marginRight': '12px'}),
                             html.Div([
                                 html.Label('Stack threshold', style=_CTRL_LABEL),
                                 dcc.Slider(id='therm-crir-threshold', min=0.0, max=0.3,
                                            step=0.01, value=0.01,
                                            marks={0: '0', 0.1: '0.1', 0.2: '0.2', 0.3: '0.3'},
                                            tooltip={'placement': 'bottom'}),
-                            ], style={'flex': '1', 'minWidth': '180px', 'marginRight': '18px'}),
+                            ], style={'flex': '1', 'minWidth': '180px', 'marginRight': '12px'}),
                         ], className='kosma-panel',
                            style={'display': 'flex', 'alignItems': 'flex-start',
-                                  'flexWrap': 'wrap', 'padding': '12px 18px',
+                                  'flexWrap': 'wrap', 'padding': '10px 14px',
                                   'marginBottom': '12px'}),
-                        html.Div([
+                        _advanced_details('Channel filtering', html.Div([
                             html.Div([
                                 html.Label('Min rate floor [erg s\u207B\u00B9]', style=_CTRL_LABEL),
-                                dcc.Input(id='therm-minrate', type='number', value=1e23,
+                                dcc.Input(id='therm-minrate', type='number', value=0,
                                           debounce=True, style={'width': '140px'}),
                             ], style={**_CTRL_BOX, 'minWidth': '160px'}),
                             html.Div([
+                                html.Label('Top N channels (0 = all)', style=_CTRL_LABEL),
+                                dcc.Input(id='therm-topn', type='number', value=0,
+                                          min=0, max=NUM_INPUT_MAX, step=1, debounce=True,
+                                          style={'width': '90px'}),
+                            ], style={**_CTRL_BOX, 'minWidth': '140px'}),
+                            html.Div([
                                 html.Label('Min points / channel', style=_CTRL_LABEL),
                                 dcc.Input(id='therm-minpoints', type='number', value=2,
-                                          min=1, step=1, debounce=True,
+                                          min=1, max=NUM_INPUT_MAX, step=1, debounce=True,
                                           style={'width': '90px'}),
                             ], style={**_CTRL_BOX, 'minWidth': '120px'}),
                             html.Div([
@@ -10866,16 +12114,270 @@ app.layout = html.Div(
                             ], style={**_CTRL_BOX, 'minWidth': '120px'}),
                         ], className='kosma-panel',
                            style={'display': 'flex', 'alignItems': 'flex-start',
-                                  'flexWrap': 'wrap', 'padding': '12px 18px',
-                                  'marginBottom': '12px'}),
+                                  'flexWrap': 'wrap', 'padding': '10px 14px',
+                                  'marginBottom': '12px'})),
                         dcc.Loading(id='loading-thermal-crir', type='circle', children=[
                             dcc.Graph(id='plot-heat-contrib-crir', figure=placeholder_fig(),
                                       config=_GRAPH_CFG, style={'marginBottom': '12px'}),
                             dcc.Graph(id='plot-abs-heatcool-crir', figure=placeholder_fig(),
+                                      config=_GRAPH_CFG, style={'marginBottom': '12px'}),
+                            html.P('Share bars (KoSens plot_heating_cooling_share_bars): each '
+                                   'channel\'s % of the total heating / cooling, same channels '
+                                   'as above. With an HDF5 overlay loaded, the attenuated grid '
+                                   'stands hatched next to the main grid at every ζ.',
+                                   style=_PAGE_INTRO),
+                            dcc.Graph(id='plot-heatcool-share', figure=placeholder_fig(),
+                                      config=_GRAPH_CFG),
+                        ]),
+                        html.H4('Rate-regime map (KoSens plot_rate_regime_boundary)',
+                                style={'fontSize': '14px', 'margin': '18px 0 6px'}),
+                        html.P('One cell per model: which of two channels dominates the '
+                               'grid-integrated rate. With the attenuated grid loaded as HDF5 '
+                               'overlay, cells whose dominant channel flips are orange '
+                               '(channel 2 \u2192 channel 1 when \u03B6 is attenuated) or '
+                               'magenta (the reverse). Limits are log\u2081\u2080 “min, max”, '
+                               'widened to whole cells. Other parameters stay at the sliders.',
+                               style=_PAGE_INTRO),
+                        html.Div([
+                            html.Div([
+                                html.Label('Rates', style=_CTRL_LABEL),
+                                _choice(id='therm-regime-kind', value='heat', options=[
+                                    {'label': ' heating', 'value': 'heat'},
+                                    {'label': ' cooling', 'value': 'cool'}], **_RADIO),
+                            ], style={**_CTRL_BOX, 'minWidth': '100px'}),
+                            html.Div([
+                                html.Label('Channel 1', style=_CTRL_LABEL),
+                                dcc.Dropdown(id='therm-regime-ch1', options=[], value=None,
+                                             clearable=False, style={'fontSize': '13px'}),
+                            ], style={**_CTRL_BOX, 'minWidth': '190px'}),
+                            html.Div([
+                                html.Label('Channel 2', style=_CTRL_LABEL),
+                                dcc.Dropdown(id='therm-regime-ch2', options=[], value=None,
+                                             clearable=False, style={'fontSize': '13px'}),
+                            ], style={**_CTRL_BOX, 'minWidth': '190px'}),
+                            html.Div([
+                                html.Label('y axis', style=_CTRL_LABEL),
+                                _choice(id='therm-regime-y', value='density', options=[
+                                    {'label': ' n', 'value': 'density'},
+                                    {'label': ' \u03C7 (FUV)', 'value': 'fuv'}], **_RADIO),
+                            ], style={**_CTRL_BOX, 'minWidth': '90px'}),
+                            html.Div([
+                                html.Label('\u03B6 limits', style=_CTRL_LABEL),
+                                dcc.Input(id='therm-regime-xlim', type='text', value='',
+                                          placeholder='-17, -13', debounce=True,
+                                          style={'width': '110px'}),
+                            ], style={**_CTRL_BOX, 'minWidth': '120px'}),
+                            html.Div([
+                                html.Label('y limits', style=_CTRL_LABEL),
+                                dcc.Input(id='therm-regime-ylim', type='text', value='',
+                                          placeholder='0, 4', debounce=True,
+                                          style={'width': '110px'}),
+                            ], style={**_CTRL_BOX, 'minWidth': '120px', 'marginRight': '0'}),
+                        ], className='kosma-panel',
+                           style={'display': 'flex', 'alignItems': 'flex-start',
+                                  'flexWrap': 'wrap', 'padding': '10px 14px',
+                                  'marginBottom': '12px'}),
+                        dcc.Loading(type='circle', children=[
+                            dcc.Graph(id='plot-rate-regime', figure=placeholder_fig(),
                                       config=_GRAPH_CFG),
                         ]),
                     ]),
                 ]),
+            ]),
+        ]),
+
+        # --- Page 5: chemistry ----------------------------------------------
+        dcc.Tab(label='Chemistry', value='chemistry', style=_TAB_STYLE, selected_style=_TAB_SEL,
+                children=[
+            html.Div(style={'paddingTop': '10px'}, children=[
+                html.P('Top formation and destruction reactions for a selected species '
+                       '(load a chemistry grid on the Load tab — standalone or with an HDF5 '
+                       'structure grid; an optional overlay chemistry grid adds dashed '
+                       'comparison curves). In chemistry-only mode the sliders index the '
+                       'chemistry filenames; load an HDF5 grid for depth profiles and '
+                       'abundance colormaps. Choose how reactions '
+                       'are ranked: fractional contribution to the total rate, or '
+                       'rate per X particle (KoSens ``top_reactions_plot`` metrics). '
+                       'Below, separate formation and destruction networks show all '
+                       'partners in those same top-N reactions (reactants left, products right). '
+                       'Switch the network to Dominant to keep only the top reactions (by rate '
+                       'contribution) of every species on the path, and tick cosmic-ray paths '
+                       'only to see the routes started or ended by cosmic rays (CRP / CRPHOT / '
+                       'CR-DES) or by the cosmic-ray ions H⁺, H₂⁺, H₃⁺, He⁺. '
+                       'Dotted arrows are steps driven by those ions; in Dominant mode arrow '
+                       'width follows each reaction\'s % contribution.',
+                       style=_PAGE_INTRO),
+                html.Div([
+                    html.Div([
+                        html.Label('Reaction species', style=_CTRL_LABEL),
+                        dcc.Dropdown(id='react-species', options=[], value=None,
+                                     placeholder='Load a chemistry grid\u2026',
+                                     style={'fontSize': '13px'}),
+                    ], style={'flex': '2', 'minWidth': '200px', 'marginRight': '12px'}),
+                    html.Div([
+                        html.Label('Top reactions / depth point', style=_CTRL_LABEL),
+                        dcc.Input(id='react-n', type='number', value=CHEM_DEFAULT_NREAC,
+                                  min=1, max=50, step=1,
+                                  style={'width': '90px', 'padding': '7px 9px', 'fontSize': '13px',
+                                         'border': '1px solid var(--border)', 'borderRadius': '6px'}),
+                    ], style={'flex': '1', 'minWidth': '150px', 'marginRight': '12px'}),
+                    html.Div([
+                        html.Label('Ranking metric', style=_CTRL_LABEL),
+                        _choice(id='react-ranking', options=REACT_RANKING_OPTIONS,
+                                       value=DEFAULT_REACT_RANKING, **_RADIO),
+                    ], style={**_CTRL_BOX, 'marginRight': '0'}),
+                ], className='kosma-panel',
+                style={'display': 'flex', 'alignItems': 'flex-start',
+                       'padding': '10px 14px'}),
+                dcc.Loading(id='loading-chemistry', type='circle', children=[
+                    html.Div([
+                        html.Div([
+                            dcc.Graph(id='plot-react-formation', figure=placeholder_fig(), config=_GRAPH_CFG,
+                                      style={'width': '100%'}),
+                            html.Div(id='react-contrib-formation'),
+                        ], style={'flex': '1', 'minWidth': '0'}),
+                        html.Div([
+                            dcc.Graph(id='plot-react-destruction', figure=placeholder_fig(), config=_GRAPH_CFG,
+                                      style={'width': '100%'}),
+                            html.Div(id='react-contrib-destruction'),
+                        ], style={'flex': '1', 'minWidth': '0'}),
+                    ], style={'display': 'flex', 'gap': '12px', 'marginTop': '12px',
+                              'alignItems': 'flex-start'}),
+                ]),
+                html.H4('Reaction pathway network',
+                        style={'fontSize': '14px', 'margin': '22px 0 6px', 'fontWeight': '600'}),
+                html.Div(id='react-network-status', style={**_PAGE_INTRO, 'marginBottom': '8px'}),
+                dcc.Store(id='react-net-highlight', data=None),
+                dcc.Store(id='react-net-hidden', data=[]),
+                html.Div([_net_slider_block(d) for d in range(N_PARAMS)],
+                         className='kosma-panel',
+                         style={'display': 'flex', 'flexWrap': 'wrap',
+                                'alignItems': 'flex-start', 'padding': '12px 16px',
+                                'marginBottom': '8px'}),
+                html.Div([
+                    html.Div([
+                        html.Label('Upstream depth', style=_CTRL_LABEL),
+                        dcc.Input(id='react-chain-upstream', type='number',
+                                  min=0, max=6, step=1,
+                                  value=chem_network.DEFAULT_CHAIN_UPSTREAM,
+                                  style={'width': '90px', 'padding': '7px 9px', 'fontSize': '13px',
+                                         'border': '1px solid var(--border)', 'borderRadius': '6px'}),
+                    ], style={'marginRight': '12px'}),
+                    html.Div([
+                        html.Label('Downstream depth', style=_CTRL_LABEL),
+                        dcc.Input(id='react-chain-downstream', type='number',
+                                  min=0, max=6, step=1,
+                                  value=chem_network.DEFAULT_CHAIN_DOWNSTREAM,
+                                  style={'width': '90px', 'padding': '7px 9px', 'fontSize': '13px',
+                                         'border': '1px solid var(--border)', 'borderRadius': '6px'}),
+                    ], style={'marginRight': '12px'}),
+                    html.Div([
+                        html.Label('Max nodes', style=_CTRL_LABEL,
+                                   title='Node cap of the network (empty = automatic, grows with depth)'),
+                        dcc.Input(id='react-chain-maxnodes', type='number',
+                                  min=5, max=300, step=1, value=None, placeholder='auto',
+                                  debounce=True,
+                                  style={'width': '90px', 'padding': '7px 9px', 'fontSize': '13px',
+                                         'border': '1px solid var(--border)', 'borderRadius': '6px'}),
+                    ], style={'marginRight': '12px'}),
+                    html.Div([
+                        html.Label('Branches / species', style=_CTRL_LABEL,
+                                   title='Formation / destruction channels followed per '
+                                         'neighbouring species'),
+                        dcc.Input(id='react-chain-branches', type='number',
+                                  min=1, max=50, step=1,
+                                  value=chem_network.CHAIN_BRANCH_LIMIT, debounce=True,
+                                  style={'width': '90px', 'padding': '7px 9px', 'fontSize': '13px',
+                                         'border': '1px solid var(--border)', 'borderRadius': '6px'}),
+                    ], style={'marginRight': '12px'}),
+                    html.Div([
+                        html.Label('Species text', style=_CTRL_LABEL,
+                                   title='Font size of species names in the boxes (pt)'),
+                        dcc.Input(id='react-species-label-size', type='number',
+                                  min=8, max=40, step=1,
+                                  value=chem_network.DEFAULT_SPECIES_LABEL_SIZE,
+                                  style={'width': '90px', 'padding': '7px 9px', 'fontSize': '13px',
+                                         'border': '1px solid var(--border)', 'borderRadius': '6px'}),
+                    ], style={'marginRight': '12px'}),
+                    html.Div([
+                        html.Label('Partner text', style=_CTRL_LABEL,
+                                   title='Font size of reaction partners on the arrows (pt)'),
+                        dcc.Input(id='react-partner-label-size', type='number',
+                                  min=8, max=40, step=1,
+                                  value=chem_network.DEFAULT_PARTNER_LABEL_SIZE,
+                                  style={'width': '90px', 'padding': '7px 9px', 'fontSize': '13px',
+                                         'border': '1px solid var(--border)', 'borderRadius': '6px'}),
+                    ], style={'marginRight': '22px'}),
+                    html.Div([
+                        html.Label('Network', style=_CTRL_LABEL,
+                                   title='Dominant: every species keeps only its top '
+                                         'reactions by rate contribution'),
+                        _choice(id='react-net-mode',
+                                       options=[{'label': ' Full', 'value': 'full'},
+                                                {'label': ' Dominant', 'value': 'dominant'}],
+                                       value='full', style={'minWidth': '120px'}, **_RADIO),
+                    ], style={'marginRight': '12px'}),
+                    html.Div([
+                        html.Label('Reactions / species', style=_CTRL_LABEL,
+                                   title='Top formation / destruction reactions kept per '
+                                         'species in Dominant mode'),
+                        dcc.Input(id='react-dom-k', type='number',
+                                  min=1, max=10, step=1, value=3,
+                                  style={'width': '90px', 'padding': '7px 9px', 'fontSize': '13px',
+                                         'border': '1px solid var(--border)', 'borderRadius': '6px'}),
+                    ], style={'marginRight': '12px'}),
+                    html.Div([
+                        html.Label(' ', style=_CTRL_LABEL),
+                        dcc.Checklist(
+                            id='react-net-cr',
+                            options=[{'label': ' cosmic-ray paths only', 'value': 'cr'}],
+                            value=[],
+                            style={'fontSize': '13px', 'whiteSpace': 'nowrap'}),
+                    ], title='Keep only routes that contain a '
+                             'cosmic-ray reaction (CRP / CRPHOT / CR-DES) or a '
+                             'cosmic-ray ion reactant (H+, H2+, H3+, He+)',
+                       style={'marginRight': '22px', 'alignSelf': 'flex-end'}),
+                    html.Div([
+                        html.Label('Include', style=_CTRL_LABEL),
+                        dcc.Checklist(
+                            id='react-chain-isotopes',
+                            options=[{'label': ' isotopes', 'value': 'iso'}],
+                            value=[],
+                            style={'fontSize': '13px', 'whiteSpace': 'nowrap'}),
+                    ], style={'marginRight': '16px', 'alignSelf': 'flex-end'}),
+                    html.Div([
+                        html.Label('\u00a0', style=_CTRL_LABEL),
+                        dcc.Checklist(
+                            id='react-chain-ice',
+                            options=[{'label': ' ice / grain', 'value': 'ice'}],
+                            value=[],
+                            style={'fontSize': '13px', 'whiteSpace': 'nowrap'}),
+                    ], style={'marginRight': '12px', 'alignSelf': 'flex-end'}),
+                    html.Div([
+                        html.Label('\u00a0', style=_CTRL_LABEL),
+                        html.Button('Hide selected', id='btn-react-net-hide', n_clicks=0,
+                                    title='Click a species box, then hide it from the figure',
+                                    className='btn btn-ghost btn-sm',
+                                    style={'marginRight': '8px'}),
+                        html.Button('Show all', id='btn-react-net-show-all', n_clicks=0,
+                                    title='Restore every hidden species',
+                                    className='btn btn-ghost btn-sm',
+                                    style={'marginRight': '8px'}),
+                        html.Button('Clear highlight', id='btn-react-net-clear', n_clicks=0,
+                                    className='btn btn-ghost btn-sm'),
+                    ], style={'alignSelf': 'flex-end'}),
+                ], style={'display': 'flex', 'alignItems': 'flex-end',
+                          'flexWrap': 'wrap', 'marginBottom': '8px'}),
+                html.Div(id='react-net-hidden-bar', style={'marginBottom': '10px'}),
+                dcc.Graph(
+                    id='plot-react-network',
+                    figure=placeholder_fig(),
+                    config={**_GRAPH_CFG, 'responsive': True},
+                    style={'width': '100%', 'maxWidth': '100%',
+                           'height': '1020px', 'maxHeight': '1020px',
+                           'minHeight': '720px', 'marginBottom': '16px',
+                           'overflow': 'hidden'},
+                ),
             ]),
         ]),
 
@@ -10906,7 +12408,7 @@ app.layout = html.Div(
                                     className='btn btn-primary btn-sm', style=_ALL_BTN_STYLE),
                         html.Div([
                             html.Label('Contour Z scale', style=_CTRL_LABEL),
-                            dcc.RadioItems(id='contour-zscale', options=_SCALE_OPTIONS,
+                            _choice(id='contour-zscale', options=_SCALE_OPTIONS,
                                            value='log', **_SEG),
                         ], style={**_CTRL_BOX, 'marginLeft': '18px', 'marginRight': '0'}),
                     ], style={'display': 'flex', 'alignItems': 'flex-start',
@@ -10926,7 +12428,7 @@ app.layout = html.Div(
                     ], style={'display': 'flex', 'alignItems': 'flex-start',
                               'flexWrap': 'wrap', 'width': '100%'}),
                 ], className='kosma-panel',
-                style={'padding': '12px 18px', 'marginBottom': '12px'}),
+                style={'padding': '10px 14px', 'marginBottom': '10px'}),
                 _advanced_details('Interpolation & resampling', _interp_control_row(prefix='')),
                 _advanced_details('Attenuation x-shift matching', _shift_control_row(prefix='')),
                 dcc.Tabs(id='grid-subtabs', value='grid-maps',
@@ -10965,7 +12467,7 @@ app.layout = html.Div(
                         ], className='kosma-panel',
                            style={'display': 'flex', 'alignItems': 'flex-start',
                                   'flexWrap': 'wrap',
-                                  'padding': '12px 18px', 'marginBottom': '12px'}),
+                                  'padding': '10px 14px', 'marginBottom': '10px'}),
                         html.Div(id='grid-ratio-hint', className='kosma-muted',
                                  style={'marginBottom': '8px'}),
                         dcc.Loading(id='loading-grid-ratios', type='circle', children=[
@@ -10989,10 +12491,10 @@ app.layout = html.Div(
                                              multi=True,
                                              placeholder='Load a grid\u2026 then pick species',
                                              style={'fontSize': '13px'}),
-                            ], style={'flex': '2', 'minWidth': '240px', 'marginRight': '18px'}),
+                            ], style={'flex': '2', 'minWidth': '240px', 'marginRight': '12px'}),
                             html.Div([
                                 html.Label('Abundance', style=_CTRL_LABEL),
-                                dcc.RadioItems(id='apdf-dens-choice',
+                                _choice(id='apdf-dens-choice',
                                                options=[{'label': 'relative n/n_H', 'value': 'rel'},
                                                         {'label': 'number n', 'value': 'number'},
                                                         {'label': 'column N', 'value': 'column'}],
@@ -11018,192 +12520,17 @@ app.layout = html.Div(
                             ], style={**_CTRL_BOX, 'minWidth': '150px'}),
                         ], className='kosma-panel',
                            style={'display': 'flex', 'alignItems': 'flex-start',
-                                  'flexWrap': 'wrap', 'padding': '12px 18px',
+                                  'flexWrap': 'wrap', 'padding': '10px 14px',
                                   'marginBottom': '12px'}),
                         dcc.Loading(id='loading-apdf', type='circle', children=[
                             html.Div(id='apdf-rows'),
                         ]),
                     ]),
+                    dcc.Tab(label='3D fronts', value='grid-3d',
+                            style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
+                            children=_grid_3d_layout()),
                 ]),
             ]),
-        ]),
-
-        # --- Page 5: chemistry ----------------------------------------------
-        dcc.Tab(label='Chemistry', value='chemistry', style=_TAB_STYLE, selected_style=_TAB_SEL,
-                children=[
-            html.Div(style={'paddingTop': '10px'}, children=[
-                html.P('Top formation and destruction reactions for a selected species '
-                       '(load a chemistry grid on the Load tab — standalone or with an HDF5 '
-                       'structure grid; an optional overlay chemistry grid adds dashed '
-                       'comparison curves). In chemistry-only mode the sliders index the '
-                       'chemistry filenames; load an HDF5 grid for depth profiles and '
-                       'abundance colormaps. Choose how reactions '
-                       'are ranked: fractional contribution to the total rate, or '
-                       'rate per X particle (KoSens ``top_reactions_plot`` metrics). '
-                       'Below, separate formation and destruction networks show all '
-                       'partners in those same top-N reactions (reactants left, products right). '
-                       'Switch the network to Dominant to keep only the top reactions (by rate '
-                       'contribution) of every species on the path, and tick cosmic-ray paths '
-                       'only to see the routes started or ended by cosmic rays (CRP / CRPHOT / '
-                       'CR-DES) or by the cosmic-ray ions H⁺, H₂⁺, H₃⁺, He⁺. '
-                       'Dotted arrows are steps driven by those ions; in Dominant mode arrow '
-                       'width follows each reaction\'s % contribution.',
-                       style=_PAGE_INTRO),
-                html.Div([
-                    html.Div([
-                        html.Label('Reaction species', style=_CTRL_LABEL),
-                        dcc.Dropdown(id='react-species', options=[], value=None,
-                                     placeholder='Load a chemistry grid\u2026',
-                                     style={'fontSize': '13px'}),
-                    ], style={'flex': '2', 'minWidth': '200px', 'marginRight': '18px'}),
-                    html.Div([
-                        html.Label('Top reactions / depth point', style=_CTRL_LABEL),
-                        dcc.Input(id='react-n', type='number', value=CHEM_DEFAULT_NREAC,
-                                  min=1, max=50, step=1,
-                                  style={'width': '90px', 'padding': '7px 9px', 'fontSize': '13px',
-                                         'border': '1px solid #bbc', 'borderRadius': '6px'}),
-                    ], style={'flex': '1', 'minWidth': '150px', 'marginRight': '18px'}),
-                    html.Div([
-                        html.Label('Ranking metric', style=_CTRL_LABEL),
-                        dcc.RadioItems(id='react-ranking', options=REACT_RANKING_OPTIONS,
-                                       value=DEFAULT_REACT_RANKING, **_RADIO),
-                    ], style={**_CTRL_BOX, 'marginRight': '0'}),
-                ], className='kosma-panel',
-                style={'display': 'flex', 'alignItems': 'flex-start',
-                       'padding': '12px 18px'}),
-                dcc.Loading(id='loading-chemistry', type='circle', children=[
-                    html.Div([
-                        html.Div([
-                            dcc.Graph(id='plot-react-formation', figure=placeholder_fig(), config=_GRAPH_CFG,
-                                      style={'width': '100%'}),
-                            html.Div(id='react-contrib-formation'),
-                        ], style={'flex': '1', 'minWidth': '0'}),
-                        html.Div([
-                            dcc.Graph(id='plot-react-destruction', figure=placeholder_fig(), config=_GRAPH_CFG,
-                                      style={'width': '100%'}),
-                            html.Div(id='react-contrib-destruction'),
-                        ], style={'flex': '1', 'minWidth': '0'}),
-                    ], style={'display': 'flex', 'gap': '12px', 'marginTop': '12px',
-                              'alignItems': 'flex-start'}),
-                ]),
-                html.H4('Reaction pathway network',
-                        style={'fontSize': '14px', 'margin': '22px 0 6px', 'fontWeight': '600'}),
-                html.Div(id='react-network-status', style={**_PAGE_INTRO, 'marginBottom': '8px'}),
-                dcc.Store(id='react-net-highlight', data=None),
-                dcc.Store(id='react-net-hidden', data=[]),
-                html.Div([
-                    html.Div([
-                        html.Label('Upstream depth', style=_CTRL_LABEL),
-                        dcc.Input(id='react-chain-upstream', type='number',
-                                  min=0, max=6, step=1,
-                                  value=chem_network.DEFAULT_CHAIN_UPSTREAM,
-                                  style={'width': '90px', 'padding': '7px 9px', 'fontSize': '13px',
-                                         'border': '1px solid #bbc', 'borderRadius': '6px'}),
-                    ], style={'marginRight': '18px'}),
-                    html.Div([
-                        html.Label('Downstream depth', style=_CTRL_LABEL),
-                        dcc.Input(id='react-chain-downstream', type='number',
-                                  min=0, max=6, step=1,
-                                  value=chem_network.DEFAULT_CHAIN_DOWNSTREAM,
-                                  style={'width': '90px', 'padding': '7px 9px', 'fontSize': '13px',
-                                         'border': '1px solid #bbc', 'borderRadius': '6px'}),
-                    ], style={'marginRight': '18px'}),
-                    html.Div([
-                        html.Label('Species text', style=_CTRL_LABEL,
-                                   title='Font size of species names in the boxes (pt)'),
-                        dcc.Input(id='react-species-label-size', type='number',
-                                  min=8, max=40, step=1,
-                                  value=chem_network.DEFAULT_SPECIES_LABEL_SIZE,
-                                  style={'width': '90px', 'padding': '7px 9px', 'fontSize': '13px',
-                                         'border': '1px solid #bbc', 'borderRadius': '6px'}),
-                    ], style={'marginRight': '18px'}),
-                    html.Div([
-                        html.Label('Partner text', style=_CTRL_LABEL,
-                                   title='Font size of reaction partners on the arrows (pt)'),
-                        dcc.Input(id='react-partner-label-size', type='number',
-                                  min=8, max=40, step=1,
-                                  value=chem_network.DEFAULT_PARTNER_LABEL_SIZE,
-                                  style={'width': '90px', 'padding': '7px 9px', 'fontSize': '13px',
-                                         'border': '1px solid #bbc', 'borderRadius': '6px'}),
-                    ], style={'marginRight': '22px'}),
-                    html.Div([
-                        html.Label('Network', style=_CTRL_LABEL,
-                                   title='Dominant: every species keeps only its top '
-                                         'reactions by rate contribution'),
-                        dcc.RadioItems(id='react-net-mode',
-                                       options=[{'label': ' Full', 'value': 'full'},
-                                                {'label': ' Dominant', 'value': 'dominant'}],
-                                       value='full', **_RADIO),
-                    ], style={'marginRight': '18px'}),
-                    html.Div([
-                        html.Label('Reactions / species', style=_CTRL_LABEL,
-                                   title='Top formation / destruction reactions kept per '
-                                         'species in Dominant mode'),
-                        dcc.Input(id='react-dom-k', type='number',
-                                  min=1, max=10, step=1, value=3,
-                                  style={'width': '90px', 'padding': '7px 9px', 'fontSize': '13px',
-                                         'border': '1px solid #bbc', 'borderRadius': '6px'}),
-                    ], style={'marginRight': '18px'}),
-                    html.Div([
-                        html.Label(' ', style=_CTRL_LABEL),
-                        dcc.Checklist(
-                            id='react-net-cr',
-                            options=[{'label': ' cosmic-ray paths only', 'value': 'cr'}],
-                            value=[],
-                            style={'fontSize': '13px', 'whiteSpace': 'nowrap'}),
-                    ], title='Dominant mode: keep only routes that contain a '
-                             'cosmic-ray reaction (CRP / CRPHOT / CR-DES) or a '
-                             'cosmic-ray ion reactant (H+, H2+, H3+, He+)',
-                       style={'marginRight': '22px', 'alignSelf': 'flex-end'}),
-                    html.Div([
-                        html.Label('Include', style=_CTRL_LABEL),
-                        dcc.Checklist(
-                            id='react-chain-isotopes',
-                            options=[{'label': ' isotopes', 'value': 'iso'}],
-                            value=[],
-                            style={'fontSize': '13px', 'whiteSpace': 'nowrap'}),
-                    ], style={'marginRight': '16px', 'alignSelf': 'flex-end'}),
-                    html.Div([
-                        html.Label('\u00a0', style=_CTRL_LABEL),
-                        dcc.Checklist(
-                            id='react-chain-ice',
-                            options=[{'label': ' ice / grain', 'value': 'ice'}],
-                            value=[],
-                            style={'fontSize': '13px', 'whiteSpace': 'nowrap'}),
-                    ], style={'marginRight': '18px', 'alignSelf': 'flex-end'}),
-                    html.Div([
-                        html.Label('\u00a0', style=_CTRL_LABEL),
-                        html.Button('Hide selected', id='btn-react-net-hide', n_clicks=0,
-                                    title='Click a species box, then hide it from the figure',
-                                    className='btn btn-ghost btn-sm',
-                                    style={'marginRight': '8px'}),
-                        html.Button('Show all', id='btn-react-net-show-all', n_clicks=0,
-                                    title='Restore every hidden species',
-                                    className='btn btn-ghost btn-sm',
-                                    style={'marginRight': '8px'}),
-                        html.Button('Clear highlight', id='btn-react-net-clear', n_clicks=0,
-                                    className='btn btn-ghost btn-sm'),
-                    ], style={'alignSelf': 'flex-end'}),
-                ], style={'display': 'flex', 'alignItems': 'flex-end',
-                          'flexWrap': 'wrap', 'marginBottom': '8px'}),
-                html.Div(id='react-net-hidden-bar', style={'marginBottom': '10px'}),
-                dcc.Graph(
-                    id='plot-react-network',
-                    figure=placeholder_fig(),
-                    config={**_GRAPH_CFG, 'responsive': True},
-                    style={'width': '100%', 'maxWidth': '100%',
-                           'height': '1020px', 'maxHeight': '1020px',
-                           'minHeight': '720px', 'marginBottom': '16px',
-                           'overflow': 'hidden'},
-                ),
-            ]),
-        ]),
-
-        # --- Probe ranking ---------------------------------------------------
-        dcc.Tab(label='Probe ranking', value='proberank', className='grp-lines',
-                style=_TAB_STYLE,
-                selected_style=_TAB_SEL, children=[
-            html.Div(style={'paddingTop': '10px'}, children=_probe_ranking_page()),
         ]),
 
         # --- Page 6: SIMLINE intensities ------------------------------------
@@ -11221,14 +12548,14 @@ app.layout = html.Div(
                 html.Div([
                     html.Div([
                         html.Label('Quantity', style=_CTRL_LABEL),
-                        dcc.RadioItems(id='int-idef', options=SIMLINE_IDEF_OPTIONS,
+                        _choice(id='int-idef', options=SIMLINE_IDEF_OPTIONS,
                                        value=SIMLINE_DEFAULT_IDEF, **_RADIO),
-                    ], style={'flex': '1.4', 'minWidth': '220px', 'marginRight': '18px'}),
+                    ], style={'flex': '1.4', 'minWidth': '220px', 'marginRight': '12px'}),
                     html.Div([
                         html.Label('Viewing angle (Meudon)', style=_CTRL_LABEL),
-                        dcc.RadioItems(id='hdf5-angle', options=[], value=None, **_RADIO),
+                        _choice(id='hdf5-angle', options=[], value=None, **_RADIO),
                     ], id='hdf5-angle-wrap',
-                        style={'display': 'none', 'minWidth': '160px', 'marginRight': '18px'}),
+                        style={'display': 'none', 'minWidth': '160px', 'marginRight': '12px'}),
                     html.Div([
                         html.Label('Species', style=_CTRL_LABEL),
                         dcc.Dropdown(id='int-species', options=[], value=[],
@@ -11240,7 +12567,7 @@ app.layout = html.Div(
                                 className='btn btn-primary btn-sm', style=_ALL_BTN_STYLE),
                     html.Div([
                         html.Label('Contour Z scale', style=_CTRL_LABEL),
-                        dcc.RadioItems(id='int-zscale', options=_SCALE_OPTIONS,
+                        _choice(id='int-zscale', options=_SCALE_OPTIONS,
                                        value='log', **_SEG),
                     ], style={**_CTRL_BOX, 'marginLeft': '12px', 'marginRight': '0'}),
                     # One transition dropdown per selected species (for grid maps);
@@ -11251,10 +12578,24 @@ app.layout = html.Div(
                 ], className='kosma-panel',
                 style={'display': 'flex', 'alignItems': 'flex-start',
                        'flexWrap': 'wrap',
-                       'padding': '12px 18px', 'marginBottom': '12px'}),
+                       'padding': '10px 14px', 'marginBottom': '10px'}),
                 _advanced_details('Interpolation & resampling', _interp_control_row(prefix='int-')),
                 _advanced_details('Attenuation x-shift matching', _shift_control_row(prefix='int-')),
                 _advanced_details('Contour overlays', _int_contour_overlay_row()),
+                _advanced_details(
+                    'CO SLED classes (Rosenberg et al. 2015)',
+                    html.P('α = (L11-10 + L12-11 + L13-12) / (L5-4 + L6-5 + L7-6) per model; '
+                           'class I α < 0.33, II 0.33–0.66, III > 0.66. Uses the CO lines of the '
+                           'selected quantity (K km/s or erg).', className='kosma-muted',
+                           style={'fontSize': '12px'}),
+                    html.Button('Count models', id='int-co-alpha-btn', n_clicks=0,
+                                className='btn btn-primary btn-sm'),
+                    html.Div([
+                        dcc.Graph(id='int-co-alpha-fig', figure=placeholder_fig(),
+                                  config=_GRAPH_CFG, style={'width': '640px', 'height': '560px', 'flex': 'none'}),
+                        html.Div(id='int-co-alpha-table',
+                                 style={'flex': '1', 'minWidth': '320px', 'marginLeft': '12px'}),
+                    ], style={'display': 'flex', 'alignItems': 'flex-start', 'flexWrap': 'wrap'})),
                 dcc.Tabs(id='int-subtabs', value='int-maps',
                          style={'marginTop': '4px'}, children=[
                     dcc.Tab(label='Maps', value='int-maps',
@@ -11298,7 +12639,7 @@ app.layout = html.Div(
                         ], className='kosma-panel',
                            style={'display': 'flex', 'alignItems': 'flex-start',
                                   'flexWrap': 'wrap',
-                                  'padding': '12px 18px', 'marginBottom': '12px'}),
+                                  'padding': '10px 14px', 'marginBottom': '10px'}),
                         html.Div(id='int-ratio-hint', className='kosma-muted',
                                  style={'marginBottom': '8px'}),
                         dcc.Loading(id='loading-int-ratios', type='circle', children=[
@@ -11309,8 +12650,125 @@ app.layout = html.Div(
             ]),
         ]),
 
+        # --- Page 8: interpolation error check --------------------------------
+        dcc.Tab(label='Interpolation', value='interperror',
+                style=_TAB_STYLE,
+                selected_style=_TAB_SEL, children=[
+            html.Div(style={'paddingTop': '10px'}, children=[
+                html.P('Compare native model grids with KoSens-style resampling and '
+                       'estimate interpolation error (decimate \u2192 re-interpolate on the '
+                       'native mesh, matching ``resampled_grid_data`` with '
+                       '``calculate_error=True``). Shows abundance / diagnostic grids when '
+                       'the main HDF5 grid is loaded, and SIMLINE intensity grids when a '
+                       'SIMLINE directory is loaded.',
+                       style=_PAGE_INTRO),
+                html.Div([
+                    html.Div([
+                        html.Label('Abundance / diagnostic quantity', style=_CTRL_LABEL),
+                        dcc.Dropdown(id='ie-quantity', options=[], value=None,
+                                     placeholder='Load a main grid\u2026',
+                                     style={'fontSize': '13px'}),
+                    ], style={'flex': '2', 'minWidth': '220px', 'marginRight': '12px'}),
+                    html.Div([
+                        html.Label('SIMLINE species', style=_CTRL_LABEL),
+                        dcc.Dropdown(id='ie-int-species', options=[], value=None,
+                                     placeholder='Load SIMLINE\u2026',
+                                     style={'fontSize': '13px'}),
+                    ], style={'flex': '1', 'minWidth': '120px', 'marginRight': '12px'}),
+                    html.Div([
+                        html.Label('Transition', style=_CTRL_LABEL),
+                        dcc.Dropdown(id='ie-int-transition', options=[], value=None,
+                                     placeholder='Select species\u2026',
+                                     style={'fontSize': '13px'}),
+                    ], style={'flex': '1.2', 'minWidth': '160px', 'marginRight': '12px'}),
+                    html.Div([
+                        html.Label('Quantity', style=_CTRL_LABEL),
+                        _choice(id='ie-int-idef', options=SIMLINE_IDEF_OPTIONS,
+                                       value=SIMLINE_DEFAULT_IDEF, **_RADIO),
+                    ], style={**_CTRL_BOX, 'marginRight': '0'}),
+                ], className='kosma-panel',
+                style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
+                       'padding': '10px 14px'}),
+                _interp_control_row(prefix='ie-'),
+                _advanced_details('Error metric & display', _interp_error_control_row()),
+                html.Div([_ie_plane_section(p['id']) for p in SLICE_PLANES],
+                         id='ie-panels-wrap', style=_SLICE_PANELS_COL_STYLE),
+            ]),
+        ]),
+
+        # --- Probe ranking ---------------------------------------------------
+        dcc.Tab(label='Probe ranking', value='proberank', className='grp-cr',
+                style=_TAB_STYLE,
+                selected_style=_TAB_SEL, children=[
+            html.Div(style={'paddingTop': '10px'}, children=_probe_ranking_page()),
+        ]),
+
+        # --- Page 9: CR attenuation profiles ----------------------------------
+        dcc.Tab(label='CR attenuation', value='cratten', style=_TAB_STYLE,
+                selected_style=_TAB_SEL, children=[
+            html.Div(style={'paddingTop': '10px'}, children=[
+                html.P('Cosmic-ray ionisation rate ζ<sub>H₂</sub> vs column density, '
+                       'following the KoSens CR_atten_plot notebook. Padovani et al. '
+                       '(2018/2024) reference bands 𝓛, 𝓗, 𝓤 are always available; '
+                       'add one or more KOSMA model profiles from the sliders or overlay grid.',
+                       style=_PAGE_INTRO),
+                html.Div([
+                    html.Div([
+                        html.Label('X axis', style=_CTRL_LABEL),
+                        _choice(id='cr-atten-xaxis', options=CR_ATTEN_XAXIS_OPTIONS,
+                                       value='nh2', **_RADIO),
+                    ], style={'flex': '1', 'minWidth': '160px', 'marginRight': '12px'}),
+                    html.Div([
+                        html.Label('Onset N_eff = N(H₂) + N(H)/2 (cm⁻²)', style=_CTRL_LABEL),
+                        dcc.Input(id='cr-atten-stop-rate', type='number',
+                                  value=cra.DEFAULT_STOPPING_RATE,
+                                  placeholder='1e20',
+                                  style={'width': '100%', 'fontSize': '13px'}),
+                    ], style={'flex': '1', 'minWidth': '160px', 'marginRight': '12px'}),
+                    html.Div([
+                        _choice(multi=True, 
+                            id='cr-atten-options',
+                            options=[
+                                {'label': ' Padovani 𝓛 / 𝓗 / 𝓤 bands', 'value': 'padovani'},
+                                {'label': ' Extrapolate profiles to 10²⁵ cm⁻²', 'value': 'extrap'},
+                                {'label': ' Attenuation onset markers (◆)', 'value': 'threshold'},
+                            ],
+                            value=['padovani', 'extrap', 'threshold'],
+                            style={'fontSize': '13px'},
+                        ),
+                    ], style={'flex': '1.6', 'minWidth': '240px'}),
+                ], style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
+                          'padding': '10px 14px',
+                          'borderRadius': '8px', 'marginBottom': '10px'}),
+                html.Div([
+                    html.Button('Add current model', id='cr-atten-add', n_clicks=0,
+                                className='btn btn-primary',
+                                style={'marginRight': '8px'}),
+                    html.Button('Add all overlay matches', id='cr-atten-add-overlay', n_clicks=0,
+                                className='btn btn-overlay',
+                                style={'marginRight': '8px'}),
+                    html.Button('Clear profiles', id='cr-atten-clear', n_clicks=0,
+                                className='btn btn-ghost'),
+                ], style={'padding': '0 18px 10px'}),
+                html.Div([
+                    html.Label('Profiles to plot', style=_CTRL_LABEL),
+                    _choice(multi=True, id='cr-atten-active', options=[], value=[],
+                                  style={'fontSize': '13px'}),
+                ], style={'padding': '0 18px 12px'}),
+                dcc.Loading(id='loading-cr-atten', type='circle', children=[
+                    dcc.Graph(id='plot-cr-atten', figure=placeholder_fig(), config=_GRAPH_CFG),
+                ]),
+            ]),
+        ]),
+
+        # --- Attenuation impact (KoSens attenuation workflow) ---------------
+        dcc.Tab(label='Attenuation impact', value='attenimpact', style=_TAB_STYLE,
+                selected_style=_TAB_SEL, children=[
+            html.Div(style={'paddingTop': '10px'}, children=_atten_impact_page()),
+        ]),
+
         # --- Page 7: spectra (SimLine PV + CARTA-like cube viewer) ------------
-        dcc.Tab(label='Spectra', value='spectra', style=_TAB_STYLE,
+        dcc.Tab(label='Spectra', value='spectra', className='grp-obs', style=_TAB_STYLE,
                 selected_style=_TAB_SEL, children=[
             html.Div(style={'paddingTop': '10px'}, children=[
                 html.P('SimLine position–velocity cubes, or a CARTA-style viewer for '
@@ -11332,14 +12790,14 @@ app.layout = html.Div(
                         html.Div([
                             html.Div([
                                 html.Label('x axis', style=_CTRL_LABEL),
-                                dcc.RadioItems(id='ir-x-axis', value='wavelength', options=[
+                                _choice(id='ir-x-axis', value='wavelength', options=[
                                     {'label': ' Wavelength (\u00b5m)', 'value': 'wavelength'},
                                     {'label': ' Frequency (GHz)', 'value': 'frequency'},
                                 ], **_RADIO),
                             ], style=_CTRL_BOX),
                             html.Div([
                                 html.Label('y scale', style=_CTRL_LABEL),
-                                dcc.RadioItems(id='ir-y-scale', value='log', options=[
+                                _choice(id='ir-y-scale', value='log', options=[
                                     {'label': ' log', 'value': 'log'},
                                     {'label': ' linear', 'value': 'linear'},
                                 ], **_RADIO),
@@ -11369,33 +12827,33 @@ app.layout = html.Div(
                 html.Div([
                     html.Div([
                         html.Label('Quantity', style=_CTRL_LABEL),
-                        dcc.RadioItems(id='sp-quantity', options=SIMLINE_PV_QUANTITY_OPTIONS,
+                        _choice(id='sp-quantity', options=SIMLINE_PV_QUANTITY_OPTIONS,
                                        value=SIMLINE_DEFAULT_PV_QUANTITY, **_RADIO),
-                    ], style={'flex': '1.4', 'minWidth': '220px', 'marginRight': '18px'}),
+                    ], style={'flex': '1.4', 'minWidth': '220px', 'marginRight': '12px'}),
                     html.Div([
                         html.Label('Species', style=_CTRL_LABEL),
                         dcc.Dropdown(id='sp-species', options=[], value=None,
                                      placeholder='Load a SIMLINE directory\u2026',
                                      style={'fontSize': '13px'}),
-                    ], style={'flex': '1', 'minWidth': '140px', 'marginRight': '18px'}),
+                    ], style={'flex': '1', 'minWidth': '140px', 'marginRight': '12px'}),
                     html.Div([
                         html.Label('Transition(s)', style=_CTRL_LABEL),
                         dcc.Dropdown(id='sp-transition', options=[], value=[],
                                      multi=True,
                                      placeholder='Select species\u2026',
                                      style={'fontSize': '13px'}),
-                    ], style={'flex': '1.8', 'minWidth': '240px', 'marginRight': '18px'}),
+                    ], style={'flex': '1.8', 'minWidth': '240px', 'marginRight': '12px'}),
                     html.Div([
                         html.Label('Position offsets (arcsec)', style=_CTRL_LABEL),
                         dcc.Input(id='sp-positions', type='text', value='',
                                   placeholder='empty = spatial mean; e.g. 0, 21, 42',
                                   style={'width': '100%', 'fontSize': '13px'}),
-                    ], style={'flex': '2', 'minWidth': '220px', 'marginRight': '18px'}),
+                    ], style={'flex': '2', 'minWidth': '220px', 'marginRight': '12px'}),
                     html.Div([
                         html.Label('PV Z scale', style=_CTRL_LABEL),
-                        dcc.RadioItems(id='sp-zscale', options=_SCALE_OPTIONS,
+                        _choice(id='sp-zscale', options=_SCALE_OPTIONS,
                                        value='linear', **_RADIO),
-                    ], style={**_CTRL_BOX, 'marginRight': '18px'}),
+                    ], style={**_CTRL_BOX, 'marginRight': '12px'}),
                     html.Div([
                         html.Label('PV colormap', style=_CTRL_LABEL),
                         dcc.Dropdown(id='sp-colorscale', options=GRID_COLORMAP_OPTIONS,
@@ -11404,13 +12862,13 @@ app.layout = html.Div(
                     ], style={'flex': '1', 'minWidth': '120px'}),
                 ], className='kosma-panel',
                 style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
-                       'padding': '12px 18px'}),
+                       'padding': '10px 14px'}),
                 html.Div([
                     html.Div([
                         html.Label('PV position min (arcsec)', style=_CTRL_LABEL),
                         dcc.Input(id='sp-pos-min', type='number', value=None,
                                   placeholder='auto', style={'width': '100%'}),
-                    ], style={'flex': '1', 'minWidth': '140px', 'marginRight': '18px'}),
+                    ], style={'flex': '1', 'minWidth': '140px', 'marginRight': '12px'}),
                     html.Div([
                         html.Label('PV position max (arcsec)', style=_CTRL_LABEL),
                         dcc.Input(id='sp-pos-max', type='number', value=None,
@@ -11420,7 +12878,7 @@ app.layout = html.Div(
                           'padding': '0 18px 12px', 'marginBottom': '4px'}),
                 html.Div([
                     html.H4('Observational spectrum (FITS cube / CLASS MATRIX)',
-                            style={'margin': '0 0 8px', 'fontSize': '14px', 'color': '#444'}),
+                            style={'margin': '0 0 8px', 'fontSize': '14px', 'color': 'var(--text)'}),
                     html.Div([
                         html.Div([
                             html.Label('FITS file path', style=_CTRL_LABEL),
@@ -11429,22 +12887,22 @@ app.layout = html.Div(
                                 placeholder='Browse or paste /path/to/cube.fits',
                                 browse_title='Open a file window and pick a FITS cube or CLASS MATRIX file',
                             ),
-                        ], style={'flex': '3', 'minWidth': '280px', 'marginRight': '18px'}),
+                        ], style={'flex': '3', 'minWidth': '280px', 'marginRight': '12px'}),
                         html.Div([
                             html.Label('HDU index', style=_CTRL_LABEL),
-                            dcc.Input(id='obs-hdu', type='number', value=1, min=0, step=1,
+                            dcc.Input(id='obs-hdu', type='number', value=1, min=0, max=NUM_INPUT_MAX, step=1,
                                       style={'width': '100%'}),
-                        ], style={'flex': '0.6', 'minWidth': '70px', 'marginRight': '18px'}),
+                        ], style={'flex': '0.6', 'minWidth': '70px', 'marginRight': '12px'}),
                         html.Div([
                             html.Label('Spectrum selection', style=_CTRL_LABEL),
                             dcc.Dropdown(id='obs-row-mode', options=OBS_ROW_OPTIONS,
                                          value='peak', style={'fontSize': '13px'}),
-                        ], style={'flex': '1.4', 'minWidth': '180px', 'marginRight': '18px'}),
+                        ], style={'flex': '1.4', 'minWidth': '180px', 'marginRight': '12px'}),
                         html.Div([
                             html.Label('Row / pixel index', style=_CTRL_LABEL),
-                            dcc.Input(id='obs-row-index', type='number', value=0, min=0,
+                            dcc.Input(id='obs-row-index', type='number', value=0, min=0, max=NUM_INPUT_MAX,
                                       step=1, style={'width': '100%'}),
-                        ], style={'flex': '0.8', 'minWidth': '90px', 'marginRight': '18px'}),
+                        ], style={'flex': '0.8', 'minWidth': '90px', 'marginRight': '12px'}),
                         html.Div([
                             html.Label('N Gaussians', style=_CTRL_LABEL),
                             dcc.Input(id='obs-n-gauss', type='number', value=1, min=1,
@@ -11457,26 +12915,26 @@ app.layout = html.Div(
                             html.Label('Line core low (km/s)', style=_CTRL_LABEL),
                             dcc.Input(id='obs-v-low', type='number', value=DEFAULT_OBS_V_LOW,
                                       step=0.5, style={'width': '100%'}),
-                        ], style={'flex': '1', 'minWidth': '120px', 'marginRight': '18px'}),
+                        ], style={'flex': '1', 'minWidth': '120px', 'marginRight': '12px'}),
                         html.Div([
                             html.Label('Line core high (km/s)', style=_CTRL_LABEL),
                             dcc.Input(id='obs-v-high', type='number', value=DEFAULT_OBS_V_HIGH,
                                       step=0.5, style={'width': '100%'}),
-                        ], style={'flex': '1', 'minWidth': '120px', 'marginRight': '18px'}),
+                        ], style={'flex': '1', 'minWidth': '120px', 'marginRight': '12px'}),
                         html.Div([
                             dcc.Checklist(id='obs-overlay', options=[
                                 {'label': ' Overlay on SimLine spectrum', 'value': 'on'},
                             ], value=['on'], style={'fontSize': '13px'}),
-                        ], style={'flex': '1.4', 'minWidth': '200px', 'marginRight': '18px'}),
+                        ], style={'flex': '1.4', 'minWidth': '200px', 'marginRight': '12px'}),
                         html.Div([
                             dcc.Checklist(id='obs-fit', options=[
                                 {'label': ' Fit Gaussians (+ continuum)', 'value': 'on'},
                             ], value=['on'], style={'fontSize': '13px'}),
                         ], style={'flex': '1.4', 'minWidth': '200px'}),
                     ], style={'display': 'flex', 'alignItems': 'center', 'flexWrap': 'wrap'}),
-                    _gaussian_guess_panel('obs', 1),
+                    _advanced_details('Gaussian initial guesses', _gaussian_guess_panel('obs', 1)),
                 ], className='kosma-panel',
-                          style={'padding': '12px 18px', 'marginBottom': '12px'}),
+                          style={'padding': '10px 14px', 'marginBottom': '10px'}),
                 dcc.Loading(id='loading-spectra', type='circle', children=[
                     dcc.Graph(id='plot-sp-spectrum', figure=placeholder_fig(), config=_GRAPH_CFG,
                               style={'marginBottom': '8px'}),
@@ -11500,6 +12958,7 @@ app.layout = html.Div(
                        'the filename and RESTFREQ / RESTFRQ.',
                        style=_PAGE_INTRO),
                 dcc.Store(id='cv-selection', data=None),
+                dcc.Store(id='cv-g-shown', data=None),  # numbers the last fit wrote into the boxes
                 html.Div([
                     html.Div([
                         html.Label('FITS file or directory', style=_CTRL_LABEL),
@@ -11509,31 +12968,31 @@ app.layout = html.Div(
                             browse_title='Open a file window and pick any FITS cube '
                                          'in the folder you want to load',
                         ),
-                    ], style={'flex': '2.4', 'minWidth': '260px', 'marginRight': '18px'}),
+                    ], style={'flex': '2.4', 'minWidth': '260px', 'marginRight': '12px'}),
                     html.Div([
                         html.Label('Cube', style=_CTRL_LABEL),
                         dcc.Dropdown(id='cv-file', options=[], value=None,
                                      placeholder='Browse or paste a path above\u2026',
                                      style={'fontSize': '13px'}),
-                    ], style={'flex': '2.2', 'minWidth': '240px', 'marginRight': '18px'}),
+                    ], style={'flex': '2.2', 'minWidth': '240px', 'marginRight': '12px'}),
                     html.Div([
                         html.Label('HDU', style=_CTRL_LABEL),
-                        dcc.Input(id='cv-hdu', type='number', value=1, min=0, step=1,
+                        dcc.Input(id='cv-hdu', type='number', value=1, min=0, max=NUM_INPUT_MAX, step=1,
                                   style={'width': '100%'}),
-                    ], style={'flex': '0.5', 'minWidth': '64px', 'marginRight': '18px'}),
+                    ], style={'flex': '0.5', 'minWidth': '64px', 'marginRight': '12px'}),
                     html.Div([
                         html.Label('Map', style=_CTRL_LABEL),
-                        dcc.RadioItems(id='cv-map-metric', options=CUBE_MAP_METRIC_OPTIONS,
+                        _choice(id='cv-map-metric', options=CUBE_MAP_METRIC_OPTIONS,
                                        value=DEFAULT_CUBE_MAP_METRIC, **_RADIO),
-                    ], style={'flex': '1.4', 'minWidth': '200px', 'marginRight': '18px'}),
+                    ], style={'flex': '1.4', 'minWidth': '200px', 'marginRight': '12px'}),
                     html.Div([
                         html.Label('Spectrum', style=_CTRL_LABEL),
-                        dcc.RadioItems(id='cv-spec-mode', options=CUBE_SPEC_MODE_OPTIONS,
+                        _choice(id='cv-spec-mode', options=CUBE_SPEC_MODE_OPTIONS,
                                        value=DEFAULT_CUBE_SPEC_MODE, **_RADIO),
                     ], style={'flex': '1.3', 'minWidth': '180px'}),
                 ], className='kosma-panel',
                    style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
-                          'padding': '12px 18px', 'marginBottom': '12px'}),
+                          'padding': '10px 14px', 'marginBottom': '10px'}),
                 html.Div([
                     html.Div([
                         html.Label('Spectral channel', style=_CTRL_LABEL),
@@ -11566,34 +13025,34 @@ app.layout = html.Div(
                     ], style={'flex': '1', 'minWidth': '280px'}),
                 ], className='kosma-panel',
                    style={'display': 'flex', 'alignItems': 'flex-end',
-                          'padding': '12px 18px', 'marginBottom': '12px'}),
+                          'padding': '10px 14px', 'marginBottom': '10px'}),
                 html.Div([
                     html.Div([
                         html.Label('Line core low (km/s)', style=_CTRL_LABEL),
                         dcc.Input(id='cv-v-low', type='number', value=DEFAULT_OBS_V_LOW,
                                   step=0.5, style={'width': '100%'}),
-                    ], style={'flex': '1', 'minWidth': '120px', 'marginRight': '18px'}),
+                    ], style={'flex': '1', 'minWidth': '120px', 'marginRight': '12px'}),
                     html.Div([
                         html.Label('Line core high (km/s)', style=_CTRL_LABEL),
                         dcc.Input(id='cv-v-high', type='number', value=DEFAULT_OBS_V_HIGH,
                                   step=0.5, style={'width': '100%'}),
-                    ], style={'flex': '1', 'minWidth': '120px', 'marginRight': '18px'}),
+                    ], style={'flex': '1', 'minWidth': '120px', 'marginRight': '12px'}),
                     html.Div([
                         html.Label('Map Z scale', style=_CTRL_LABEL),
-                        dcc.RadioItems(id='cv-zscale', options=_SCALE_OPTIONS,
+                        _choice(id='cv-zscale', options=_SCALE_OPTIONS,
                                        value='linear', **_SEG),
-                    ], style={**_CTRL_BOX, 'marginRight': '18px'}),
+                    ], style={**_CTRL_BOX, 'marginRight': '12px'}),
                     html.Div([
                         html.Label('Colormap', style=_CTRL_LABEL),
                         dcc.Dropdown(id='cv-colorscale', options=GRID_COLORMAP_OPTIONS,
                                      value=DEFAULT_GRID_COLORMAP,
                                      style={'fontSize': '13px'}),
-                    ], style={'flex': '1', 'minWidth': '120px', 'marginRight': '18px'}),
+                    ], style={'flex': '1', 'minWidth': '120px', 'marginRight': '12px'}),
                     html.Div([
                         html.Label('N Gaussians', style=_CTRL_LABEL),
                         dcc.Input(id='cv-n-gauss', type='number', value=1, min=1,
                                   max=6, step=1, style={'width': '100%'}),
-                    ], style={'flex': '0.7', 'minWidth': '80px', 'marginRight': '18px'}),
+                    ], style={'flex': '0.7', 'minWidth': '80px', 'marginRight': '12px'}),
                     html.Div([
                         dcc.Checklist(id='cv-fit', options=[
                             {'label': ' Fit Gaussians (+ continuum)', 'value': 'on'},
@@ -11601,31 +13060,31 @@ app.layout = html.Div(
                     ], style={'flex': '1.4', 'minWidth': '200px'}),
                 ], className='kosma-panel',
                    style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
-                          'padding': '12px 18px', 'marginBottom': '12px'}),
-                html.Div(_gaussian_guess_panel('cv', 1), className='kosma-panel',
-                         style={'padding': '12px 18px', 'marginBottom': '12px'}),
-                html.Div([
+                          'padding': '10px 14px', 'marginBottom': '10px'}),
+                html.Div(_gaussian_guess_panel('cv', 1, autofill=True), className='kosma-panel',
+                         style={'padding': '10px 14px', 'marginBottom': '10px'}),
+                _advanced_details('Line identification', html.Div([
                     html.Div([
                         html.Label('Spectrum X axis', style=_CTRL_LABEL),
-                        dcc.RadioItems(id='cv-xaxis', options=CUBE_XAXIS_OPTIONS,
+                        _choice(id='cv-xaxis', options=CUBE_XAXIS_OPTIONS,
                                        value='velocity', **_RADIO),
-                    ], style={'flex': '1.2', 'minWidth': '180px', 'marginRight': '18px'}),
+                    ], style={'flex': '1.2', 'minWidth': '180px', 'marginRight': '12px'}),
                     html.Div([
                         html.Label('Line catalog', style=_CTRL_LABEL),
                         dcc.Dropdown(id='cv-linecat', options=CUBE_LINECAT_OPTIONS,
                                      value=DEFAULT_CUBE_LINECAT,
                                      style={'fontSize': '13px'}),
-                    ], style={'flex': '1.4', 'minWidth': '200px', 'marginRight': '18px'}),
+                    ], style={'flex': '1.4', 'minWidth': '200px', 'marginRight': '12px'}),
                     html.Div([
                         html.Label('Source VLSR (km/s)', style=_CTRL_LABEL),
                         dcc.Input(id='cv-v-source', type='number', value=0.0,
                                   step=0.5, style={'width': '100%'}),
-                    ], style={'flex': '0.9', 'minWidth': '110px', 'marginRight': '18px'}),
+                    ], style={'flex': '0.9', 'minWidth': '110px', 'marginRight': '12px'}),
                     html.Div([
                         html.Label('E_u max (K)', style=_CTRL_LABEL),
                         dcc.Input(id='cv-eu-max', type='number', value=150.0,
-                                  min=0, step=10, style={'width': '100%'}),
-                    ], style={'flex': '0.8', 'minWidth': '90px', 'marginRight': '18px'}),
+                                  min=0, max=NUM_INPUT_MAX, step=10, style={'width': '100%'}),
+                    ], style={'flex': '0.8', 'minWidth': '90px', 'marginRight': '12px'}),
                     html.Div([
                         dcc.Checklist(id='cv-mark-lines', options=[
                             {'label': ' Mark lines on spectrum', 'value': 'on'},
@@ -11633,7 +13092,49 @@ app.layout = html.Div(
                     ], style={'flex': '1.2', 'minWidth': '180px'}),
                 ], className='kosma-panel',
                    style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
-                          'padding': '12px 18px', 'marginBottom': '12px'}),
+                          'padding': '10px 14px', 'marginBottom': '10px'})),
+                html.Div([
+                    html.Div([
+                        html.Strong('Regions', style={'fontSize': '13px'}),
+                        html.Div('Draw a box, circle/ellipse or polygon with the map tool bar '
+                                 '(drag/resize to edit, erase tool to delete); the spectrum is '
+                                 'the mean over every pixel inside the regions. Or place a '
+                                 'circle by numbers (empty centre = map centre, empty radius = '
+                                 'half beam):',
+                                 style={'fontSize': '12px', 'opacity': 0.8, 'marginTop': '2px'}),
+                    ], style={'flex': '3', 'minWidth': '260px', 'marginRight': '12px'}),
+                    html.Div([
+                        html.Label('ΔRA (″)', style=_CTRL_LABEL),
+                        dcc.Input(id='cv-circ-ra', type='number', step=1, placeholder='centre',
+                                  style={'width': '100%'}),
+                    ], style={'flex': '0.7', 'minWidth': '80px', 'marginRight': '10px'}),
+                    html.Div([
+                        html.Label('ΔDec (″)', style=_CTRL_LABEL),
+                        dcc.Input(id='cv-circ-dec', type='number', step=1, placeholder='centre',
+                                  style={'width': '100%'}),
+                    ], style={'flex': '0.7', 'minWidth': '80px', 'marginRight': '10px'}),
+                    html.Div([
+                        html.Label('Radius', style=_CTRL_LABEL),
+                        dcc.Input(id='cv-circ-r', type='number', min=0, max=NUM_INPUT_MAX, placeholder='beam/2',
+                                  style={'width': '100%'}),
+                    ], style={'flex': '0.7', 'minWidth': '80px', 'marginRight': '10px'}),
+                    html.Div([
+                        html.Label('Unit', style=_CTRL_LABEL),
+                        _choice(id='cv-circ-unit', options=[
+                            {'label': ' arcsec', 'value': 'arcsec'},
+                            {'label': ' pc', 'value': 'pc'}], value='arcsec', style={'minWidth': '120px'}, **_RADIO),
+                    ], style={'marginRight': '10px'}),
+                    html.Div([
+                        html.Label('Distance (pc)', style=_CTRL_LABEL),
+                        dcc.Input(id='cv-circ-dist', type='number', min=0, max=NUM_INPUT_MAX,
+                                  placeholder='for pc', style={'width': '100%'}),
+                    ], style={'flex': '0.9', 'minWidth': '90px', 'marginRight': '10px'}),
+                    html.Button('Add circle', id='cv-add-circle', n_clicks=0,
+                                style={'marginRight': '8px'}),
+                    html.Button('Clear regions', id='cv-clear-regions', n_clicks=0),
+                ], className='kosma-panel',
+                   style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
+                          'padding': '10px 14px', 'marginBottom': '10px'}),
                 dcc.Loading(id='loading-cube-viewer', type='circle', children=[
                     html.Div([
                         dcc.Graph(id='plot-cv-map', figure=placeholder_fig(
@@ -11660,12 +13161,96 @@ app.layout = html.Div(
                                   'flexDirection': 'column'}),
                     ], style={'display': 'flex', 'gap': '12px',
                               'alignItems': 'stretch', 'flexWrap': 'wrap'}),
+                    html.Div([
+                        html.Div([
+                            html.Label('PPV overlay folder', style=_CTRL_LABEL),
+                            _path_browse_row(
+                                'cv-ppv-ovl-path', 'btn-browse-cv-ppv-ovl-path',
+                                placeholder='Empty = same folder as the main cube',
+                                browse_title='Pick any FITS cube in the folder to overlay from',
+                            ),
+                        ], style={'flex': '2', 'minWidth': '260px', 'marginRight': '12px'}),
+                        html.Div([
+                            html.Label('Overlay cubes (one colour each)', style=_CTRL_LABEL),
+                            dcc.Dropdown(id='cv-ppv-overlays', options=[], value=[],
+                                         multi=True,
+                                         placeholder='Pick cubes to overplot…',
+                                         style={'fontSize': '13px'}),
+                        ], style={'flex': '3', 'minWidth': '280px'}),
+                    ], className='kosma-panel',
+                       style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
+                              'padding': '10px 14px', 'marginTop': '12px'}),
                     dcc.Graph(id='plot-cv-ppv',
                               figure=placeholder_fig(
                                   '3-D position–position–velocity volume'),
                               config=_GRAPH_CFG,
                               style={'height': f'{_CV_PPV_HEIGHT}px',
                                      'marginTop': '12px'}),
+                    html.Div([
+                        html.Div([
+                            html.Label('Channel maps from (km/s)', style=_CTRL_LABEL),
+                            dcc.Input(id='cv-chmap-vstart', type='number', value=None,
+                                      step=0.5, debounce=True, placeholder='e.g. 20',
+                                      style={'width': '100%'}),
+                        ], style={'flex': '1', 'minWidth': '140px', 'marginRight': '12px'}),
+                        html.Div([
+                            html.Label('to (km/s)', style=_CTRL_LABEL),
+                            dcc.Input(id='cv-chmap-vend', type='number', value=None,
+                                      step=0.5, debounce=True, placeholder='e.g. 25',
+                                      style={'width': '100%'}),
+                        ], style={'flex': '1', 'minWidth': '120px', 'marginRight': '12px'}),
+                        html.Div([
+                            html.Label('Bin width (km/s)', style=_CTRL_LABEL),
+                            dcc.Input(id='cv-chmap-bin', type='number', value=1.0,
+                                      min=0, max=NUM_INPUT_MAX, step=0.1, debounce=True,
+                                      placeholder='native channels',
+                                      style={'width': '100%'}),
+                        ], style={'flex': '1', 'minWidth': '120px', 'marginRight': '12px'}),
+                        html.P('Each panel is ∫T dv over its velocity bin; all panels share '
+                               'one colour scale. Leave the bin empty (or below the channel '
+                               'width) for one panel per native channel.',
+                               style={'flex': '3', 'minWidth': '240px', 'margin': '0',
+                                      'fontSize': '12px', 'opacity': '0.75'}),
+                    ], className='kosma-panel',
+                       style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
+                              'padding': '10px 14px', 'marginTop': '12px'}),
+                    dcc.Graph(id='plot-cv-chmaps',
+                              figure=placeholder_fig(
+                                  'Velocity channel maps: enter a velocity range above'),
+                              config=_GRAPH_CFG,
+                              style={'marginTop': '12px'}),
+                    html.Div([
+                        *[html.Div([
+                            html.Label(lbl, style=_CTRL_LABEL),
+                            dcc.Input(id=cid, type='number', value=None, step=0.1,
+                                      debounce=True, placeholder='auto',
+                                      style={'width': '100%'}),
+                        ], style={'flex': '1', 'minWidth': '110px', 'marginRight': '12px'})
+                          for lbl, cid in (('PV cut start ΔRA (′)', 'cv-pv-ra0'),
+                                           ('start ΔDec (′)', 'cv-pv-dec0'),
+                                           ('end ΔRA (′)', 'cv-pv-ra1'),
+                                           ('end ΔDec (′)', 'cv-pv-dec1'))],
+                        html.Div([
+                            html.Label('Cut width (′)', style=_CTRL_LABEL),
+                            dcc.Input(id='cv-pv-width', type='number', value=0,
+                                      min=0, max=NUM_INPUT_MAX, step=0.1, debounce=True,
+                                      style={'width': '100%'}),
+                        ], style={'flex': '1', 'minWidth': '100px', 'marginRight': '12px'}),
+                        html.P('Straight cut between two map offsets (arcmin, as on the map '
+                               'axes); offset 0 is the red dot. Drag the white line or its ends on '
+                               'the map, or draw a new one with the line tool. A width > 0 '
+                               'averages spectra '
+                               'across the cut. Leave empty for a horizontal cut through the '
+                               'map centre. The velocity axis follows the line-core window.',
+                               style={'flex': '3', 'minWidth': '240px', 'margin': '0',
+                                      'fontSize': '12px', 'opacity': '0.75'}),
+                    ], className='kosma-panel',
+                       style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
+                              'padding': '10px 14px', 'marginTop': '12px'}),
+                    dcc.Graph(id='plot-cv-pvcut',
+                              figure=placeholder_fig('PV cut: load a cube'),
+                              config={**_GRAPH_CFG, 'modeBarButtonsToAdd': ['drawline']},
+                              style={'marginTop': '12px'}),
                     html.Div(id='cv-line-table', className='kosma-panel',
                              style={'padding': '14px 18px', 'marginTop': '12px',
                                     'maxHeight': '420px', 'overflowY': 'auto'}),
@@ -11673,116 +13258,6 @@ app.layout = html.Div(
                     ]),
                 ]),
             ]),
-        ]),
-
-        # --- Page 8: interpolation error check --------------------------------
-        dcc.Tab(label='Interpolation', value='interperror', className='grp-diag',
-                style=_TAB_STYLE,
-                selected_style=_TAB_SEL, children=[
-            html.Div(style={'paddingTop': '10px'}, children=[
-                html.P('Compare native model grids with KoSens-style resampling and '
-                       'estimate interpolation error (decimate \u2192 re-interpolate on the '
-                       'native mesh, matching ``resampled_grid_data`` with '
-                       '``calculate_error=True``). Shows abundance / diagnostic grids when '
-                       'the main HDF5 grid is loaded, and SIMLINE intensity grids when a '
-                       'SIMLINE directory is loaded.',
-                       style=_PAGE_INTRO),
-                html.Div([
-                    html.Div([
-                        html.Label('Abundance / diagnostic quantity', style=_CTRL_LABEL),
-                        dcc.Dropdown(id='ie-quantity', options=[], value=None,
-                                     placeholder='Load a main grid\u2026',
-                                     style={'fontSize': '13px'}),
-                    ], style={'flex': '2', 'minWidth': '220px', 'marginRight': '18px'}),
-                    html.Div([
-                        html.Label('SIMLINE species', style=_CTRL_LABEL),
-                        dcc.Dropdown(id='ie-int-species', options=[], value=None,
-                                     placeholder='Load SIMLINE\u2026',
-                                     style={'fontSize': '13px'}),
-                    ], style={'flex': '1', 'minWidth': '120px', 'marginRight': '18px'}),
-                    html.Div([
-                        html.Label('Transition', style=_CTRL_LABEL),
-                        dcc.Dropdown(id='ie-int-transition', options=[], value=None,
-                                     placeholder='Select species\u2026',
-                                     style={'fontSize': '13px'}),
-                    ], style={'flex': '1.2', 'minWidth': '160px', 'marginRight': '18px'}),
-                    html.Div([
-                        html.Label('Quantity', style=_CTRL_LABEL),
-                        dcc.RadioItems(id='ie-int-idef', options=SIMLINE_IDEF_OPTIONS,
-                                       value=SIMLINE_DEFAULT_IDEF, **_RADIO),
-                    ], style={**_CTRL_BOX, 'marginRight': '0'}),
-                ], className='kosma-panel',
-                style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
-                       'padding': '12px 18px'}),
-                _interp_control_row(prefix='ie-'),
-                _advanced_details('Error metric & display', _interp_error_control_row()),
-                html.Div([_ie_plane_section(p['id']) for p in SLICE_PLANES],
-                         id='ie-panels-wrap', style=_SLICE_PANELS_COL_STYLE),
-            ]),
-        ]),
-
-        # --- Page 9: CR attenuation profiles ----------------------------------
-        dcc.Tab(label='CR attenuation', value='cratten', style=_TAB_STYLE,
-                selected_style=_TAB_SEL, children=[
-            html.Div(style={'paddingTop': '10px'}, children=[
-                html.P('Cosmic-ray ionisation rate ζ<sub>H₂</sub> vs column density, '
-                       'following the KoSens CR_atten_plot notebook. Padovani et al. '
-                       '(2018/2024) reference bands 𝓛, 𝓗, 𝓤 are always available; '
-                       'add one or more KOSMA model profiles from the sliders or overlay grid.',
-                       style=_PAGE_INTRO),
-                html.Div([
-                    html.Div([
-                        html.Label('X axis', style=_CTRL_LABEL),
-                        dcc.RadioItems(id='cr-atten-xaxis', options=CR_ATTEN_XAXIS_OPTIONS,
-                                       value='nh2', **_RADIO),
-                    ], style={'flex': '1', 'minWidth': '160px', 'marginRight': '18px'}),
-                    html.Div([
-                        html.Label('N<sub>H₂</sub> threshold line (cm⁻²)', style=_CTRL_LABEL),
-                        dcc.Input(id='cr-atten-stop-rate', type='number',
-                                  value=cra.DEFAULT_STOPPING_RATE,
-                                  placeholder='1e20',
-                                  style={'width': '100%', 'fontSize': '13px'}),
-                    ], style={'flex': '1', 'minWidth': '160px', 'marginRight': '18px'}),
-                    html.Div([
-                        dcc.Checklist(
-                            id='cr-atten-options',
-                            options=[
-                                {'label': ' Padovani 𝓛 / 𝓗 / 𝓤 bands', 'value': 'padovani'},
-                                {'label': ' Extrapolate profiles to 10²⁵ cm⁻²', 'value': 'extrap'},
-                                {'label': ' Attenuation threshold line', 'value': 'threshold'},
-                            ],
-                            value=['padovani', 'extrap', 'threshold'],
-                            style={'fontSize': '13px'},
-                        ),
-                    ], style={'flex': '1.6', 'minWidth': '240px'}),
-                ], style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
-                          'padding': '12px 18px',
-                          'borderRadius': '8px', 'marginBottom': '10px'}),
-                html.Div([
-                    html.Button('Add current model', id='cr-atten-add', n_clicks=0,
-                                className='btn btn-primary',
-                                style={'marginRight': '8px'}),
-                    html.Button('Add all overlay matches', id='cr-atten-add-overlay', n_clicks=0,
-                                className='btn btn-overlay',
-                                style={'marginRight': '8px'}),
-                    html.Button('Clear profiles', id='cr-atten-clear', n_clicks=0,
-                                className='btn btn-ghost'),
-                ], style={'padding': '0 18px 10px'}),
-                html.Div([
-                    html.Label('Profiles to plot', style=_CTRL_LABEL),
-                    dcc.Checklist(id='cr-atten-active', options=[], value=[],
-                                  style={'fontSize': '13px'}),
-                ], style={'padding': '0 18px 12px'}),
-                dcc.Loading(id='loading-cr-atten', type='circle', children=[
-                    dcc.Graph(id='plot-cr-atten', figure=placeholder_fig(), config=_GRAPH_CFG),
-                ]),
-            ]),
-        ]),
-
-        # --- Attenuation impact (KoSens attenuation workflow) ---------------
-        dcc.Tab(label='Attenuation impact', value='attenimpact', style=_TAB_STYLE,
-                selected_style=_TAB_SEL, children=[
-            html.Div(style={'paddingTop': '10px'}, children=_atten_impact_page()),
         ]),
 
         # --- Page 10: observational map fit ---------------------------------
@@ -11799,9 +13274,9 @@ app.layout = html.Div(
                 html.Div([
                     html.Div([
                         html.Label('Intensity units (SIMLINE)', style=_CTRL_LABEL),
-                        dcc.RadioItems(id='fit-idef', options=SIMLINE_MAPFIT_IDEF_OPTIONS,
+                        _choice(id='fit-idef', options=SIMLINE_MAPFIT_IDEF_OPTIONS,
                                        value=SIMLINE_DEFAULT_IDEF, **_RADIO),
-                    ], style={'flex': '1.2', 'minWidth': '200px', 'marginRight': '18px'}),
+                    ], style={'flex': '1.2', 'minWidth': '200px', 'marginRight': '12px'}),
                     html.Div([
                         html.Label('3-D grid size (nz \u00d7 ny \u00d7 nx)', style=_CTRL_LABEL),
                         html.Div([
@@ -11809,30 +13284,30 @@ app.layout = html.Div(
                                       value=gf.DEFAULT_TARGET_SHAPE_3D[0],
                                       min=2, max=200, step=1,
                                       style={'width': '58px', 'padding': '7px 6px',
-                                             'fontSize': '13px', 'border': '1px solid #bbc',
+                                             'fontSize': '13px', 'border': '1px solid var(--border)',
                                              'borderRadius': '6px'}),
-                            html.Span(' \u00d7 ', style={'margin': '0 4px', 'color': '#666'}),
+                            html.Span(' \u00d7 ', style={'margin': '0 4px', 'color': 'var(--text-muted)'}),
                             dcc.Input(id='fit-ny', type='number',
                                       value=gf.DEFAULT_TARGET_SHAPE_3D[1],
                                       min=2, max=200, step=1,
                                       style={'width': '58px', 'padding': '7px 6px',
-                                             'fontSize': '13px', 'border': '1px solid #bbc',
+                                             'fontSize': '13px', 'border': '1px solid var(--border)',
                                              'borderRadius': '6px'}),
-                            html.Span(' \u00d7 ', style={'margin': '0 4px', 'color': '#666'}),
+                            html.Span(' \u00d7 ', style={'margin': '0 4px', 'color': 'var(--text-muted)'}),
                             dcc.Input(id='fit-nx', type='number',
                                       value=gf.DEFAULT_TARGET_SHAPE_3D[2],
                                       min=2, max=200, step=1,
                                       style={'width': '58px', 'padding': '7px 6px',
-                                             'fontSize': '13px', 'border': '1px solid #bbc',
+                                             'fontSize': '13px', 'border': '1px solid var(--border)',
                                              'borderRadius': '6px'}),
                         ]),
-                    ], style={'flex': '1.1', 'minWidth': '200px', 'marginRight': '18px'}),
+                    ], style={'flex': '1.1', 'minWidth': '200px', 'marginRight': '12px'}),
                     html.Div([
                         html.Label('Interpolation method', style=_CTRL_LABEL),
                         dcc.Dropdown(id='fit-method', options=INTERP_METHOD_OPTIONS,
                                      value=DEFAULT_INTERP_METHOD, clearable=False,
                                      style={'fontSize': '13px'}),
-                    ], style={'flex': '1', 'minWidth': '120px', 'marginRight': '18px'}),
+                    ], style={'flex': '1', 'minWidth': '120px', 'marginRight': '12px'}),
                     html.Div([
                         html.Label('Output directory', style=_CTRL_LABEL),
                         _path_browse_row(
@@ -11843,7 +13318,7 @@ app.layout = html.Div(
                     ], style={'flex': '2', 'minWidth': '220px'}),
                 ], className='kosma-panel',
                 style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
-                       'padding': '12px 18px'}),
+                       'padding': '10px 14px'}),
                 html.Div([
                     html.Div([
                         html.Label('Observed FITS maps (JSON: line \u2192 path)', style=_CTRL_LABEL),
@@ -11851,7 +13326,7 @@ app.layout = html.Div(
                             id='fit-maps-json', value='', placeholder=_MAP_FIT_MAPS_EXAMPLE,
                             style={'width': '100%', 'height': '120px', 'fontFamily': 'monospace',
                                    'fontSize': '12px', 'padding': '8px',
-                                   'border': '1px solid #bbc', 'borderRadius': '6px'}),
+                                   'border': '1px solid var(--border)', 'borderRadius': '6px'}),
                     ], style={'flex': '1', 'minWidth': '280px', 'marginRight': '14px'}),
                     html.Div([
                         html.Label('Map errors (JSON: line \u2192 scalar or FITS path)', style=_CTRL_LABEL),
@@ -11859,47 +13334,76 @@ app.layout = html.Div(
                             id='fit-errors-json', value='', placeholder=_MAP_FIT_ERRORS_EXAMPLE,
                             style={'width': '100%', 'height': '120px', 'fontFamily': 'monospace',
                                    'fontSize': '12px', 'padding': '8px',
-                                   'border': '1px solid #bbc', 'borderRadius': '6px'}),
+                                   'border': '1px solid var(--border)', 'borderRadius': '6px'}),
                     ], style={'flex': '1', 'minWidth': '240px'}),
                 ], style={'display': 'flex', 'padding': '0 18px 12px'}),
                 html.Div([
                     html.Div([
                         html.Label('χ² analysis pixel (row, col)', style=_CTRL_LABEL),
                         html.Div([
-                            dcc.Input(id='fit-chi2-i', type='number', value=98, min=0, step=1,
+                            dcc.Input(id='fit-chi2-i', type='number', value=98, min=0, max=NUM_INPUT_MAX, step=1,
                                       style={'width': '64px', 'padding': '7px 6px',
-                                             'fontSize': '13px', 'border': '1px solid #bbc',
+                                             'fontSize': '13px', 'border': '1px solid var(--border)',
                                              'borderRadius': '6px'}),
                             html.Span(', ', style={'margin': '0 4px'}),
-                            dcc.Input(id='fit-chi2-j', type='number', value=48, min=0, step=1,
+                            dcc.Input(id='fit-chi2-j', type='number', value=48, min=0, max=NUM_INPUT_MAX, step=1,
                                       style={'width': '64px', 'padding': '7px 6px',
-                                             'fontSize': '13px', 'border': '1px solid #bbc',
+                                             'fontSize': '13px', 'border': '1px solid var(--border)',
                                              'borderRadius': '6px'}),
                         ]),
-                    ], style={'flex': '1', 'minWidth': '160px', 'marginRight': '18px'}),
+                    ], style={'flex': '1', 'minWidth': '160px', 'marginRight': '12px'}),
                     html.Div([
                         html.Label('Fit options', style=_CTRL_LABEL),
-                        dcc.Checklist(
+                        _choice(multi=True, 
                             id='fit-options',
                             options=[
                                 {'label': ' create observed ratios', 'value': 'ratios'},
                                 {'label': ' create model ratios', 'value': 'model_ratios'},
                                 {'label': ' χ² analysis at pixel', 'value': 'chi2'},
                                 {'label': ' uncertainty maps (slow)', 'value': 'unc'},
+                                {'label': ' ε_att: refit with the attenuated overlay grid',
+                                 'value': 'atten'},
                             ],
-                            value=['ratios', 'model_ratios', 'chi2'],
+                            value=['ratios', 'model_ratios', 'chi2', 'atten'],
                             style={'fontSize': '13px'},
                         ),
-                    ], style={'flex': '2', 'minWidth': '260px', 'marginRight': '18px'}),
+                    ], style={'flex': '2', 'minWidth': '260px', 'marginRight': '12px'}),
                     html.Div([
                         html.Button('Run map fit', id='btn-run-map-fit', n_clicks=0,
                                     className='btn btn-success'),
                     ], style={'flex': '0', 'alignSelf': 'flex-end'}),
                 ], className='kosma-panel',
                 style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
-                       'padding': '12px 18px'}),
+                       'padding': '10px 14px'}),
+                _advanced_details('Map annotations (circles, scale bar)', html.Div([
+                    html.Div([
+                        html.Label('Distance (pc)', style=_CTRL_LABEL),
+                        dcc.Input(id='fit-ov-dist', type='number', min=0, max=NUM_INPUT_MAX, debounce=True,
+                                  placeholder='e.g. 1400', style={'width': '110px'}),
+                    ], style={**_CTRL_BOX, 'minWidth': '120px'}),
+                    html.Div([
+                        html.Label('Circle radii (pc, comma-separated)', style=_CTRL_LABEL),
+                        dcc.Input(id='fit-ov-radii', type='text', debounce=True,
+                                  placeholder='e.g. 0.5, 1', style={'width': '160px'}),
+                    ], style={**_CTRL_BOX, 'minWidth': '170px'}),
+                    html.Div([
+                        html.Label('Scale bar (pc)', style=_CTRL_LABEL),
+                        dcc.Input(id='fit-ov-scale', type='number', min=0, max=NUM_INPUT_MAX, debounce=True,
+                                  style={'width': '90px'}),
+                    ], style={**_CTRL_BOX, 'minWidth': '100px'}),
+                    html.Div([
+                        html.Label('Colour', style=_CTRL_LABEL),
+                        dcc.Input(id='fit-ov-color', type='text', value='red', debounce=True,
+                                  style={'width': '80px'}),
+                    ], style={**_CTRL_BOX, 'minWidth': '90px'}),
+                    html.Div('Circles of physical radius at the map centre and a scale bar '
+                             'on every fitted map (KoSens circles_pc / scale_pc).',
+                             style={'fontSize': '12px', 'opacity': 0.8, 'alignSelf': 'center'}),
+                ], className='kosma-panel',
+                   style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
+                          'padding': '10px 18px', 'margin': '8px 0'})),
                 html.Div(id='fit-available-lines',
-                         style={'padding': '0 18px 8px', 'fontSize': '12px', 'color': '#666'}),
+                         style={'padding': '0 18px 8px', 'fontSize': '12px', 'color': 'var(--text-muted)'}),
                 html.Div(id='fit-status', style={'padding': '0 18px 12px'}),
                 dcc.Store(id='fit-state', data=0),
                 dcc.Loading(type='circle', children=[
@@ -11923,19 +13427,25 @@ app.layout = html.Div(
                         dcc.Graph(id='plot-fit-dominant', figure=placeholder_fig(),
                                   config=_GRAPH_CFG, style={'width': '100%'}),
                     ], style={'padding': '0 18px', 'marginBottom': '12px'}),
+                    html.Div([
+                        dcc.Graph(id='plot-fit-delta-att', figure=placeholder_fig(
+                                      'Load an attenuated SIMLINE overlay and run a fit '
+                                      'for the ε_att map'),
+                                  config=_GRAPH_CFG, style={'width': '100%'}),
+                    ], style={'padding': '0 18px', 'marginBottom': '12px'}),
                     html.H4('Fitted parameter distributions', style={'padding': '0 18px',
                                                                     'margin': '8px 0 4px',
-                                                                    'fontSize': '15px', 'color': '#444'}),
+                                                                    'fontSize': '15px', 'color': 'var(--text)'}),
                     html.Div([
                         dcc.Graph(id='plot-fit-kde', figure=placeholder_fig(),
                                   config=_GRAPH_CFG, style={'width': '100%'}),
                     ], style={'padding': '0 18px', 'marginBottom': '12px'}),
                     html.H4('χ² analysis at pixel', style={'padding': '0 18px', 'margin': '8px 0 4px',
-                                                           'fontSize': '15px', 'color': '#444'}),
+                                                           'fontSize': '15px', 'color': 'var(--text)'}),
                     html.P('Set row/column above and re-run the fit, or change the pixel after a fit '
                              'to refresh the detailed χ² plots.',
                            style={'padding': '0 18px', 'margin': '0 0 8px', 'fontSize': '12px',
-                                  'color': '#666'}),
+                                  'color': 'var(--text-muted)'}),
                     html.Div([
                         dcc.Graph(id='plot-fit-chi2-pixel', figure=placeholder_fig(),
                                   config=_GRAPH_CFG, style={'width': '100%'}),
@@ -11963,13 +13473,13 @@ app.layout = html.Div(
 
     # Footer with export options
     html.Div([
-        html.Hr(style={'margin': '16px 0 12px', 'borderColor': '#e8e8e8'}),
+        html.Hr(style={'margin': '16px 0 12px', 'borderColor': 'var(--border)'}),
         html.Div([
             html.Div([
                 html.Span('\u2B07 Export format for camera icon:', 
                           style={'fontWeight': '600', 'fontSize': '12px',
-                                 'marginRight': '10px', 'color': '#555'}),
-                dcc.RadioItems(
+                                 'marginRight': '10px', 'color': 'var(--text)'}),
+                _choice(
                     id='export-format-selector',
                     options=[
                         {'label': ' PNG (raster)', 'value': 'png'},
@@ -11989,10 +13499,10 @@ app.layout = html.Div(
                 ' camera icon on any plot. ',
                 html.Span('SVG', style={'fontWeight': '600'}),
                 ' is vector format \u2014 ideal for papers & easily converted to PDF.',
-            ], style={'color': '#888', 'fontSize': '12px', 'textAlign': 'center', 'margin': '8px 0 6px'}),
-        ], className='kosma-panel', style={'padding': '12px 18px', 'marginBottom': '10px'}),
+            ], style={'color': 'var(--text-muted)', 'fontSize': '12px', 'textAlign': 'center', 'margin': '8px 0 6px'}),
+        ], className='kosma-panel', style={'padding': '10px 14px', 'marginBottom': '10px'}),
         html.P('PRISMA  \u2014  PDR Results Interactive Simulation Mapping & Analysis',
-               style={'color': '#ccc', 'fontSize': '11px', 'textAlign': 'center', 'margin': '0 0 6px'}),
+               style={'color': 'var(--text-muted)', 'fontSize': '11px', 'textAlign': 'center', 'margin': '0 0 6px'}),
     ]),
 ])
 
@@ -12962,11 +14472,11 @@ def update_labels(*values):
     if phys.get('av_max') is not None:
         info.append(html.Span(
             f'Max A_V = {_format_phys_number(phys["av_max"])} mag',
-            style={'marginRight': '20px', 'color': '#555'}))
+            style={'marginRight': '20px', 'color': 'var(--text)'}))
     if phys.get('radius') is not None:
         info.append(html.Span(
             f'Radius = {_format_phys_number(phys["radius"])} pc',
-            style={'marginRight': '20px', 'color': '#555'}))
+            style={'marginRight': '20px', 'color': 'var(--text)'}))
 
     if filepath:
         fname = os.path.basename(filepath)
@@ -12986,7 +14496,7 @@ def update_labels(*values):
             fname = 'Chemistry model point (no HDF5)'
     else:
         fname = '(no matching file)'
-    info.append(html.Span(fname, style={'color': '#999', 'fontSize': '12px'}))
+    info.append(html.Span(fname, style={'color': 'var(--text-muted)', 'fontSize': '12px'}))
     return labels + [info]
 
 
@@ -13010,7 +14520,7 @@ def _slice_axis_ui(plane, idx):
     fixed_lbl = f'{role}: {sdef["name"]}{unit}'
     value_style = {
         'textAlign': 'center', 'color': sdef['color'],
-        'fontSize': '11px', 'marginTop': '2px', 'fontWeight': '600',
+        'fontSize': '13px', 'marginTop': '2px', 'fontWeight': '600',
     }
     return fixed_lbl, f'{disp}{unit}', value_style
 
@@ -13208,17 +14718,20 @@ def update_int_spag_panels_layout(_loaded, _simline_state):
 
 @app.callback(
     [Output(f'grid-rgb-sp{i}', 'options') for i in range(3)]
-    + [Output(f'grid-rgb-sp{i}', 'value') for i in range(3)],
+    + [Output(f'grid-rgb-sp{i}', 'value') for i in range(3)]
+    + [Output('grid-rgb-extra', 'options'), Output('grid-rgb-extra', 'value')],
     Input('grid-loaded', 'data'),
     Input('simline-state', 'data'),
 )
 def update_grid_rgb_species(_loaded, _simline_state):
     if not _grid or not _grid_has_hdf5():
-        return ([],) * 3 + (None,) * 3
+        return ([],) * 3 + (None,) * 3 + ([], [])
     species = list(_grid.get('species') or [])
     opts = [{'label': s, 'value': s} for s in species]
     defaults = _default_rgb_grid_species(species)
-    return (*[opts] * 3, *defaults)
+    extra = [k for k in (sp if sp in species else rgb_phase.exact_base_key(sp, species)
+                         for sp in RGB_EXTRA_DEFAULT_SPECIES) if k]
+    return (*[opts] * 3, *defaults, opts, extra)
 
 
 @app.callback(
@@ -13573,6 +15086,7 @@ def update_one_grid_ratio(slice_idx, zscale, _overlay_state, shift_dir,
      Input('grid-rgb-cf1', 'value'),
      Input('grid-rgb-cf2', 'value'),
      Input('grid-rgb-transitions', 'value'),
+     Input('grid-rgb-extra', 'value'),
      Input('interp-ny', 'value'),
      Input('interp-nx', 'value'),
      Input('interp-x-lim', 'value'),
@@ -13584,7 +15098,7 @@ def update_one_grid_ratio(slice_idx, zscale, _overlay_state, shift_dir,
     + _rgb_slice_slider_inputs,
     prevent_initial_call=True,
 )
-def update_grid_rgb_plots(sp0, sp1, sp2, cf0, cf1, cf2, transitions,
+def update_grid_rgb_plots(sp0, sp1, sp2, cf0, cf1, cf2, transitions, extra,
                           interp_ny, interp_nx, interp_x_lim, interp_y_lim,
                           interp_method, interp_clip, plot_theme, _loaded,
                           *slice_indices):
@@ -13598,6 +15112,7 @@ def update_grid_rgb_plots(sp0, sp1, sp2, cf0, cf1, cf2, transitions,
         [sp0, sp1, sp2], transitions or [], list(slice_indices),
         interp_config=icfg, theme=theme,
         conv_factors=_parse_rgb_conv_factors(cf0, cf1, cf2),
+        extra_species=extra or [],
     )
 
 
@@ -13617,7 +15132,7 @@ def handle_overlay(n_load, n_clear, directory, recursive, state):
 
     if trigger.startswith('btn-clear-overlay'):
         clear_overlay()
-        return (html.Span('Overlay cleared.', style={'color': '#888'}), state + 1)
+        return (html.Span('Overlay cleared.', style={'color': 'var(--text-muted)'}), state + 1)
 
     if not _grid:
         return (html.Span('\u2717  Load a main grid first.',
@@ -13633,7 +15148,7 @@ def handle_overlay(n_load, n_clear, directory, recursive, state):
         html.Span('\u2713  Overlay ', style={'color': '#8c564b', 'fontWeight': '700'}),
         html.Code(ov['directory']),
         html.Span(f'   {ov["n_files"]} models (dashed){note}',
-                  style={'color': '#555', 'marginLeft': '10px'}),
+                  style={'color': 'var(--text)', 'marginLeft': '10px'}),
     ])
     return (status, state + 1)
 
@@ -13654,7 +15169,7 @@ def handle_simline_overlay(n_load, n_clear, directory, recursive, state):
 
     if trigger.startswith('btn-clear-simline-overlay'):
         clear_simline_overlay()
-        return (html.Span('Overlay SIMLINE cleared.', style={'color': '#888'}), state + 1)
+        return (html.Span('Overlay SIMLINE cleared.', style={'color': 'var(--text-muted)'}), state + 1)
 
     if not _simline:
         return (html.Span('\u2717  Load a main SIMLINE directory first.',
@@ -13671,7 +15186,7 @@ def handle_simline_overlay(n_load, n_clear, directory, recursive, state):
         html.Span('\u2713  Overlay SIMLINE ', style={'color': '#8c564b', 'fontWeight': '700'}),
         html.Code(sl['directory']),
         html.Span(f'   {sl["n_files"]} files{note}',
-                  style={'color': '#555', 'marginLeft': '10px'}),
+                  style={'color': 'var(--text)', 'marginLeft': '10px'}),
     ])
     return (status, state + 1)
 
@@ -13692,7 +15207,7 @@ def handle_chem_overlay(n_load, n_clear, directory, recursive, state):
 
     if trigger.startswith('btn-clear-chem-overlay'):
         clear_chem_overlay()
-        return (html.Span('Overlay chemistry cleared.', style={'color': '#888'}),
+        return (html.Span('Overlay chemistry cleared.', style={'color': 'var(--text-muted)'}),
                 state + 1)
 
     if not _chem:
@@ -13712,7 +15227,7 @@ def handle_chem_overlay(n_load, n_clear, directory, recursive, state):
         html.Span('\u2713  Overlay chemistry ', style={'color': '#8c564b', 'fontWeight': '700'}),
         html.Code(ch['directory']),
         html.Span(f'   {ch["n_files"]} models (dashed){note}',
-                  style={'color': '#555', 'marginLeft': '10px'}),
+                  style={'color': 'var(--text)', 'marginLeft': '10px'}),
     ])
     return (status, state + 1)
 
@@ -13741,7 +15256,7 @@ def handle_chem(n_load, n_clear, directory, recursive, state, cur_species):
         clear_chem()
         clear_chem_only_grid()
         grid_sync = _empty_grid_sync(loaded=False) if was_chem_only else no_grid_sync
-        return (html.Span('Chemistry grid cleared.', style={'color': '#888'}),
+        return (html.Span('Chemistry grid cleared.', style={'color': 'var(--text-muted)'}),
                 state + 1, [], None) + tuple(grid_sync)
 
     try:
@@ -13782,7 +15297,7 @@ def handle_chem(n_load, n_clear, directory, recursive, state, cur_species):
         html.Span('\u2713  Chemistry ', style={'color': '#2ca02c', 'fontWeight': '700'}),
         html.Code(ch['directory']),
         html.Span(f'   {ch["n_files"]} models, {len(species)} species{note}{mode_note}',
-                  style={'color': '#555', 'marginLeft': '10px'}),
+                  style={'color': 'var(--text)', 'marginLeft': '10px'}),
     ])
     return (status, state + 1, opts, value) + tuple(grid_sync)
 
@@ -13790,7 +15305,7 @@ def handle_chem(n_load, n_clear, directory, recursive, state, cur_species):
 def _hdf5_angle_ui():
     """[angle options, angle value, wrap style, int-idef, ie-int-idef] for HDF5 intensities."""
     angles = _simline.get('angles') or ()
-    hidden = {'display': 'none', 'minWidth': '160px', 'marginRight': '18px'}
+    hidden = {'display': 'none', 'minWidth': '160px', 'marginRight': '12px'}
     if not angles:
         return [[], None, hidden, dash.no_update, dash.no_update]
     opts = [{'label': f' {a}\u00B0', 'value': a} for a in angles]
@@ -13868,7 +15383,7 @@ def handle_simline(n_load, n_clear, directory, recursive, state,
             _load_hdf5_simline()
         if _simline:
             msg += '  Using intensities from the loaded HDF5 grid.'
-        return ([html.Span(msg, style={'color': '#888'}), state + 1]
+        return ([html.Span(msg, style={'color': 'var(--text-muted)'}), state + 1]
                 + _simline_species_ui(_simline.get('species', []),
                                       cur_species, cur_ie_species, cur_sp_species)
                 + grid_sync)
@@ -13903,7 +15418,7 @@ def handle_simline(n_load, n_clear, directory, recursive, state,
         html.Span('\u2713  SIMLINE ', style={'color': '#9467bd', 'fontWeight': '700'}),
         html.Code(sl['directory']),
         html.Span(f'   {sl["n_files"]} files, {len(sl["species"])} species{pv_note}{note}{mode_note}',
-                  style={'color': '#555', 'marginLeft': '10px'}),
+                  style={'color': 'var(--text)', 'marginLeft': '10px'}),
     ])
     return ([status, state + 1]
             + _simline_species_ui(sl['species'], cur_species, cur_ie_species, cur_sp_species)
@@ -14124,24 +15639,154 @@ def update_cv_hdu(path):
     return cv.default_hdu_index(path)
 
 
+def _cv_numeric_circle(cube, ra_arcsec, dec_arcsec, radius, unit, distance_pc):
+    """Circle region from typed numbers (KoSens ``_draw_pc_circles``: map centre, pc radius)."""
+    ra_ax, dec_ax = np.asarray(cube.ra_axis_arcmin, float), np.asarray(cube.dec_axis_arcmin, float)
+    x = float(ra_arcsec) / 60.0 if ra_arcsec is not None else 0.5 * (ra_ax.min() + ra_ax.max())
+    y = float(dec_arcsec) / 60.0 if dec_arcsec is not None else 0.5 * (dec_ax.min() + dec_ax.max())
+    if radius is None or radius <= 0:
+        bmaj = (cube.header_extras or {}).get('BMAJ')
+        r_arcsec = 0.5 * float(bmaj) * 3600.0 if bmaj else 2.0 * cube.grid_step_arcsec
+    elif unit == 'pc':
+        r_arcsec = cv.physical_radius_arcsec(radius, distance_pc)
+    else:
+        r_arcsec = float(radius)
+    return cv.circle_shape(x, y, r_arcsec / 60.0)
+
+
+@app.callback(
+    Output('pr-dom-species', 'options'),
+    Output('pr-dom-species', 'value'),
+    Input('pr-state', 'data'),
+    State('pr-dom-species', 'value'),
+    prevent_initial_call=True,
+)
+def sync_probe_dominance_species(_state, current):
+    grids = (_probe_results or {}).get('grids') or {}
+    species = [s for s in grids if '/' not in str(s)]
+    kept = [s for s in _as_str_list(current) if s in grids]
+    return [{'label': s, 'value': s} for s in grids], kept or species[:4]
+
+
+_PR_DOM_COLS = [
+    ('species', 'Species', ''), ('slice', 'n_H', 'phys'),
+    ('frac_cr', 'CR-dominated', 'pct'), ('frac_fuv', 'FUV-dominated', 'pct'),
+    ('frac_mixed', 'Mixed', 'pct'), ('valid_frac', 'Valid', 'pct'),
+    ('range_log_X', 'range log X', 'err'), ('median_abs_S_zeta', 'med |S_ζ|', 'err'),
+    ('median_abs_S_chi', 'med |S_χ|', 'err'), ('median_iso_slope', 'iso slope', 'err'),
+]
+
+
+@app.callback(
+    Output('pr-plot-dominance', 'figure'),
+    Output('pr-dominance-table', 'children'),
+    Input('pr-dom-species', 'value'),
+    Input('pr-dom-slices', 'value'),
+    Input('pr-dom-baseline', 'value'),
+    Input('pr-dom-ratio', 'value'),
+    Input('pr-dom-minab', 'value'),
+    Input('pr-dom-smooth', 'value'),
+    Input('plot-theme', 'value'),
+    prevent_initial_call=True,
+)
+def update_probe_dominance(species, slices_text, baseline, ratio, min_ab, smooth, plot_theme):
+    theme = _parse_plot_theme(plot_theme)
+    grids = (_probe_results or {}).get('grids') or {}
+    species = [s for s in _as_str_list(species) if s in grids]
+    if not grids or not species:
+        return placeholder_fig('Compute a ranking, then pick species', theme=theme), ''
+    slices = []
+    for part in str(slices_text or '').replace(';', ',').split(','):
+        try:
+            if float(part) > 0:
+                slices.append(float(part))
+        except ValueError:
+            continue
+    slices = slices or [1e3, 1e5]
+    panels, rows = pr.cr_fuv_dominance(
+        grids, species, slice_values=slices,
+        dominance_ratio=float(ratio or 3.0),
+        min_abundance=float(min_ab) if min_ab is not None else pr.DEFAULT_MIN_ABUNDANCE,
+        baseline_dex=float(baseline or 1.0), smooth=bool(smooth and 'on' in smooth))
+    fig = pr.fig_cr_fuv_dominance(panels, species, len(slices),
+                                  theme_colors=_theme_colors(theme), fmt=format_species_html)
+    if fig is None:
+        return placeholder_fig('The ranking grids have no (χ₀, ζ) plane', theme=theme), ''
+    return fig, _probe_table(rows, _PR_DOM_COLS, max_rows=200)
+
+
+@app.callback(
+    Output('ai-obs-download', 'data'),
+    Input('ai-obs-csv', 'n_clicks'),
+    Input('ai-obs-compact', 'n_clicks'),
+    Input('ai-obs-tex', 'n_clicks'),
+    State('ai-d-grid', 'value'),
+    prevent_initial_call=True,
+)
+def download_observer_table(_n_csv, _n_compact, _n_tex, d_grid):
+    tab = (((_atten_results or {}).get('workflow') or {}).get('observer') or {}).get(
+        d_grid or 'native')
+    if tab is None or not len(tab):
+        raise PreventUpdate
+    if dash.callback_context.triggered_id == 'ai-obs-tex':
+        return dcc.send_string(ac.observer_table_tex(tab), 'observer_error_table_condensed.tex')
+    if dash.callback_context.triggered_id == 'ai-obs-compact':
+        return dcc.send_data_frame(ac.observer_compact(tab).to_csv,
+                                   'observer_error_table_compact.csv', index=False)
+    return dcc.send_data_frame(tab.to_csv, 'observer_error_table.csv', index=False)
+
+
 @app.callback(
     Output('cv-selection', 'data'),
     Input('cv-file', 'value'),
     Input('cv-hdu', 'value'),
     Input('plot-cv-map', 'clickData'),
     Input('plot-cv-map', 'selectedData'),
+    Input('plot-cv-map', 'relayoutData'),
+    Input('cv-add-circle', 'n_clicks'),
+    Input('cv-clear-regions', 'n_clicks'),
     State('cv-v-low', 'value'),
     State('cv-v-high', 'value'),
     State('cv-map-metric', 'value'),
     State('cv-channel', 'value'),
+    State('cv-selection', 'data'),
+    State('cv-circ-ra', 'value'),
+    State('cv-circ-dec', 'value'),
+    State('cv-circ-r', 'value'),
+    State('cv-circ-unit', 'value'),
+    State('cv-circ-dist', 'value'),
     prevent_initial_call=True,
 )
-def update_cv_selection(path, hdu, click_data, selected_data,
-                        v_low, v_high, metric, channel_index):
+def update_cv_selection(path, hdu, click_data, selected_data, relayout, _n_add, _n_clear,
+                        v_low, v_high, metric, channel_index, current,
+                        circ_ra, circ_dec, circ_r, circ_unit, circ_dist):
     trig = dash.callback_context.triggered[0]['prop_id'] if dash.callback_context.triggered else ''
     cube, err = _load_cv_cube(path, hdu)
     if cube is None:
         return None
+    shapes = list((current or {}).get('shapes') or [])
+
+    if trig.startswith('cv-clear-regions'):
+        trig = 'cv-file'  # back to the brightest pixel
+    elif trig.startswith('cv-add-circle') or trig.endswith('relayoutData'):
+        if trig.startswith('cv-add-circle'):
+            try:
+                shapes.append(_cv_numeric_circle(cube, circ_ra, circ_dec, circ_r,
+                                                 circ_unit, circ_dist))
+            except ValueError:
+                raise PreventUpdate
+        else:
+            new = cv.apply_relayout_shapes(relayout, shapes)
+            if new is None:
+                raise PreventUpdate  # zoom / pan only
+            shapes = new
+        if not shapes:
+            trig = 'cv-file'
+        else:
+            rows = cv.rows_in_shapes(cube, shapes)
+            sky = cv.selection_sky(cube, rows) if rows else {}
+            return {'kind': 'region', 'rows': rows, 'shapes': shapes,
+                    'iy': sky.get('iy'), 'ix': sky.get('ix')}
 
     if trig.startswith('cv-file') or trig.startswith('cv-hdu'):
         try:
@@ -14253,12 +15898,133 @@ def update_cv_map(path, hdu, metric, v_low, v_high, colorscale, zscale,
     Input('cv-hdu', 'value'),
     Input('cv-colorscale', 'value'),
     Input('plot-theme', 'value'),
+    Input('cv-ppv-overlays', 'value'),
 )
-def update_cv_ppv(path, hdu, colorscale, plot_theme):
+def update_cv_ppv(path, hdu, colorscale, plot_theme, overlays):
     return fig_cube_ppv(
         path, hdu, _parse_grid_colorscale(colorscale),
+        theme=_parse_plot_theme(plot_theme), overlays=overlays,
+    )
+
+
+@app.callback(
+    Output('cv-ppv-overlays', 'options'),
+    Input('cv-ppv-ovl-path', 'value'),
+    Input('cv-path', 'value'),
+    Input('cv-file', 'value'),
+    State('cv-ppv-overlays', 'value'),
+)
+def update_cv_ppv_overlay_options(ovl_path, main_path, main_file, selected):
+    """Cubes in the overlay folder (default: the main cube's folder), minus the main
+    cube; already-picked cubes stay listed so overlays can mix folders."""
+    opts = cv.list_cube_fits(ovl_path or main_path or '')
+    opts = [o for o in opts if o['value'] != main_file]
+    listed = {o['value'] for o in opts}
+    for p in selected or []:
+        if p not in listed and p != main_file:
+            opts.append({'label': f'{os.path.basename(p)}  —  '
+                                  f'{cv.species_label_from_path(p)}  ({os.path.dirname(p)})',
+                         'value': p})
+    return opts
+
+
+@app.callback(
+    Output('plot-cv-chmaps', 'figure'),
+    Input('cv-file', 'value'),
+    Input('cv-hdu', 'value'),
+    Input('cv-chmap-vstart', 'value'),
+    Input('cv-chmap-vend', 'value'),
+    Input('cv-chmap-bin', 'value'),
+    Input('cv-colorscale', 'value'),
+    Input('cv-zscale', 'value'),
+    Input('plot-theme', 'value'),
+)
+def update_cv_chmaps(path, hdu, v_start, v_end, bin_kms, colorscale, zscale, plot_theme):
+    return fig_cube_channel_maps(
+        path, hdu, v_start, v_end, bin_kms,
+        _parse_grid_colorscale(colorscale), zscale or 'linear',
         theme=_parse_plot_theme(plot_theme),
     )
+
+
+@app.callback(
+    Output('plot-cv-pvcut', 'figure'),
+    Input('cv-file', 'value'),
+    Input('cv-hdu', 'value'),
+    Input('cv-pv-ra0', 'value'),
+    Input('cv-pv-dec0', 'value'),
+    Input('cv-pv-ra1', 'value'),
+    Input('cv-pv-dec1', 'value'),
+    Input('cv-pv-width', 'value'),
+    Input('cv-v-low', 'value'),
+    Input('cv-v-high', 'value'),
+    Input('cv-colorscale', 'value'),
+    Input('cv-zscale', 'value'),
+    Input('plot-theme', 'value'),
+)
+def update_cv_pvcut(path, hdu, ra0, dec0, ra1, dec1, width, v_low, v_high,
+                    colorscale, zscale, plot_theme):
+    return fig_cube_pv_cut(
+        path, hdu, ra0, dec0, ra1, dec1, width, v_low, v_high,
+        _parse_grid_colorscale(colorscale), zscale or 'linear',
+        theme=_parse_plot_theme(plot_theme),
+    )
+
+
+def pv_cut_from_relayout(relayout, current):
+    """New (ra0, dec0, ra1, dec1) from a PV-map relayout event, or None if unrelated.
+
+    Dragging the cut gives ``shapes[0].x0`` ... keys (only the moved end when an
+    endpoint is dragged); drawing with the line tool gives the full ``shapes``
+    list, whose last map-panel line becomes the cut.
+    """
+    if not relayout:
+        return None
+    shapes = relayout.get('shapes')
+    if isinstance(shapes, list):
+        lines = [sh for sh in shapes if sh.get('type') == 'line'
+                 and sh.get('xref', 'x') == 'x' and sh.get('yref', 'y') == 'y']
+        if not lines:
+            return None
+        sh = lines[-1]
+        new = [sh.get('x0'), sh.get('y0'), sh.get('x1'), sh.get('y1')]
+    else:
+        keys = ('shapes[0].x0', 'shapes[0].y0', 'shapes[0].x1', 'shapes[0].y1')
+        if not any(k in relayout for k in keys):
+            return None
+        new = [relayout.get(k, c) for k, c in zip(keys, current)]
+    if any(_cv_float(x) is None for x in new):
+        return None
+    return tuple(round(float(x), 3) for x in new)
+
+
+@app.callback(
+    Output('cv-pv-ra0', 'value'),
+    Output('cv-pv-dec0', 'value'),
+    Output('cv-pv-ra1', 'value'),
+    Output('cv-pv-dec1', 'value'),
+    Input('plot-cv-pvcut', 'relayoutData'),
+    State('cv-pv-ra0', 'value'),
+    State('cv-pv-dec0', 'value'),
+    State('cv-pv-ra1', 'value'),
+    State('cv-pv-dec1', 'value'),
+    State('cv-file', 'value'),
+    State('cv-hdu', 'value'),
+    prevent_initial_call=True,
+)
+def update_cv_pv_inputs(relayout, ra0, dec0, ra1, dec1, path, hdu):
+    current = [ra0, dec0, ra1, dec1]
+    if any(_cv_float(x) is None for x in current):
+        # inputs still on 'auto': the shape being dragged is the default cut
+        cube, _err = _load_cv_cube(path, hdu)
+        if cube is None:
+            raise PreventUpdate
+        (a, b), (c, d) = cv.default_pv_cut(cube)
+        current = [a, b, c, d]
+    new = pv_cut_from_relayout(relayout, current)
+    if new is None:
+        raise PreventUpdate
+    return new
 
 
 @app.callback(
@@ -14276,6 +16042,12 @@ def update_cv_gauss_rows(n, amps, centers, fwhms):
     Output('plot-cv-spectrum', 'figure'),
     Output('cv-stats', 'children'),
     Output('cv-line-table', 'children'),
+    # same-callback circular outputs: fitted numbers go back into the boxes left
+    # on auto (Dash allows this within one callback and does not re-trigger it)
+    Output({'type': 'cv-g-amp', 'index': ALL}, 'value'),
+    Output({'type': 'cv-g-v0', 'index': ALL}, 'value'),
+    Output({'type': 'cv-g-fwhm', 'index': ALL}, 'value'),
+    Output('cv-g-shown', 'data'),
     Input('cv-file', 'value'),
     Input('cv-hdu', 'value'),
     Input('cv-selection', 'data'),
@@ -14295,16 +16067,27 @@ def update_cv_gauss_rows(n, amps, centers, fwhms):
     Input('cv-eu-max', 'value'),
     Input('cv-channel', 'value'),
     Input('plot-theme', 'value'),
+    Input('cv-g-reset', 'n_clicks'),
+    State('cv-g-shown', 'data'),
 )
 def update_cv_spectrum(path, hdu, selection, spec_mode, v_low, v_high, n_gauss, do_fit,
                        gauss_amps, gauss_centers, gauss_fwhms, gauss_lock,
                        xaxis, linecat, mark_lines, v_source, eu_max,
-                       channel_index, plot_theme):
-    fig, summary, line_table = fig_cube_spectrum(
+                       channel_index, plot_theme, _reset, shown):
+    # all triggers, not just the first: typing in a box then clicking Reset commits
+    # the box (blur) in the same update as the click
+    reset = any(t.get('prop_id', '').startswith('cv-g-reset.')
+                for t in dash.callback_context.triggered or [])
+    columns = [gauss_amps, gauss_centers, gauss_fwhms]
+    if reset:  # Reset to auto: drop the user's numbers, refit from auto-guesses
+        guesses = [[None] * len(c) for c in columns]
+    else:
+        guesses = user_guesses(columns, shown)
+    fig, summary, line_table, fit_guess = fig_cube_spectrum(
         path, hdu, selection, v_low, v_high, n_gauss,
         do_fit='on' in (do_fit or []),
         theme=_parse_plot_theme(plot_theme),
-        gauss_amps=gauss_amps, gauss_centers=gauss_centers, gauss_fwhms=gauss_fwhms,
+        gauss_amps=guesses[0], gauss_centers=guesses[1], gauss_fwhms=guesses[2],
         gauss_lock=_lock_filled(gauss_lock),
         xaxis=xaxis or 'velocity',
         line_catalog=linecat or DEFAULT_CUBE_LINECAT,
@@ -14314,9 +16097,11 @@ def update_cv_spectrum(path, hdu, selection, spec_mode, v_low, v_high, n_gauss, 
         spec_mode=spec_mode or DEFAULT_CUBE_SPEC_MODE,
         channel_index=channel_index,
     )
+    boxes, shown_new = guess_boxes_after_fit(fit_guess, columns, shown, reset=reset)
     return (fig,
             summary if summary is not None else html.Div(),
-            line_table if line_table is not None else html.Div())
+            line_table if line_table is not None else html.Div(),
+            *boxes, shown_new)
 
 
 @app.callback(
@@ -14365,6 +16150,8 @@ def _ie_quantity_unit(quantity):
         return 'cm^-3'
     if quantity == 'xe':
         return 'n(e-)/nH'
+    if quantity == 'atten_mass_frac':
+        return 'M_att/M_clump'
     if quantity.startswith('species:'):
         return 'rel. abund.'
     if quantity.startswith('cdens:'):
@@ -15090,15 +16877,88 @@ def populate_apdf_species(_loaded, _subtab, current):
     return opts, value
 
 
+_REGIME_DEFAULTS = {'heat': ('Cosmic rays', 'Photo-electric effect'),
+                    'cool': ('C+', 'O 63mu')}
+
+
+def _parse_lim(text):
+    """``'a, b'`` → ``(a, b)`` sorted, or None."""
+    try:
+        lo, hi = (float(p) for p in str(text).replace(';', ',').split(',') if p.strip())
+    except (TypeError, ValueError):
+        return None
+    return (min(lo, hi), max(lo, hi))
+
+
+@app.callback(
+    Output('therm-regime-ch1', 'options'), Output('therm-regime-ch1', 'value'),
+    Output('therm-regime-ch2', 'options'), Output('therm-regime-ch2', 'value'),
+    Input('grid-loaded', 'data'),
+    Input('therm-regime-kind', 'value'),
+    State('therm-regime-ch1', 'value'),
+    State('therm-regime-ch2', 'value'),
+)
+def update_regime_channels(_loaded, kind, ch1, ch2):
+    comps = _heat_components if kind == 'heat' else _cool_components
+    labels = [lbl for lbl, _ in comps]
+    if kind == 'heat':
+        labels.append(_GAS_GRAIN_HEAT_LABEL)
+    names = _HEAT_NAME_DICT if kind == 'heat' else _COOL_NAME_DICT
+    opts = [{'label': names.get(lbl, lbl), 'value': lbl} for lbl in labels]
+    d1, d2 = _REGIME_DEFAULTS.get(kind, (None, None))
+    ch1 = ch1 if ch1 in labels else (d1 if d1 in labels else (labels[:1] or [None])[0])
+    ch2 = ch2 if ch2 in labels + ['all'] and ch2 != ch1 else (
+        d2 if d2 in labels else 'all')
+    return opts, ch1, [{'label': 'all other channels', 'value': 'all'}] + opts, ch2
+
+
+@app.callback(
+    Output('plot-rate-regime', 'figure'),
+    _slider_value_inputs
+    + [Input('therm-regime-kind', 'value'),
+       Input('therm-regime-ch1', 'value'),
+       Input('therm-regime-ch2', 'value'),
+       Input('therm-regime-y', 'value'),
+       Input('therm-regime-xlim', 'value'),
+       Input('therm-regime-ylim', 'value'),
+       Input('thermal-subtabs', 'value'),
+       Input('overlay-state', 'data'),
+       Input('plot-theme', 'value')],
+    prevent_initial_call=True,
+)
+def update_rate_regime_plot(*args_in):
+    values = list(args_in[:N_PARAMS])
+    kind, ch1, ch2, y_param, xlim, ylim, subtab, _ov, plot_theme = args_in[N_PARAMS:]
+    if subtab != 'thermal-crir':
+        raise PreventUpdate
+    theme = _parse_plot_theme(plot_theme)
+    if not (_grid and _grid.get('has_hdf5')):
+        return placeholder_fig('The rate-regime map requires an HDF5 model grid', theme=theme)
+    y_param = y_param or 'density'
+    data = _grid_heat_cool_dataframes(values, y_param=y_param)
+    if not data:
+        return placeholder_fig('No models for the current slider selection', theme=theme)
+    data_att = _grid_heat_cool_dataframes(values, overlay=True, y_param=y_param) \
+        if _overlay else None
+    y_label = ('log\u2081\u2080(\u03C7) [Draine]' if y_param == 'fuv'
+               else 'log\u2081\u2080(n) [cm\u207B\u00B3]')
+    return fig_rate_regime_boundary(data, ch1, ch2 or 'all', kind=kind or 'heat',
+                                    data_atten=data_att, y_label=y_label,
+                                    x_lim=_parse_lim(xlim), y_lim=_parse_lim(ylim),
+                                    theme=theme)
+
+
 @app.callback(
     Output('plot-heat-contrib-crir', 'figure'),
     Output('plot-abs-heatcool-crir', 'figure'),
+    Output('plot-heatcool-share', 'figure'),
     _slider_value_inputs
     + [Input('therm-crir-densities', 'value'),
        Input('therm-crir-threshold', 'value'),
        Input('therm-minrate', 'value'),
        Input('therm-minpoints', 'value'),
        Input('therm-show-totals', 'value'),
+       Input('therm-topn', 'value'),
        Input('thermal-subtabs', 'value'),
        Input('overlay-state', 'data'),
        Input('plot-theme', 'value')],
@@ -15106,22 +16966,22 @@ def populate_apdf_species(_loaded, _subtab, current):
 )
 def update_heatcool_crir_plots(*args_in):
     values = list(args_in[:N_PARAMS])
-    (densities, threshold, min_rate, min_points, show_totals,
+    (densities, threshold, min_rate, min_points, show_totals, top_n,
      _subtab, _overlay_state, plot_theme) = args_in[N_PARAMS:]
     theme = _parse_plot_theme(plot_theme)
     if not (_grid and _grid.get('has_hdf5')):
         ph = placeholder_fig('Grid-integrated heating/cooling requires an HDF5 model grid',
                              theme=theme)
-        return ph, ph
+        return ph, ph, ph
     data = _grid_heat_cool_dataframes(values)
     if not data:
         ph = placeholder_fig('No models for the current FUV / mass / metallicity selection',
                              theme=theme)
-        return ph, ph
+        return ph, ph, ph
     dens = [float(d) for d in (densities or [])]
     if not dens:
         ph = placeholder_fig('Select one or more densities above', theme=theme)
-        return ph, ph
+        return ph, ph, ph
     try:
         thr = float(threshold)
     except (TypeError, ValueError):
@@ -15129,7 +16989,7 @@ def update_heatcool_crir_plots(*args_in):
     try:
         mr = float(min_rate)
     except (TypeError, ValueError):
-        mr = 1e23
+        mr = 0.0
     try:
         mp = int(min_points)
     except (TypeError, ValueError):
@@ -15137,8 +16997,142 @@ def update_heatcool_crir_plots(*args_in):
     show = bool(show_totals)
     f1 = fig_heating_contributions_vs_crir(data, dens, threshold=thr, theme=theme)
     f3 = fig_absolute_heating_cooling_vs_crir(
-        data, dens, min_rate=mr, min_points=max(1, mp), show_totals=show, theme=theme)
-    return f1, f3
+        data, dens, min_rate=mr, min_points=max(1, mp), show_totals=show, theme=theme,
+        top_n=int(top_n) if isinstance(top_n, (int, float)) and top_n > 0 else None)
+    tn = int(top_n) if isinstance(top_n, (int, float)) and top_n > 0 else None
+    datasets = [('Main grid', data)]
+    if _overlay:
+        datasets.append(('Overlay (attenuated)', _grid_heat_cool_dataframes(values, overlay=True)))
+    f4 = fig_heat_cool_share_bars(datasets, dens, min_rate=mr, min_points=max(1, mp),
+                                  top_n=tn, theme=theme)
+    return f1, f3, f4
+
+
+@app.callback(
+    Output('g3d-slice', 'max'),
+    Output('g3d-slice', 'marks'),
+    Output('g3d-slice', 'value'),
+    Output('g3d-slice-label', 'children'),
+    Output('g3d-slice-wrap', 'style'),
+    Input('g3d-slice-key', 'value'),
+    Input('g3d-mode', 'value'),
+    Input('grid-loaded', 'data'),
+    State('g3d-slice', 'value'),
+    State('g3d-slice-wrap', 'style'),
+)
+def update_grid_3d_slice(key, mode, _loaded, current, wrap_style):
+    style = {**(wrap_style or {}), 'display': 'none' if mode == 'regime' else 'flex'}
+    if not (_grid and _grid.get('axis_tokens') and key in _grid['axis_tokens']):
+        return 1, {}, 0, 'Slice value', style
+    pdef = _param_def(key)
+    n = len(_grid['axis_tokens'][key])
+    value = current if dash.ctx.triggered_id == 'grid-loaded' and current is not None else n // 2
+    value = min(max(int(value), 0), max(n - 1, 0))
+    unit = f' ({pdef["unit"]})' if pdef['unit'] else ''
+    return max(n - 1, 0), build_marks(pdef), value, f'{pdef["name"]}{unit}', style
+
+
+@app.callback(
+    Output('g3d-fig', 'figure'),
+    _slider_value_inputs
+    + [Input('g3d-mode', 'value'),
+       Input('g3d-fronts', 'value'),
+       Input('g3d-centre', 'value'),
+       Input('g3d-slice-key', 'value'),
+       Input('g3d-slice', 'value'),
+       Input('g3d-style', 'value'),
+       Input('g3d-interp', 'value'),
+       Input('g3d-interp-n', 'value')]
+    + [Input(f'g3d-level-{f["key"]}', 'value') for f in tf.FRONTS]
+    + [Input('grid-subtabs', 'value'),
+       Input('grid-loaded', 'data'),
+       Input('plot-theme', 'value')],
+    prevent_initial_call=True,
+)
+def update_grid_3d(*args_in):
+    values = list(args_in[:N_PARAMS])
+    rest = list(args_in[N_PARAMS:])
+    mode, fronts, centre, slice_key, slice_idx, style, interp, interp_n = rest[:8]
+    level_vals = rest[8:8 + len(tf.FRONTS)]
+    subtab, _loaded, plot_theme = rest[8 + len(tf.FRONTS):]
+    style = 'points' if style == 'points' else 'filled'
+    try:
+        n_fine = min(max(int(interp_n), 10), 80) if interp else None
+    except (TypeError, ValueError):
+        n_fine = 30 if interp else None
+    theme = _parse_plot_theme(plot_theme)
+    if subtab != 'grid-3d':
+        return dash.no_update
+    if not (_grid and _grid.get('has_hdf5')):
+        return placeholder_fig('3D fronts require an HDF5 model grid', theme=theme)
+    missing = [sp for sp in tf.FRONT_SPECIES if sp not in _grid['species_idx']]
+    if missing:
+        return placeholder_fig('Species missing from the network: ' + ', '.join(missing),
+                               theme=theme)
+    fronts = [k for k in _as_str_list(fronts) if k in tf.FRONT_BY_KEY]
+    if not fronts:
+        return placeholder_fig('Select at least one front', theme=theme)
+    levels = {}
+    for f, v in zip(tf.FRONTS, level_vals):
+        try:
+            levels[f['key']] = float(v)
+        except (TypeError, ValueError):
+            levels[f['key']] = f['default_level']
+    t = _theme_colors(theme)
+    dark = theme == 'dark'
+    if mode == 'regime':
+        if any(len(_grid['axis_tokens'][k]) < 2 for k in _G3D_AXES):
+            return placeholder_fig('Parameter regimes need at least two values of '
+                                   'n_H, χ and ζ in the grid', theme=theme)
+        coords, cube, labels = _g3d_regime_cube(values, list(tf.FRONT_BY_KEY))
+        fine = None
+        if n_fine:
+            refined = {k: tf.refine(coords, v, n_fine) for k, v in cube.items()}
+            fine = (next(iter(refined.values()))[0], {k: r[1] for k, r in refined.items()})
+        return tf.fig_regime_cube(*coords, cube, levels, t, labels, fronts=fronts, dark=dark,
+                                  style='volumes' if style == 'filled' else 'points',
+                                  fine=fine, title='Parameter regimes: media and fronts',
+                                  uirevision=f'g3d-regime|{theme}')
+    slice_key = slice_key if slice_key in _G3D_AXES else 'crir'
+    free = [k for k in _G3D_AXES if k != slice_key]
+    if any(len(_grid['axis_tokens'][k]) < 2 for k in free):
+        return placeholder_fig('Front depth needs at least two values on both free axes',
+                               theme=theme)
+    if mode == 'media':
+        coords, cube, labels3 = _g3d_regime_cube(values, list(tf.FRONT_BY_KEY))
+        ax = _G3D_AXES.index(slice_key)
+        raw = list(_grid['axis_tokens'][slice_key])  # slider order
+        s_tok = raw[min(max(int(slice_idx or 0), 0), len(raw) - 1)]
+        s_i = _g3d_axis(slice_key)[0].index(s_tok)    # cube (ascending) order
+        xi, yi = [i for i in range(3) if i != ax]
+        x, y = coords[xi], coords[yi]
+        # cube axes are (density, fuv, crir): take the slice, order as [y, x]
+        fr2 = {k: np.take(v, s_i, axis=ax).T for k, v in cube.items()}
+        fine = None
+        if n_fine:
+            refined = {k: tf.refine([y, x], v, n_fine) for k, v in fr2.items()}
+            fine = (next(iter(refined.values()))[0], {k: r[1] for k, r in refined.items()})
+        sdef = _param_def(slice_key)
+        s_unit = f' {sdef["unit"]}' if sdef['unit'] else ''
+        return tf.fig_media_map(x, y, fr2, levels, t, (labels3[xi], labels3[yi]),
+                                fronts=fronts, dark=dark, style=style, fine=fine,
+                                title=(f'Media  ({sdef["name"]} = '
+                                       f'{_param_token_disp(sdef, s_tok)}{s_unit})'),
+                                uirevision=f'g3d-media|{slice_key}|{theme}')
+    x, y, depth, av_c, labels, slice_txt = _g3d_front_depths(
+        slice_key, slice_idx, values, fronts, levels, bool(centre))
+    if n_fine:
+        depth = {k: tf.refine([y, x], v, n_fine)[1] for k, v in depth.items()}
+        if av_c is not None:
+            av_c = tf.refine([y, x], av_c, n_fine)[1]
+        x = np.linspace(x.min(), x.max(), n_fine)
+        y = np.linspace(y.min(), y.max(), n_fine)
+    if not any(np.isfinite(d).any() for d in depth.values()):
+        return placeholder_fig('No model reaches the selected fronts at this slice',
+                               theme=theme)
+    return tf.fig_front_surfaces(x, y, depth, t, labels, av_center=av_c, dark=dark,
+                                 title=f'Front depth  ({slice_txt})',
+                                 uirevision=f'g3d-depth|{slice_key}|{theme}')
 
 
 @app.callback(
@@ -15213,7 +17207,9 @@ def update_abundance_pdf(*args_in):
        Input('react-net-hidden', 'data'),
        Input('react-net-mode', 'value'),
        Input('react-dom-k', 'value'),
-       Input('react-net-cr', 'value')],
+       Input('react-net-cr', 'value'),
+       Input('react-chain-maxnodes', 'value'),
+       Input('react-chain-branches', 'value')],
     prevent_initial_call=True,
 )
 def update_reaction_plots(*args_in):
@@ -15221,7 +17217,7 @@ def update_reaction_plots(*args_in):
     (species, top_n, ranking, xscale, yscale, x_min, xvar, _chem_state, _chem_overlay_state,
      plot_theme, chain_up, chain_down, chain_iso, chain_ice,
      species_pt, partner_pt, net_highlight, net_hidden,
-     net_mode, dom_k, net_cr) = args_in[N_PARAMS:]
+     net_mode, dom_k, net_cr, max_nodes, branches) = args_in[N_PARAMS:]
     top_n = top_n or CHEM_DEFAULT_NREAC
     return make_reaction_plots(values, species, xscale, yscale, top_n,
                                ranking_metric=ranking,
@@ -15237,7 +17233,43 @@ def update_reaction_plots(*args_in):
                                species_label_size=species_pt,
                                network_mode=net_mode,
                                dominant_k=dom_k,
-                               cr_only=bool(net_cr and 'cr' in net_cr))
+                               cr_only=bool(net_cr and 'cr' in net_cr),
+                               network_max_nodes=max_nodes,
+                               network_branches=branches)
+
+
+@app.callback(
+    [Output(f'net-slider-{d}', prop) for d in range(N_PARAMS) for prop in ('max', 'marks')]
+    + [Output(f'net-slider-wrap-{d}', 'style') for d in range(N_PARAMS)]
+    + [Output(f'net-slabel-{d}', 'children') for d in range(N_PARAMS)],
+    [Input(f'slider-{d}', prop) for d in range(N_PARAMS) for prop in ('max', 'marks')]
+    + [Input({'role': 'slider-wrap', 'idx': d}, 'style') for d in range(N_PARAMS)]
+    + [Input(f'slabel-{d}', 'children') for d in range(N_PARAMS)],
+)
+def mirror_net_slider_props(*args):
+    """Network sliders show the same range, marks, visibility and label as the grid sliders."""
+    return list(args)
+
+
+@app.callback(
+    [Output(f'slider-{d}', 'value', allow_duplicate=True) for d in range(N_PARAMS)]
+    + [Output(f'net-slider-{d}', 'value') for d in range(N_PARAMS)],
+    [Input(f'slider-{d}', 'value') for d in range(N_PARAMS)]
+    + [Input(f'net-slider-{d}', 'value') for d in range(N_PARAMS)],
+    prevent_initial_call=True,
+)
+def sync_net_sliders(*vals):
+    """Two-way sync: moving either copy moves the other (one callback, no loop)."""
+    keep = [dash.no_update] * N_PARAMS  # don't echo into the moved copy (re-fires plots)
+    if str(dash.callback_context.triggered_id or '').startswith('net-slider-'):
+        return list(vals[N_PARAMS:]) + keep
+    return keep + list(vals[:N_PARAMS])
+
+
+@app.callback(Output('react-dom-k', 'disabled'), Input('react-net-mode', 'value'))
+def toggle_react_dom_k(mode):
+    """Reactions / species only applies in Dominant mode."""
+    return mode != 'dominant'
 
 
 @app.callback(
@@ -15297,15 +17329,15 @@ def _hidden_species_bar(hidden):
             title=f'Show {n} again',
             style={'padding': '3px 9px', 'fontSize': '12px', 'marginRight': '6px',
                    'marginBottom': '4px', 'border': '1px solid #c5b48a',
-                   'borderRadius': '12px', 'backgroundColor': '#fff6e0',
-                   'cursor': 'pointer', 'color': '#5a4a20'},
+                   'borderRadius': '12px', 'backgroundColor': 'rgba(234, 179, 8, 0.14)',
+                   'cursor': 'pointer', 'color': 'var(--text)'},
         ))
     return html.Div([
-        html.Span('Hidden: ', style={'fontSize': '12px', 'color': '#666',
+        html.Span('Hidden: ', style={'fontSize': '12px', 'color': 'var(--text-muted)',
                                      'marginRight': '6px'}),
         html.Div(chips, style={'display': 'inline'}),
         html.Span(' (click a name to restore)',
-                  style={'fontSize': '12px', 'color': '#888', 'marginLeft': '4px'}),
+                  style={'fontSize': '12px', 'color': 'var(--text-muted)', 'marginLeft': '4px'}),
     ])
 
 
@@ -15409,11 +17441,15 @@ def _chi2_detail_figure(figs, key, default_msg, *, theme='light'):
     State('plot-theme', 'value'),
     State('grid-colorscale', 'value'),
     State('fit-state', 'data'),
+    State('fit-ov-dist', 'value'),
+    State('fit-ov-radii', 'value'),
+    State('fit-ov-scale', 'value'),
+    State('fit-ov-color', 'value'),
     prevent_initial_call=True,
 )
 def handle_map_fit(n_clicks, maps_json, errors_json, output_dir, idef,
                    nz, ny, nx, method, chi2_i, chi2_j, fit_options,
-                   plot_theme, grid_colorscale, state):
+                   plot_theme, grid_colorscale, state, ov_dist, ov_radii, ov_scale, ov_color):
     theme = _parse_plot_theme(plot_theme)
     colorscale = _parse_grid_colorscale(grid_colorscale)
     empty = placeholder_fig('Run a map fit', theme=theme)
@@ -15427,7 +17463,7 @@ def handle_map_fit(n_clicks, maps_json, errors_json, output_dir, idef,
     try:
         result = run_map_fit_job(
             maps_json, errors_json, output_dir, idef, nz, ny, nx, method,
-            chi2_i, chi2_j, opts, opts, opts, opts,
+            chi2_i, chi2_j, opts, opts, opts, opts, atten_refit='atten' in opts,
         )
     except Exception as exc:
         err = html.Span(f'\u2717  {exc}',
@@ -15436,7 +17472,8 @@ def handle_map_fit(n_clicks, maps_json, errors_json, output_dir, idef,
                 chi2_empty, chi2_empty, chi2_empty, chi2_empty, chi2_empty)
 
     # WCS from the reference observed FITS (stored on the result)
-    figs = gf.fit_result_figures(result, theme=theme, colorscale=colorscale)
+    figs = gf.fit_result_figures(result, theme=theme, colorscale=colorscale,
+                                 overlay=_fit_map_overlay(ov_dist, ov_radii, ov_scale, ov_color))
     ref = result.get('reference_line', '')
     nlines = len(result.get('lines_fitted') or [])
     axes_label = result.get('fit_axes_label') or result.get('fit_axis_config', {}).get('axis_x', '')
@@ -15479,17 +17516,24 @@ def handle_map_fit(n_clicks, maps_json, errors_json, output_dir, idef,
     Output('plot-fit-chi2-z', 'figure', allow_duplicate=True),
     Output('plot-fit-chi2-bars', 'figure', allow_duplicate=True),
     Output('plot-fit-species-contours', 'figure', allow_duplicate=True),
+    Output('plot-fit-delta-att', 'figure'),
     Input('plot-theme', 'value'),
     Input('grid-colorscale', 'value'),
     Input('fit-state', 'data'),
+    Input('fit-ov-dist', 'value'),
+    Input('fit-ov-radii', 'value'),
+    Input('fit-ov-scale', 'value'),
+    Input('fit-ov-color', 'value'),
     prevent_initial_call=True,
 )
-def refresh_fit_figures_on_theme(plot_theme, grid_colorscale, _fit_state):
+def refresh_fit_figures_on_theme(plot_theme, grid_colorscale, _fit_state,
+                                 ov_dist, ov_radii, ov_scale, ov_color):
     if not _fit_results:
-        return (dash.no_update,) * 11
+        return (dash.no_update,) * 12
     theme = _parse_plot_theme(plot_theme)
     colorscale = _parse_grid_colorscale(grid_colorscale)
-    figs = gf.fit_result_figures(_fit_results, theme=theme, colorscale=colorscale)
+    figs = gf.fit_result_figures(_fit_results, theme=theme, colorscale=colorscale,
+                                 overlay=_fit_map_overlay(ov_dist, ov_radii, ov_scale, ov_color))
     empty = placeholder_fig('Run a map fit', theme=theme)
     return (
         figs.get('x', empty), figs.get('y', empty),
@@ -15502,7 +17546,29 @@ def refresh_fit_figures_on_theme(plot_theme, grid_colorscale, _fit_state):
         _chi2_detail_figure(figs, 'chi2_z_profile', 'No third-axis χ² profile', theme=theme),
         _chi2_detail_figure(figs, 'chi2_bars', 'No observed vs model bars', theme=theme),
         _chi2_detail_figure(figs, 'species_contours', 'No species contours (enable χ² analysis)', theme=theme),
+        figs.get('delta_att', placeholder_fig(
+            'No ε_att map — load an attenuated SIMLINE overlay and tick the ε_att option',
+            theme=theme)),
     )
+
+
+def _fit_map_overlay(dist, radii_text, scale, color):
+    """Physical circle / scale-bar overlay spec for the fitted maps, or None."""
+    try:
+        dist = float(dist)
+    except (TypeError, ValueError):
+        return None
+    radii = []
+    for part in str(radii_text or '').replace(';', ',').split(','):
+        try:
+            if float(part) > 0:
+                radii.append(float(part))
+        except ValueError:
+            continue
+    if dist <= 0 or not (radii or scale):
+        return None
+    return {'distance_pc': dist, 'radii_pc': radii, 'scale_pc': scale or 0,
+            'color': (color or 'red').strip() or 'red'}
 
 
 @app.callback(
@@ -15929,9 +17995,7 @@ def sync_atten_tracers(_loaded, _sim_state, quantity, idef, _n_typ, _n_all, curr
         value = _probe_typical_tracers(names, quantity)
     else:
         value = kept or _probe_typical_tracers(names, quantity)
-    idef_style = {**_CTRL_BOX, 'minWidth': '160px'}
-    if quantity != 'intensity':
-        idef_style['display'] = 'none'
+    idef_style = {'display': 'block' if quantity == 'intensity' else 'none'}
     dens = []
     if _grid:
         for tok in _probe_axis_tokens('density'):
@@ -15947,12 +18011,14 @@ def sync_atten_tracers(_loaded, _sim_state, quantity, idef, _n_typ, _n_all, curr
 @app.callback(
     Output('ai-density-wrap', 'style'),
     Output('ai-env-wrap', 'style'),
+    Output('ai-interp-n', 'value'),
     Input('ai-mode', 'value'),
 )
 def toggle_atten_mode(mode):
+    # KoSens target_shape defaults: (24, 24, 24) in 3-D, (60, 60) for one slice.
     if mode == '3d':
-        return {'display': 'none'}, {'display': 'block'}
-    return {'display': 'block'}, {'display': 'none'}
+        return {'display': 'none'}, {'display': 'block'}, 24
+    return {'display': 'block'}, {'display': 'none'}, 60
 
 
 @app.callback(
@@ -16057,16 +18123,15 @@ def _ai_table(df, columns, *, drop=(), max_rows=40, empty='Nothing to show.'):
 
 
 _AI_SUMMARY_COLS = [
-    ('species', 'Species', ''), ('ranked', 'Ranked', 'bool'), ('n_cells', 'Cells', 'int'),
-    ('n_affected', 'Moved or unmatched', 'int'), ('frac_shifted', 'Shifted', 'pct'),
-    ('frac_unmatched', 'Unmatched', 'pct'), ('frac_trusted', 'Trusted', 'pct'),
-    ('median_abs_shift_dex', 'median |Δ|', 'score'), ('std_abs_shift_dex', 'std |Δ|', 'score'),
+    ('species', 'Species', ''), ('n_cells', 'Cells', 'int'), ('n_valid', 'With a model', 'int'),
+    ('median_abs_shift_dex', 'median |Δ|', 'score'), ('mean_abs_shift_dex', 'mean |Δ|', 'score'),
+    ('std_abs_shift_dex', 'std |Δ|', 'score'),
     ('max_abs_shift_dex', 'max |Δ|', 'score'), ('frac_observable', 'Observable', 'pct'),
 ]
 _AI_WINNER_COLS = [
-    ('n', 'n_H', 'phys'), ('x_bin', 'ζ bin', ''), ('y_bin', 'χ bin', ''),
+    ('n', 'n_H', 'phys'), ('n_bin', 'n_H bin', ''), ('x_bin', 'ζ bin', ''), ('y_bin', 'χ bin', ''),
     ('species', 'Winner', ''), ('median_abs_shift_dex', 'median |Δ|', 'score'),
-    ('n_models', 'Trusted cells', 'int'),
+    ('n_models', 'Cells', 'int'),
 ]
 _AI_TOP_COLS = [
     ('species', 'Species', ''), ('n', 'n_H', 'phys'), ('x', 'ζ', 'phys'), ('y', 'χ', 'phys'),
@@ -16075,83 +18140,133 @@ _AI_TOP_COLS = [
 ]
 _AI_RESPONSE_COLS = [
     ('species', 'Species', ''), ('error_dex', 'ζ error', 'err'), ('error_p10', 'p10', 'score'),
-    ('error_p90', 'p90', 'score'), ('frac_censored', 'Censored', 'pct'),
-    ('abs_response_dex', '|R|', 'score'), ('swing_dex', 'Swing', 'score'),
-    ('fuv_swing_dex', 'χ swing', 'score'), ('n_swing_dex', 'n_H swing', 'score'),
-    ('fuv_trend', 'Trend', 'score'), ('probe_margin', 'Margin', 'score'),
-    ('den_contrib', 'den_contrib', 'score'), ('frac_trusted', 'Trusted', 'pct'),
+    ('error_p90', 'p90', 'score'), ('frac_observable', 'Observable', 'pct'),
+    ('response_dex', 'R', 'score'), ('abs_response_dex', '|R|', 'score'),
+    ('fuv_swing_dex', 'Swing', 'score'),
+    ('g0_swing_dex', 'χ swing', 'score'), ('n_swing_dex', 'n_H swing', 'score'),
+    ('fuv_trend', 'Trend', 'score'), ('cr_dominated', 'CR-dom.', 'bool'),
+    ('den_contrib', 'den_contrib', 'score'),
     ('ranked', 'Left panel', 'bool'), ('probe_ranked', 'Right panel', 'bool'),
 ]
 _AI_VERDICT_COLS = [
-    ('species', 'Species', ''), ('verdict', 'Verdict', 'verdict'), ('broad', 'b', 'bool'),
-    ('honest', 'h', 'bool'), ('cr_led', 'c', 'bool'), ('matters', 'm', 'bool'),
-    ('frac_shifted', 'Shifted', 'pct'), ('frac_unmatched', 'Unmatched', 'pct'),
+    ('species', 'Species', ''), ('verdict', 'Verdict', 'verdict'), ('answer', 'Answer', ''),
+    ('cr_led', 'c', 'bool'), ('matters', 'm', 'bool'),
+    ('frac_observable', 'Observable', 'pct'),
     ('error_dex', 'ζ error', 'err'), ('error_p90', 'p90', 'score'),
-    ('bound_gap', 'bound_gap', 'score'), ('frac_censored', 'Censored', 'pct'),
-    ('abs_response_dex', '|R|', 'score'), ('swing_dex', 'Swing', 'score'),
-    ('probe_margin', 'Margin', 'score'), ('n_cells', 'Cells', 'int'),
+    ('response_dex', 'R', 'score'), ('abs_response_dex', '|R|', 'score'),
+    ('fuv_swing_dex', 'Swing', 'score'),
+    ('g0_swing_dex', 'χ swing', 'score'), ('n_swing_dex', 'n_H swing', 'score'),
+    ('fuv_trend', 'Trend', 'score'),
+    ('f_att', 'f_att', 'score'), ('n_cells', 'Cells', 'int'),
+]
+_AI_ZETA_COLS = [
+    ('label', 'Species', ''), ('best_regime', 'Best regime', ''), ('zeta_range', 'ζ range', ''),
+    ('zeta_observable', 'ζ observable', ''), ('chi_observable', 'χ observable', ''),
+    ('verdict', 'Verdict', 'verdict'), ('abs_response_dex', '|R|', 'score'),
+    ('fuv_swing_dex', 'Swing', 'score'), ('error_dex', 'ζ error', 'err'),
+    ('frac_observable', 'Observable', 'pct'), ('whole_grid_verdict', 'Whole grid', 'verdict'),
+    ('cr_led_regimes', 'CR-led in', ''),
+]
+_AI_IMPACT_COLS = [
+    ('rank', 'Rank', 'int'), ('species', 'Species', ''),
+    ('median_box_error_dex', 'median |Δ| over boxes', 'score'),
+    ('median_box_abs_response_dex', 'median |R| over boxes', 'score'),
+    ('mean_box_error_dex', 'mean |Δ| over boxes', 'score'),
+    ('mean_box_abs_response_dex', 'mean |R| over boxes', 'score'),
+    ('n_boxes', 'Boxes', 'int'), ('shown', 'Drawn', 'bool'),
+]
+_AI_BEST_REGIME_COLS = [
+    ('species', 'Species', ''), ('cube_verdict', 'Whole cube', 'verdict'),
+    ('n_crir_probe', 'Robust-probe boxes', 'int'), ('n_cr_led', 'CR-led boxes', 'int'),
+    ('crir_probe_regimes', 'Robust probe in', ''), ('cr_led_regimes', 'CR-led in', ''),
+]
+_AI_SCOPE_COLS = [
+    ('species', 'Species', ''), ('scope', 'Scope', ''), ('conditional_on', 'Depends on', ''),
+    ('n_boxes_responding', 'Responding', 'int'), ('n_boxes', 'Boxes', 'int'),
+    ('boxes_probe', 'Probe in', 'int'), ('median_abs_response_dex', 'median |R|', 'score'),
+    ('within_ratio', 'χ swing / |R|', 'score'), ('within_n_ratio', 'n_H swing / |R|', 'score'),
+    ('between_ratio', 'between / |R|', 'score'), ('between_n_dex', 'Δ over n_H', 'score'),
+    ('between_chi_dex', 'Δ over χ', 'score'), ('between_zeta_dex', 'Δ over ζ', 'score'),
+    ('r_fatt_corr', 'corr(R, f_att)', 'score'), ('r_per_fatt_dex', 'R / f_att', 'score'),
+]
+_AI_ENV_TALLY_COLS = [
+    ('species', 'Species', ''), ('best_box_answer', 'Answer', ''),
+    ('boxes_probe', 'Probe in', 'score'), ('boxes_cr_led', 'CR-led in', 'score'),
+    ('boxes_fuv', 'FUV in', 'score'), ('boxes_graded', 'Graded boxes', 'score'),
+    ('best_box', 'Best environment', ''), ('verdict', 'Verdict there', 'verdict'),
+    ('abs_response_dex', '|R|', 'score'), ('g0_swing_dex', 'χ swing', 'score'),
+    ('n_swing_dex', 'n_H swing', 'score'), ('error_dex', 'ζ error', 'err'),
+]
+_AI_OBSERVER_COLS = [
+    ('species', 'Species', ''), ('environment', 'Box', ''),
+    ('Delta_med', 'Δ', 'err'), ('Delta_lin_med', 'Δ_lin', 'err'),
+    ('lin_ratio_med', 'lin_ratio', 'err'), ('S_zeta_med', 'S_ζ', 'err'),
+    ('S_chi_med', 'S_χ', 'err'), ('r_med', 'r', 'err'), ('D_med', 'D', 'err'),
+    ('frac_zero', 'unmatched', 'pct'), ('f_att', 'f_att', 'err'),
+    ('log_N_H', 'log N_H', 'err'), ('reliable', 'Reliable', 'bool'),
 ]
 _AI_RENDER_OUTPUTS = [
-    ('ai-notes', 'children'), ('ai-fig-bars', 'figure'), ('ai-fig-heat', 'figure'),
+    ('ai-notes', 'children'), ('ai-step1-figs', 'children'),
     ('ai-fig-winner', 'figure'), ('ai-tbl-summary', 'children'), ('ai-tbl-winners', 'children'),
-    ('ai-tbl-top', 'children'), ('ai-fig-err', 'figure'), ('ai-fig-probe', 'figure'),
+    ('ai-tbl-top', 'children'), ('ai-step2-figs', 'children'),
     ('ai-tbl-response', 'children'), ('ai-tally', 'children'), ('ai-tbl-tracers', 'children'),
     ('ai-tbl-problematic', 'children'), ('ai-tbl-verdicts', 'children'),
-    ('ai-tbl-followup', 'children'), ('ai-3d-wrap', 'style'), ('ai-fig-dens-matrix', 'figure'),
-    ('ai-fig-env-matrix', 'figure'), ('ai-env-pick', 'options'), ('ai-env-pick', 'value'),
+    ('ai-tbl-followup', 'children'),
+    ('ai-fig-zeta', 'figure'), ('ai-tbl-zeta', 'children'),
     ('ai-render', 'data'),
+]
+# Filled only while the "3-D environments" sub-tab is open (the slow part).
+_AI_RENDER_3D_OUTPUTS = [
+    ('ai-3d-wrap', 'style'), ('ai-3d-hint', 'style'),
+    ('ai-fig-env-matrix', 'figure'), ('ai-tbl-best-regimes', 'children'),
+    ('ai-tbl-env-tally', 'children'),
+    ('ai-fig-impact-d', 'figure'),
+    ('ai-fig-impact', 'figure'), ('ai-tbl-impact', 'children'),
+    ('ai-fig-scope', 'figure'), ('ai-tbl-scope', 'children'),
+    ('ai-tbl-observer', 'children'),
+    ('ai-box-species', 'options'), ('ai-box-species', 'value'),
+    ('ai-render-3d', 'data'),
 ]
 
 
 @app.callback(
     *[Output(cid, prop) for cid, prop in _AI_RENDER_OUTPUTS],
     Input('ai-state', 'data'),
-    Input('ai-min-slope', 'value'),
-    Input('ai-min-abs-shift', 'value'),
     Input('ai-shift-edges', 'value'),
-    Input('ai-max-unmatched', 'value'),
-    Input('ai-max-censored', 'value'),
-    Input('ai-min-obs-frac', 'value'),
     Input('ai-response-floor', 'value'),
-    Input('ai-min-frac-shifted', 'value'),
     Input('ai-min-error', 'value'),
     Input('ai-max-species', 'value'),
-    Input('ai-max-per-const', 'value'),
-    Input('ai-top-summary', 'value'),
     Input('ai-nx-bins', 'value'),
     Input('ai-ny-bins', 'value'),
     Input('ai-top-models', 'value'),
-    Input('ai-probe-axis-max', 'value'),
+    Input('ai-probe-scale', 'value'),
+    Input('ai-probe-min', 'value'),
+    Input('ai-probe-max', 'value'),
+    Input('ai-profile-scale', 'value'),
+    Input('ai-zeta-bins', 'value'),
     Input('ai-filters', 'value'),
     Input('ai-env-n', 'value'),
     Input('ai-env-chi', 'value'),
     Input('ai-env-zeta', 'value'),
-    Input('ai-min-env-cells', 'value'),
     Input('plot-theme', 'value'),
-    State('ai-env-pick', 'value'),
     State('ai-render', 'data'),
 )
-def render_atten_impact(_state, min_slope, min_abs_shift, shift_edges, max_unmatched,
-                        max_censored, min_obs_frac, response_floor, min_frac_shifted, min_error,
-                        max_species, max_per_const, top_summary, nx_bins, ny_bins, top_models,
-                        probe_axis_max, filters, env_n, env_chi, env_zeta, min_env_cells,
-                        plot_theme, env_current, render_n):
+def render_atten_impact(_state, shift_edges, response_floor, min_error,
+                        max_species, nx_bins, ny_bins, top_models,
+                        probe_scale, probe_min, probe_max, profile_scale, zeta_bins, filters,
+                        env_n, env_chi, env_zeta, plot_theme, render_n):
     theme = _parse_plot_theme(plot_theme)
     t = _theme_colors(theme)
     blank = placeholder_fig('Compute to fill this figure', theme=theme)
     blank_tbl = _probe_table([], [], empty='Compute to fill this table.')
     out = {
-        'ai-notes': [], 'ai-tally': [], 'ai-3d-wrap': {'display': 'none'},
-        'ai-env-pick.options': [], 'ai-env-pick.value': None,
-        'ai-render': (render_n or 0) + 1,
+        'ai-notes': [], 'ai-tally': [], 'ai-render': (render_n or 0) + 1,
     }
     for cid, prop in _AI_RENDER_OUTPUTS:
-        key = cid if cid != 'ai-env-pick' else f'{cid}.{prop}'
-        out.setdefault(key, blank if prop == 'figure' else blank_tbl)
+        out.setdefault(cid, blank if prop == 'figure' else blank_tbl)
 
     def _result():
-        return tuple(out[cid if cid != 'ai-env-pick' else f'{cid}.{prop}']
-                     for cid, prop in _AI_RENDER_OUTPUTS)
+        return tuple(out[cid] for cid, _prop in _AI_RENDER_OUTPUTS)
 
     pixels = (_atten_results or {}).get('pixels')
     if pixels is None:
@@ -16161,33 +18276,28 @@ def render_atten_impact(_state, min_slope, min_abs_shift, shift_edges, max_unmat
     three_d = _atten_results.get('mode') == '3d'
     summary_kw = dict(
         shift_abs_edges=_ai_shift_edges(shift_edges),
-        min_abs_shift_dex=_ai_val(min_abs_shift, 0.1), min_slope_dex=_ai_val(min_slope, 0.1),
-        max_frac_unmatched=_ai_val(max_unmatched, 0.5),
         exclude_ice='ice' in flags, exclude_isotopologues='iso' in flags,
         n_x_bins=_ai_val(nx_bins, 4, int), n_y_bins=_ai_val(ny_bins, 4, int),
         n_top_models=_ai_val(top_models, 8, int),
-        n_top_summary_species=_ai_val(top_summary, 12, int),
-        max_per_constituent=_ai_val(max_per_const, 2, int),
-        min_frac_observable=_ai_val(min_obs_frac, 0.5),
+        n_top_summary_species=None,  # step 1 draws them all, split over figures
     )
-    response_kw = dict(max_species=_ai_val(max_species, 8, int),
-                       max_frac_censored=_ai_val(max_censored, 0.5))
-    reconcile_kw = dict(min_frac_shifted=_ai_val(min_frac_shifted, 0.5),
-                        response_floor_dex=_ai_val(response_floor, 0.1),
+    response_kw = dict(max_species=None)  # step 2 draws them all, split over figures
+    reconcile_kw = dict(response_floor_dex=_ai_val(response_floor, 0.1),
                         min_error_dex=_ai_val(min_error, 0.3))
     try:
-        env_edges = None
-        if three_d:
-            env_edges = {'n': ac.parse_axis_edges(env_n, pixels['n']),
-                         'y': ac.parse_axis_edges(env_chi, pixels['y']),
-                         'x': ac.parse_axis_edges(env_zeta, pixels['x'])}
+        if three_d:  # one bin setting for step 1 and the environments
+            summary_kw['regime_edges'] = {'n': ac.parse_axis_edges(env_n, pixels['n']),
+                                          'y': ac.parse_axis_edges(env_chi, pixels['y']),
+                                          'x': ac.parse_axis_edges(env_zeta, pixels['x'])}
+        # Per-box grading is left to the 3-D sub-tab (render_atten_3d).
         wf = ac.run_workflow(pixels, summary_kw=summary_kw, response_kw=response_kw,
-                             reconcile_kw=reconcile_kw, env_edges=env_edges,
-                             min_env_cells=_ai_val(min_env_cells, 10, int))
+                             reconcile_kw=reconcile_kw,
+                             require_catalog=three_d and 'catalog' in flags)
     except ValueError as exc:
         out['ai-notes'] = html.P(f'✗  {exc}', style={'color': '#d62728'})
         return _result()
     _atten_results['workflow'] = wf
+    _atten_results['kw'] = (summary_kw, wf['response_kw'], reconcile_kw)
 
     fmt = format_species_html
     summary, table = wf['summary'], wf['response']['table']
@@ -16201,12 +18311,28 @@ def render_atten_impact(_state, min_slope, min_abs_shift, shift_edges, max_unmat
     if _atten_results.get('missing_overlay'):
         notes.append('No attenuated models for: '
                      + ', '.join(map(str, _atten_results['missing_overlay'][:12])) + '.')
-    notes += summary['notes'] + wf['response']['notes']
+    if three_d and 'f_att' not in pixels.columns:
+        notes.append('No CR-attenuated mass fraction f_att: load the attenuated grid as HDF5 '
+                     'overlay to mark environments where attenuation never switched on.')
+    notes += wf['notes'] + summary['notes'] + wf['response']['notes']
     out['ai-notes'] = html.Ul([html.Li(n) for n in notes], className='kosma-muted',
                               style={'fontSize': '12px', 'margin': '0 0 10px 18px'})
 
-    out['ai-fig-bars'] = ac.fig_shift_bars(summary, theme=t, fmt=fmt)
-    out['ai-fig-heat'] = ac.fig_regime_heatmaps(summary, theme=t, fmt=fmt)
+    per_figure = _ai_val(max_species, 10, int)
+
+    def _tag(i, pages):
+        return f'  ·  {i + 1}/{len(pages)}' if len(pages) > 1 else ''
+
+    species_all = summary['species_summary']
+    step1_pages = ac.species_pages(species_all, None, per_figure)
+    scale_species = list(species_all.get('species', []))
+    step1 = []
+    for i, page in enumerate(step1_pages):
+        kw = dict(species=list(page.get('species', [])), theme=t, fmt=fmt,
+                  scale_species=scale_species, page=_tag(i, step1_pages))
+        step1 += [dcc.Graph(figure=ac.fig_shift_bars(summary, **kw), config=_GRAPH_CFG),
+                  dcc.Graph(figure=ac.fig_regime_heatmaps(summary, **kw), config=_GRAPH_CFG)]
+    out['ai-step1-figs'] = step1
     out['ai-fig-winner'] = ac.fig_winner_map(summary, theme=t, fmt=fmt)
     out['ai-tbl-summary'] = _ai_table(summary['species_summary'], _AI_SUMMARY_COLS, max_rows=60)
     drop_n = () if three_d else ('n',)
@@ -16214,14 +18340,37 @@ def render_atten_impact(_state, min_slope, min_abs_shift, shift_edges, max_unmat
                                       max_rows=60)
     out['ai-tbl-top'] = _ai_table(summary['top_models'], _AI_TOP_COLS, drop=drop_n,
                                   max_rows=80)
-    out['ai-fig-err'] = ac.fig_error_bars(table, theme=t, fmt=fmt)
-    out['ai-fig-probe'] = ac.fig_probe_plane(
-        table, response_floor_dex=reconcile_kw['response_floor_dex'],
-        probe_axis_max=_ai_val(probe_axis_max, 1.5), theme=t, fmt=fmt,
-        swing_label='environment swing of R' if three_d else 'G₀ swing of R')
+    err_pages = ac.species_pages(table, 'ranked', per_figure)
+    probe_pages = ac.species_pages(table, 'probe_ranked', per_figure, by='abs_response_dex')
+    err_all, probe_all = pd.concat(err_pages), pd.concat(probe_pages)
+
+    step2 = []
+    for i in range(max(len(err_pages), len(probe_pages))):
+        # Square figures (height fixed in atten_compare, width capped here) side by side.
+        # Probe panel is wider: its legend sits to the right of the square plot.
+        row = []
+        if i < len(err_pages):
+            row.append((ac.fig_error_bars(err_pages[i], theme=t, fmt=fmt, scale_table=err_all,
+                                          page=_tag(i, err_pages)), 560, 680))
+        if i < len(probe_pages):
+            row.append((ac.fig_probe_plane(
+                probe_pages[i], response_floor_dex=reconcile_kw['response_floor_dex'],
+                axis_scale=probe_scale or 'log', axis_min=_ai_val(probe_min, None),
+                axis_max=_ai_val(probe_max, None), theme=t, fmt=fmt,
+                swing_label='χ swing of R (at fixed n_H)' if three_d else 'χ swing of R',
+                scale_table=probe_all, page=_tag(i, probe_pages)), 760, 920))
+        step2.append(html.Div(
+            [html.Div(dcc.Graph(figure=f, config=_GRAPH_CFG),
+                      style={'flex': f'1 1 {w}px', 'maxWidth': f'{mw}px'}) for f, w, mw in row],
+            style={**_AI_ROW, 'gap': '16px'}))
+        if i < len(probe_pages):
+            step2.append(dcc.Graph(config=_GRAPH_CFG, figure=ac.fig_profiles(
+                probe_pages[i], wf['response']['profiles'], x_scale=profile_scale or 'log',
+                theme=t, fmt=fmt, page=_tag(i, probe_pages))))
+    out['ai-step2-figs'] = step2
     out['ai-tbl-response'] = _ai_table(
         table, _AI_RESPONSE_COLS, max_rows=60,
-        drop=() if three_d else ('fuv_swing_dex', 'n_swing_dex'))
+        drop=() if three_d else ('g0_swing_dex', 'n_swing_dex'))
 
     counts = verdicts['table']['verdict'].value_counts()
     out['ai-tally'] = [
@@ -16229,44 +18378,240 @@ def render_atten_impact(_state, min_slope, min_abs_shift, shift_edges, max_unmat
             'background': ac.VERDICT_COLORS[v], 'color': '#0f172a', 'padding': '3px 10px',
             'borderRadius': '12px', 'fontSize': '12px', 'fontWeight': '600'})
         for v in ac.VERDICT_ORDER if v in counts]
-    out['ai-tbl-tracers'] = _ai_table(verdicts['tracers'], _AI_VERDICT_COLS,
+    drop_3d = () if three_d else ('g0_swing_dex', 'n_swing_dex')
+    out['ai-tbl-tracers'] = _ai_table(verdicts['tracers'], _AI_VERDICT_COLS, drop=drop_3d,
                                       empty='No CR-led species with these thresholds.')
     out['ai-tbl-problematic'] = _ai_table(verdicts['problematic'], _AI_VERDICT_COLS,
-                                          empty='No honest species with a measured ζ error.')
-    out['ai-tbl-verdicts'] = _ai_table(verdicts['table'], _AI_VERDICT_COLS, max_rows=80)
-    probes = set(verdicts['table'].loc[verdicts['table']['verdict'] == 'CRIR probe', 'species'])
+                                          drop=drop_3d, empty='No species with a ζ error.')
+    out['ai-tbl-verdicts'] = _ai_table(verdicts['table'], _AI_VERDICT_COLS, drop=drop_3d,
+                                       max_rows=80)
+    probes = set(verdicts['table'].loc[verdicts['table']['verdict'] == 'robust attenuation probe', 'species'])
     winners = summary['regime_winners']
     follow = winners[winners['species'].isin(probes)] if len(winners) else winners
     out['ai-tbl-followup'] = _ai_table(
         follow, _AI_WINNER_COLS, drop=drop_n,
-        empty='No CRIR probe wins a step-1 regime — the winner map ranks |Δ| alone, so the '
-              'regime leaders may be FUV tracers or unmeasurable species.')
+        empty='No robust attenuation probe wins a step-1 regime — the winner map ranks |Δ| alone, so the '
+              'regime leaders may be G0-modulated species.')
 
-    if three_d:
-        out['ai-3d-wrap'] = {'display': 'block'}
-        long, order, labels, species = ac.density_strip(wf)
-        if long is not None:
-            out['ai-fig-dens-matrix'] = ac.fig_verdict_matrix(
-                long, col_key='i_n', col_order=order, col_labels=labels, species=species,
-                theme=t, fmt=fmt, title='Verdict by density slice (+ pooled)')
-        env = wf.get('environments') or {}
-        if env.get('table') is not None and len(env['table']):
-            env_labels = [e['label'] for e in env['environments'] if e['label'] in env['views']]
-            out['ai-fig-env-matrix'] = ac.fig_verdict_matrix(
-                env['table'], col_key='environment', col_order=env_labels,
-                species=verdicts['table']['species'].tolist()[:40], theme=t, fmt=fmt,
-                title='Verdict per environment (n_H · χ · ζ)')
-            out['ai-env-pick.options'] = [{'label': e, 'value': e} for e in env_labels]
-            out['ai-env-pick.value'] = (env_current if env_current in env_labels
-                                        else (env_labels[0] if env_labels else None))
+    try:
+        zr = ac.zeta_regime_verdicts(wf['pixels'], _ai_val(zeta_bins, 3, int), summary_kw,
+                                     wf['response_kw'],
+                                     reconcile_kw, whole=verdicts['table'])
+    except ValueError as exc:
+        zr = None
+        out['ai-tbl-zeta'] = _probe_table([], [], empty=str(exc))
+    if zr is not None and len(zr['regimes']):
+        best = zr['best']
+        out['ai-fig-zeta'] = ac.fig_verdict_matrix(
+            zr['regimes'], col_key='regime', col_order=zr['levels'],
+            col_labels=[f'{lv}<br>{zr["edges"][k]:.0e}–{zr["edges"][k + 1]:.0e}'
+                        for k, lv in enumerate(zr['levels'])],
+            species=(best['species'].tolist()[:40] if len(best)
+                     else verdicts['table']['species'].tolist()[:40]),
+            theme=t, fmt=fmt, title='Verdict per ζ regime', annot_col='abs_response_dex')
+        out['ai-tbl-zeta'] = _ai_table(best, _AI_ZETA_COLS, max_rows=60,
+                                       empty='No species is CR-led in any ζ regime.')
+
     return _result()
+
+
+@app.callback(
+    Output('int-co-alpha-fig', 'figure'),
+    Output('int-co-alpha-table', 'children'),
+    Input('int-co-alpha-btn', 'n_clicks'),
+    State('int-idef', 'value'),
+    State('plot-theme', 'value'),
+    prevent_initial_call=True,
+)
+def render_co_alpha(_n, idef, theme):
+    idef = idef if idef in ('jtemp', 'jerg') else 'jtemp'
+    lines = {j: [] for j in ac.CO_FREQ_GHZ}
+    models = []
+    for (key, species, i), path in ((_simline or {}).get('files') or {}).items():
+        if species != 'CO' or i != idef:
+            continue
+        rows = read_smli_file(path)
+        for j, f in ac.CO_FREQ_GHZ.items():
+            hit = [r['intensity'] for r in rows if abs(r['frequency'] - f) < 0.5]
+            lines[j].append(hit[0] if hit else np.nan)
+        models.append({p['key']: _physical_param_value(p['key'], key[k], filepath=path)
+                       for k, p in enumerate(PARAM_DEFS) if k < len(key)})
+    if not models:
+        return ac.empty_fig('Load a grid with CO line intensities first.', theme), html.P('—', className='kosma-muted')
+    alpha = ac.co_alpha(lines, idef)
+    counts = ac.co_alpha_classes(alpha)
+    if not sum(counts.values()):
+        return (ac.empty_fig('No model has all six CO lines (5-4, 6-5, 7-6, 11-10, 12-11, 13-12).',
+                             theme), html.P('—', className='kosma-muted'))
+    df = pd.DataFrame(models).assign(alpha=alpha, cls=ac.co_alpha_class(alpha))
+    df = df[df['cls'] != ''].sort_values('alpha')  # class is monotonic in alpha
+    cols = [('cls', 'Class', ''), ('alpha', 'α', 'score')] + [
+        (p['key'], f"{p['name']} [{p['unit']}]" if p['unit'] else p['name'], 'phys')
+        for p in PARAM_DEFS if p['key'] in df.columns]
+    return ac.fig_co_alpha_classes(counts, theme=theme), _probe_table(
+        df.to_dict('records'), cols, max_rows=5000)
+
+
+@app.callback(
+    *[Output(cid, prop) for cid, prop in _AI_RENDER_3D_OUTPUTS],
+    Input('ai-render', 'data'),
+    Input('ai-subtabs', 'value'),
+    Input('ai-min-f-att', 'value'),
+    Input('ai-impact-metric', 'value'),
+    Input('ai-impact-top', 'value'),
+    Input('ai-impact-exclude', 'value'),
+    Input('ai-impact-pair', 'value'),
+    Input('ai-d-grid', 'value'),
+    Input('plot-theme', 'value'),
+    # Bins are State: changing them re-renders step 1, whose ai-render fires this callback.
+    State('ai-env-n', 'value'),
+    State('ai-env-chi', 'value'),
+    State('ai-env-zeta', 'value'),
+    State('ai-box-species', 'value'),
+    State('ai-render-3d', 'data'),
+)
+def render_atten_3d(render_n, subtab, min_f_att, impact_metric, impact_top, impact_exclude,
+                    impact_pair, d_grid, plot_theme, env_n, env_chi, env_zeta, box_current,
+                    render3d_n):
+    """The 3-D sub-tab: per-box grading, only while that sub-tab is open."""
+    if subtab != 'ai-3d':
+        raise PreventUpdate
+    theme = _parse_plot_theme(plot_theme)
+    t = _theme_colors(theme)
+    blank = placeholder_fig('Compute in 3-D mode to fill this figure', theme=theme)
+    blank_tbl = _probe_table([], [], empty='Compute in 3-D mode to fill this table.')
+    out = {'ai-3d-wrap': {'display': 'none'}, 'ai-3d-hint': {'display': 'block'},
+           'ai-box-species.options': [], 'ai-box-species.value': [],
+           'ai-render-3d': (render3d_n or 0) + 1}
+
+    def _key(cid, prop):
+        return f'{cid}.{prop}' if cid == 'ai-box-species' else cid
+    for cid, prop in _AI_RENDER_3D_OUTPUTS:
+        out.setdefault(_key(cid, prop), blank if prop == 'figure' else blank_tbl)
+
+    def _result():
+        return tuple(out[_key(cid, prop)] for cid, prop in _AI_RENDER_3D_OUTPUTS)
+
+    wf = (_atten_results or {}).get('workflow')
+    if not wf or _atten_results.get('mode') != '3d' or 'kw' not in _atten_results:
+        return _result()
+    pixels, verdicts = wf['pixels'], wf['verdicts']
+    summary_kw, response_kw, reconcile_kw = _atten_results['kw']
+    fmt = format_species_html
+    f_att_min = _ai_val(min_f_att, 0.0)
+    # Grading is the slow part: redo it only when the cells, thresholds or bins changed.
+    key = (render_n, str(env_n), str(env_chi), str(env_zeta))
+    if (_atten_results.get('cache_3d') or (None,))[0] != key:
+        try:
+            edges = {'n': ac.parse_axis_edges(env_n, pixels['n']),
+                     'y': ac.parse_axis_edges(env_chi, pixels['y']),
+                     'x': ac.parse_axis_edges(env_zeta, pixels['x'])}
+        except ValueError as exc:
+            out['ai-3d-hint'] = {'display': 'block', 'color': '#d62728'}
+            out['ai-tbl-best-regimes'] = _probe_table([], [], empty=f'Bad bin edges: {exc}')
+            return _result()
+        wf['environments'] = ac.environment_verdicts(pixels, edges, summary_kw, response_kw,
+                                                     reconcile_kw)
+        wf['env_edges'] = edges
+        wf.pop('observer', None)
+        _atten_results['cache_3d'] = (key,)
+    out['ai-3d-wrap'], out['ai-3d-hint'] = {'display': 'block'}, {'display': 'none'}
+
+    env = wf.get('environments') or {}
+    if env.get('table') is not None and len(env['table']):
+        env_labels = [e['label'] for e in env['environments'] if e['label'] in env['views']]
+        best_boxes = ac.best_regimes(env['table'], verdicts['table'])
+        n_levels = max(len({e['levels'].get('n_level') for e in env['environments']}), 1)
+        out['ai-fig-env-matrix'] = ac.fig_verdict_matrix(
+            env['table'], col_key='environment', col_order=env_labels,
+            col_labels=ac.env_col_labels(env['environments'], env_labels),
+            # KoSens: species CR-led somewhere, most CRIR-probe boxes first.
+            species=(best_boxes['species'].tolist()
+                     or verdicts['table']['species'].tolist())[:40], theme=t, fmt=fmt,
+            title='Verdict per environment (n_H · χ · ζ)', env_info=env['environments'],
+            group=len(env_labels) // n_levels if n_levels > 1 else None)
+        out['ai-tbl-best-regimes'] = _ai_table(
+            best_boxes, _AI_BEST_REGIME_COLS, max_rows=60,
+            empty='No species is CR-led in any box.')
+        out['ai-tbl-env-tally'] = _ai_table(
+            ac.regime_tally(env['table']), _AI_ENV_TALLY_COLS, max_rows=60,
+            empty='No environment could be graded with these thresholds.')
+        impact_kw = dict(
+            metric=impact_metric or 'error_dex', min_f_att=f_att_min,
+            top_n=_ai_val(impact_top, 15, int),
+            exclude_species=[p.strip() for p in str(impact_exclude or '').split(',')
+                             if p.strip()])
+        d_grid = d_grid or 'native'
+        obs_by_grid = wf.setdefault('observer', {})
+        if d_grid not in obs_by_grid and _atten_results.get('ref_cubes'):
+            # Without a separate native grid (resampling off) both choices are this one.
+            src = (d_grid == 'native' and _atten_results.get('native')) or {
+                'pixels': pixels, 'ref_cubes': _atten_results['ref_cubes']}
+            graded = src['pixels'][src['pixels']['species'].isin(set(pixels['species']))]
+            obs_by_grid[d_grid] = ac.observer_error_table(graded, src['ref_cubes'],
+                                                          wf['env_edges'])
+        obs_tab = obs_by_grid.get(d_grid)
+        if obs_tab is not None and len(obs_tab):
+            # KoSens notebook: D matrix first; its rows fix the |Δ| matrix's rows.
+            d_kw = {**impact_kw, 'metric': 'D_med'}
+            out['ai-fig-impact-d'] = ac.fig_impact_matrix(obs_tab, env['environments'],
+                                                          theme=t, fmt=fmt, **d_kw)
+            if impact_pair and 'on' in impact_pair:
+                d_rank = ac.impact_ranking(obs_tab, env['environments'], **d_kw)[1]
+                impact_kw['species_order'] = d_rank.loc[d_rank['shown'], 'species'].tolist()
+        out['ai-fig-impact'] = ac.fig_impact_matrix(env['table'], env['environments'],
+                                                    theme=t, fmt=fmt, **impact_kw)
+        out['ai-tbl-impact'] = _ai_table(
+            ac.impact_ranking(env['table'], env['environments'], **impact_kw)[1],
+            _AI_IMPACT_COLS, max_rows=60)
+        floor = reconcile_kw['response_floor_dex']
+        scope = ac.probe_scope(env['table'], min_f_att=f_att_min, response_floor_dex=floor)
+        out['ai-fig-scope'] = ac.fig_probe_scope(scope, response_floor_dex=floor, theme=t,
+                                                 fmt=fmt)
+        out['ai-tbl-scope'] = _ai_table(scope, _AI_SCOPE_COLS, max_rows=80,
+                                        empty='No graded box.')
+        out['ai-tbl-observer'] = _ai_table(
+            obs_tab if obs_tab is not None else pd.DataFrame(), _AI_OBSERVER_COLS,
+            max_rows=120, empty='No cells to tabulate.')
+        box_species = scope['species'].tolist() if len(scope) else []
+        out['ai-box-species.options'] = [{'label': sp, 'value': sp} for sp in box_species]
+        kept = [sp for sp in _as_str_list(box_current) if sp in box_species]
+        cond = scope.loc[scope['scope'] == 'conditional probe', 'species'].tolist() \
+            if len(scope) else []
+        out['ai-box-species.value'] = kept or (cond or box_species)[:3]
+        _atten_results['box_kw'] = dict(min_f_att=f_att_min, response_floor_dex=floor)
+    return _result()
+
+
+@app.callback(
+    Output('ai-env-pick', 'data'),
+    Output('ai-env-legend', 'figure'),
+    Output('ai-env-name', 'children'),
+    Input('ai-env-legend', 'clickData'),
+    Input('ai-render-3d', 'data'),
+    Input('plot-theme', 'value'),
+    State('ai-env-pick', 'data'),
+)
+def pick_atten_environment(click, _render, plot_theme, current):
+    t = _theme_colors(_parse_plot_theme(plot_theme))
+    env = ((_atten_results or {}).get('workflow') or {}).get('environments') or {}
+    info, views = env.get('environments') or [], env.get('views') or {}
+    labels = [e['label'] for e in info if e['label'] in views]
+    if not labels:
+        return None, ac.empty_fig('Compute in 3-D mode to fill this legend.', t), ''
+    trigger = (dash.callback_context.triggered[0]['prop_id']
+               if dash.callback_context.triggered else '')
+    hit = click['points'][0].get('x') if click and trigger.startswith('ai-env-legend') else None
+    selected = next((e for e in (hit, current) if e in labels), labels[0])
+    return (selected, ac.fig_env_picker(info, labels, selected, theme=t),
+            ac.env_col_labels(info, [selected])[0].replace('<br>', '  ·  '))
 
 
 @app.callback(
     Output('ai-env-tracers', 'children'),
     Output('ai-env-problematic', 'children'),
-    Input('ai-env-pick', 'value'),
-    Input('ai-render', 'data'),
+    Input('ai-env-pick', 'data'),
+    Input('ai-render-3d', 'data'),
 )
 def render_atten_environment(env, _render):
     wf = (_atten_results or {}).get('workflow') or {}
@@ -16277,7 +18622,37 @@ def render_atten_environment(env, _render):
     return (_ai_table(views['tracers'], _AI_VERDICT_COLS,
                       empty='No CR-led species in this environment.'),
             _ai_table(views['problematic'], _AI_VERDICT_COLS,
-                      empty='No honest species with a measured ζ error here.'))
+                      empty='No species with a ζ error here.'))
+
+
+@app.callback(
+    Output('ai-box-figs', 'children'),
+    Input('ai-box-species', 'value'),
+    Input('ai-slice-metric', 'value'),
+    Input('ai-render-3d', 'data'),
+    Input('plot-theme', 'value'),
+)
+def render_atten_boxes(species, metric, _render, plot_theme):
+    t = _theme_colors(_parse_plot_theme(plot_theme))
+    wf = (_atten_results or {}).get('workflow') or {}
+    env = (wf.get('environments') or {}).get('table')
+    kw = (_atten_results or {}).get('box_kw') or {}
+    species = _as_str_list(species)
+    if env is None or not len(env) or not species:
+        return html.P('Compute in 3-D mode, then pick species.', className='kosma-muted')
+    cube = (wf.get('verdicts') or {}).get('table')
+    rows = []
+    for sp in species:
+        figs = (ac.fig_probe_boxes(env, cube, sp, theme=t, fmt=format_species_html, **kw),
+                ac.fig_response_slices(env, sp, metric=metric or 'response_dex',
+                                       min_f_att=kw.get('min_f_att', 0.0), theme=t,
+                                       fmt=format_species_html))
+        rows.append(html.Div(
+            [html.Div(dcc.Graph(figure=f, config=_GRAPH_CFG),
+                      style={'flex': f'1 1 {w}px', 'maxWidth': f'{mw}px'})
+             for f, (w, mw) in zip(figs, ((620, 760), (700, 1100)))],
+            style={**_AI_ROW, 'gap': '16px'}))
+    return rows
 
 
 @app.callback(

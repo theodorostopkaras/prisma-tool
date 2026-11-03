@@ -10,7 +10,11 @@ A separate depth-limited chemical-chain flowchart is also provided.
 
 from __future__ import annotations
 
+import json
 import math
+import re
+import shutil
+import subprocess
 from collections import defaultdict, deque
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -1580,6 +1584,7 @@ def build_multihop_pathway(
     focal_formation: Optional[Sequence[str]] = None,
     focal_destruction: Optional[Sequence[str]] = None,
     reaction_picker: Optional[Callable[[str, str], Sequence[str]]] = None,
+    branch_limit: int = CHAIN_BRANCH_LIMIT,
 ) -> Tuple[Set[str], List[dict], Dict[str, int]]:
     """Multi-hop pathway graph around ``focal_species`` (form + destroy combined).
 
@@ -1642,7 +1647,9 @@ def build_multihop_pathway(
         nodes.add(edge['source'])
         nodes.add(edge['target'])
 
-    def _pick_reactions(sp: str, mode: str, *, limit: int = CHAIN_BRANCH_LIMIT) -> List[str]:
+    branch_limit = max(1, int(branch_limit or CHAIN_BRANCH_LIMIT))
+
+    def _pick_reactions(sp: str, mode: str, *, limit: int = branch_limit) -> List[str]:
         """Focal species uses the tabulated channels; neighbours stay capped."""
         if reaction_picker is not None:
             # Items are labels or (label, % contribution) tuples.
@@ -1887,12 +1894,29 @@ def is_cr_edge(edge: dict) -> bool:
                for p in _raw_reactions(edge.get('raw', '')))
 
 
-def cr_path_edges(edges: Sequence[dict], focal: str) -> List[dict]:
+def cr_path_edges(edges: Sequence[dict], focal: str,
+                  rank: Optional[Dict[str, int]] = None) -> List[dict]:
     """Edges on a directed route linking a cosmic-ray reaction with ``focal``.
 
     Upstream: CR edge → … → focal.  Downstream: focal → … → CR edge.
     A CR edge is a direct CR step or a CR-ion-driven reaction (``is_cr_edge``).
+    With ``rank`` (the pathway columns) a route only moves forward (rank rises
+    along every step): chemistry is full of cycles (HCO⁺ → CO → HCO⁺), and
+    through them nearly every edge "reaches" a CR reaction.
     """
+    all_edges = list(edges)
+    if rank is not None:
+        # ponytail: same-column steps (H3+ → HOC+) are dropped from the routes;
+        # they are what closes the cycles.  Allow them when the cycle check is smarter.
+        def _r(n):
+            return rank.get(n, 0)
+        edges = [e for e in all_edges if _r(e['source']) < _r(e['target'])]
+        # A CR step may still start / end a route inside its own column: most
+        # X + CRPHOT → X⁺ + e⁻ ionisations put X and X⁺ in the same column.
+        cr_pool = [e for e in all_edges
+                   if is_cr_edge(e) and _r(e['source']) <= _r(e['target'])]
+    else:
+        cr_pool = [e for e in all_edges if is_cr_edge(e)]
     succ: Dict[str, Set[str]] = defaultdict(set)
     pred: Dict[str, Set[str]] = defaultdict(set)
     for e in edges:
@@ -1910,16 +1934,119 @@ def cr_path_edges(edges: Sequence[dict], focal: str) -> List[dict]:
 
     to_focal = _reach({focal}, pred)
     from_focal = _reach({focal}, succ)
-    cr = [e for e in edges if is_cr_edge(e)]
-    up_cr = [e for e in cr if e['target'] in to_focal]
-    dn_cr = [e for e in cr if e['source'] in from_focal]
+    up_cr = [e for e in cr_pool if e['target'] in to_focal]
+    dn_cr = [e for e in cr_pool if e['source'] in from_focal]
     after_up = _reach({e['target'] for e in up_cr}, succ)
     before_dn = _reach({e['source'] for e in dn_cr}, pred)
     keep = {id(e) for e in up_cr + dn_cr}
-    return [e for e in edges
+    return [e for e in all_edges
             if id(e) in keep
-            or (up_cr and e['source'] in after_up and e['target'] in to_focal)
-            or (dn_cr and e['source'] in from_focal and e['target'] in before_dn)]
+            or ((rank is None or rank.get(e['source'], 0) < rank.get(e['target'], 0))
+                and ((up_cr and e['source'] in after_up and e['target'] in to_focal)
+                     or (dn_cr and e['source'] in from_focal
+                         and e['target'] in before_dn)))]
+
+
+def _dot_layout(
+    nodes: Iterable[str],
+    edges: Sequence[dict],
+    rank: Dict[str, int],
+    box_px: Dict[str, Tuple[float, float]],
+    label_pt: float,
+    rankdir: str = 'LR',
+    aspect: Optional[float] = None,
+) -> Optional[dict]:
+    """Graphviz ``dot`` layout in points (1 pt drawn as 1 px).
+
+    ``aspect`` (height / width of the page) makes dot spread nodes along the
+    short direction until the drawing matches the page; it never squeezes.
+
+    Columns follow the pathway rank (upstream → focus → destruction, left to right
+    for ``rankdir='LR'``, top to bottom for ``'TB'``); dot orders species inside a column to cut crossings and routes each link as a
+    Bézier spline around the boxes, with its partner label placed clear of both.
+    Returns ``{'pos', 'splines', 'heads', 'labels', 'bb'}`` keyed by node name /
+    edge index, or None when ``dot`` is missing or fails (the in-house router
+    is used instead).
+    """
+    exe = shutil.which('dot')
+    if not exe:
+        return None
+    names = sorted(nodes)
+    gid = {n: f'n{i}' for i, n in enumerate(names)}
+    src = ['digraph G {',
+           f'rankdir={rankdir}; splines=true; nodesep=0.30; ranksep=0.75; newrank=true;'
+           + (f' ratio={aspect:.3f};' if aspect else ''),
+           f'node [shape=box, fixedsize=true, label=""]; '
+           f'edge [fontsize={float(label_pt):g}, fontname="Arial", arrowsize=0.9];']
+    for n in names:
+        w, h = box_px[n]
+        src.append(f'{gid[n]} [width={w / 72:.3f}, height={h / 72:.3f}];')
+    by_rank: Dict[int, List[str]] = defaultdict(list)
+    for n in names:
+        by_rank[int(rank.get(n, 0))].append(gid[n])
+    ranks = sorted(by_rank)
+    for r in ranks:
+        src.append('{rank=same; ' + '; '.join(by_rank[r]) + '}')
+    # Invisible spine keeps the columns in rank order whatever the edge directions.
+    for a, b in zip(ranks, ranks[1:]):
+        src.append(f'{by_rank[a][0]} -> {by_rank[b][0]} [style=invis, weight=0];')
+    for i, e in enumerate(edges):
+        if e['source'] not in gid or e['target'] not in gid:
+            continue
+        text = re.sub(r'<[^>]+>', '', _partner_text(e)).replace('"', "'")
+        label = f', label="{text}"' if text else ''
+        src.append(f'{gid[e["source"]]} -> {gid[e["target"]]} [id="e{i}"{label}];')
+    src.append('}')
+    try:
+        run = subprocess.run([exe, '-Tjson'], input='\n'.join(src), capture_output=True,
+                             text=True, timeout=30, check=True)
+        out = json.loads(run.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+    def _xy(s: str) -> Tuple[float, float]:
+        x, y = s.split(',')[:2]
+        return float(x), float(y)
+
+    by_gid = {v: k for k, v in gid.items()}
+    pos = {by_gid[o['name']]: _xy(o['pos']) for o in out.get('objects', [])
+           if o.get('name') in by_gid and 'pos' in o}
+    splines, heads, labels = {}, {}, {}
+    for oe in out.get('edges', []):
+        eid = str(oe.get('id') or '')
+        if not eid.startswith('e'):
+            continue
+        i = int(eid[1:])
+        for op in oe.get('_draw_', []):
+            if op.get('op') == 'b':
+                splines[i] = _bezier_points(op['points'])
+        for op in oe.get('_hdraw_', []):
+            if op.get('op') in ('P', 'p'):
+                heads[i] = [tuple(p) for p in op['points']]
+        if 'lp' in oe:
+            labels[i] = _xy(oe['lp'])
+    x0, y0, x1, y1 = (float(v) for v in out['bb'].split(','))
+    return dict(pos=pos, splines=splines, heads=heads, labels=labels, bb=(x0, y0, x1, y1))
+
+
+def _bezier_points(ctrl: Sequence[Sequence[float]], n: int = 12) -> List[Tuple[float, float]]:
+    """Sample a piecewise cubic Bézier (dot's ``b`` op: p0, then 3 points per segment)."""
+    p = np.asarray(ctrl, dtype=float)
+    t = np.linspace(0.0, 1.0, n + 1)[1:, None]
+    out = [p[0]]
+    for k in range(0, len(p) - 3, 3):
+        a, b, c, d = p[k:k + 4]
+        out.extend((1 - t) ** 3 * a + 3 * (1 - t) ** 2 * t * b + 3 * (1 - t) * t ** 2 * c + t ** 3 * d)
+    return [(float(x), float(y)) for x, y in out]
+
+
+def _rounded_box_path(x: float, y: float, hw: float, hh: float) -> str:
+    """SVG path of a rounded rectangle centred on (x, y)."""
+    r = min(0.45 * hh, 0.35 * hw)
+    l, rr, b, t = x - hw, x + hw, y - hh, y + hh
+    return (f'M {l + r},{b} L {rr - r},{b} Q {rr},{b} {rr},{b + r} L {rr},{t - r} '
+            f'Q {rr},{t} {rr - r},{t} L {l + r},{t} Q {l},{t} {l},{t - r} '
+            f'L {l},{b + r} Q {l},{b} {l + r},{b} Z')
 
 
 def build_network_figure(
@@ -1940,6 +2067,8 @@ def build_network_figure(
     species_label_size: Optional[float] = None,
     reaction_picker: Optional[Callable[[str, str], Sequence[str]]] = None,
     cr_only: bool = False,
+    max_nodes: Optional[int] = None,
+    branch_limit: Optional[int] = None,
 ) -> Tuple[go.Figure, dict]:
     """Combined multi-hop pathway network (formation + destruction) for one species.
 
@@ -1964,14 +2093,21 @@ def build_network_figure(
     partner_pt = _clamp_label_pt(partner_label_size, DEFAULT_PARTNER_LABEL_SIZE)
     species_pt = _clamp_label_pt(species_label_size, DEFAULT_SPECIES_LABEL_SIZE)
 
-    # Allow denser / deeper networks more nodes so depth controls stay useful.
-    max_nodes = min(
-        90,
-        CHAIN_MAX_NODES
-        + 6 * (up + down)
-        + (10 if include_isotopes else 0)
-        + (10 if include_ice else 0),
-    )
+    try:
+        max_nodes = max(5, min(300, int(max_nodes)))
+    except (TypeError, ValueError):
+        # Auto: allow denser / deeper networks more nodes so depth controls stay useful.
+        max_nodes = min(
+            90,
+            CHAIN_MAX_NODES
+            + 6 * (up + down)
+            + (10 if include_isotopes else 0)
+            + (10 if include_ice else 0),
+        )
+    try:
+        branch_limit = max(1, min(50, int(branch_limit)))
+    except (TypeError, ValueError):
+        branch_limit = CHAIN_BRANCH_LIMIT
     nodes, edges, rank = build_multihop_pathway(
         labels_by_species, focal_species,
         upstream_depth=up, downstream_depth=down,
@@ -1981,12 +2117,13 @@ def build_network_figure(
         focal_formation=focal_formation,
         focal_destruction=focal_destruction,
         reaction_picker=reaction_picker,
+        branch_limit=branch_limit,
     )
     edges = _dedupe_pathway_edges(edges)
     if cr_only:
         focal_key = _match_known_species(
             str(focal_species or ''), (labels_by_species or {}).keys())
-        edges = cr_path_edges(edges, focal_key)
+        edges = cr_path_edges(edges, focal_key, rank)
         nodes = {e['source'] for e in edges} | {e['target'] for e in edges}
         rank = {n: r for n, r in rank.items() if n in nodes}
     hidden_set = _resolve_hidden_species(
@@ -2031,7 +2168,7 @@ def build_network_figure(
             autosize=True,
             height=PAGE_FIG_HEIGHT,
             annotations=[dict(
-                text=(f'No cosmic-ray-driven route among the dominant reactions '
+                text=(f'No cosmic-ray-driven route among the shown reactions '
                       f'(upstream {up}, downstream {down})'
                       if cr_only and focal_species else
                       'Select a species to build its reaction pathway network'),
@@ -2043,11 +2180,193 @@ def build_network_figure(
         )
         return fig, status
 
+    # Clicked species + direct neighbours (fully solid when highlighting).
+    related: Set[str] = set()
+    if hl:
+        related.add(hl)
+        for e in edges:
+            if e['source'] == hl:
+                related.add(e['target'])
+            if e['target'] == hl:
+                related.add(e['source'])
+
+    def _species_hover(n: str) -> str:
+        labs = sorted({e['raw'] for e in edges
+                       if e['source'] == n or e['target'] == n})
+        bits = [n]
+        if _is_ice_like(n):
+            bits.append('<br><i>ice / grain surface</i>')
+        if hl and n in related:
+            bits.append(f'<br><b>On path with {hl}</b>')
+        bits.append('<br><i>Click to highlight links</i>')
+        if labs:
+            bits.append('<br>' + '<br>'.join(labs[:6]))
+        return ''.join(bits)
+
+    def _box_style(n: str) -> Tuple[str, str, float, float]:
+        """fill, border, borderwidth, opacity for a species rectangle."""
+        if hl and n == hl:
+            return '#fde68a', '#b45309', 2.6, 1.0
+        if hl and n not in related:
+            return '#f3f3f3', '#d0d0d0', 1.0, 0.35
+        if n == focal_species:
+            return '#dbeafe', '#1d4ed8', 2.6, 1.0
+        if _is_ice_like(n):
+            return '#fdf3e7', '#b07b4f', 1.4, 1.0
+        fill = plot_bg if plot_bg not in ('rgba(0,0,0,0)', None) else 'white'
+        return fill, '#94a3b8', 1.3, 1.0
+
+    def _text_color(n: str) -> str:
+        if hl and n not in related:
+            return '#c0c0c0'
+        light_fill = n == focal_species or n == hl or _is_ice_like(n)
+        return '#0f172a' if light_fill else font
+
+    # When highlighting, omit unrelated links entirely (avoids orphan stubs).
+    draw_edges = [
+        e for e in edges
+        if hl is None or e['source'] == hl or e['target'] == hl
+    ]
+    n_edges = len(edges)
+    edge_width = 2.2 if n_edges < 40 else (1.7 if n_edges < 80 else 1.35)
+
+    def _edge_style(e: dict) -> Tuple[str, str, float, str, str]:
+        """(color, dash, width, legend, hover) of one link."""
+        leg, color, dash = PARTNER_STYLES.get(e.get('partner') or 'other',
+                                              PARTNER_STYLES['other'])
+        width = edge_width + (1.4 if hl else 0.0)
+        # Dominant mode: width follows % contribution (sqrt keeps minor links visible).
+        w_pct = e.get('weight')
+        if w_pct is not None:
+            frac = max(0.0, min(100.0, float(w_pct))) / 100.0
+            width = round(4 * width * (0.6 + 1.4 * math.sqrt(frac))) / 4
+        # CR-ion-driven steps (H+, H2+, H3+, He+) dotted; direct CR stays solid orange.
+        if e.get('partner') != 'cr' and cr_ions_in(e.get('raw', '')):
+            dash = 'dot'
+        hover = str(e.get('raw') or f"{e['source']} → {e['target']}")
+        if w_pct is not None:
+            hover += f' ({float(w_pct):.1f} % contribution)'
+        return color, dash, width, leg, hover
+
+    uirev = (f'pathnet|{focal_species}|{up}|{down}|'
+             f'iso={int(bool(include_isotopes))}|ice={int(bool(include_ice))}|'
+             f'pt={partner_pt}|sp={species_pt}|hl={hl or ""}|'
+             f'dom={int(reaction_picker is not None)}|cr={int(bool(cr_only))}|'
+             f'mx={max_nodes}|br={branch_limit}|'
+             f'{len(nodes)}n{len(edges)}e')
+    title_text = (title or f'Reaction pathway network — {focal_species}') + (
+        f'  ·  highlighting {hl} and {max(0, len(related) - 1)} linked species '
+        f'(click empty / Clear to reset)' if hl else '')
+
+    # Graphviz path: layout on *all* edges so highlighting never moves a box.
+    box_px = {}
+    font_of = {}
+    for n in nodes:
+        fs = float(_label_font_size(species_pt, _label_char_count(n)))
+        hw_px, hh_px = _species_box_pixels(n, fs, is_focal=n == focal_species)
+        box_px[n] = (2.0 * hw_px, 2.0 * hh_px)
+        font_of[n] = fs
+    fig_h = int(PAGE_FIG_HEIGHT)
+
+    def _fit(d: dict) -> float:
+        """px per point once plotly fits the layout's bounding box on the page."""
+        bx0, by0, bx1, by1 = d['bb']
+        return min((PAGE_FIG_WIDTH_EST - 60) / max(bx1 - bx0, 1.0),
+                   (fig_h - 90) / max(by1 - by0, 1.0))
+
+    # Tall rank columns fit the wide page better as rows: keep the larger drawing.
+    page_aspect = (fig_h - 90) / (PAGE_FIG_WIDTH_EST - 60)
+    dots = [d for d in (_dot_layout(nodes, edges, rank, box_px, partner_pt, rankdir=rd,
+                                    aspect=page_aspect)
+                        for rd in ('LR', 'TB')) if d is not None and d['pos']]
+    dot = max(dots, key=_fit) if dots else None
+    # ponytail: below half scale (≈ >40 species / >150 links) dot's drawing is
+    # unreadably small, so the compact in-house router takes over; lift this
+    # when the page can grow or labels can scale with zoom.
+    if dot is not None and _fit(dot) >= 0.5:
+        status['layout'] = 'dot'
+        bx0, by0, bx1, by1 = dot['bb']
+        # Fonts follow the fit so labels stay inside their boxes (capped so a
+        # 3-node graph is not giant text).
+        px_per = _fit(dot)
+        k = min(1.35, px_per)
+        line_groups: Dict[Tuple[str, str, float, str], Tuple[list, list, list]] = {}
+        heads_by_color: Dict[str, Tuple[list, list]] = {}
+        annotations, shapes = [], []
+        for i, e in enumerate(edges):
+            if hl and hl not in (e['source'], e['target']):
+                continue
+            pts = dot['splines'].get(i)
+            if not pts:
+                continue
+            color, dash, width, leg, hover = _edge_style(e)
+            gx, gy, gh = line_groups.setdefault((color, dash, width, leg), ([], [], []))
+            gx.extend([p[0] for p in pts] + [None])
+            gy.extend([p[1] for p in pts] + [None])
+            gh.extend([hover] * len(pts) + [None])
+            head = dot['heads'].get(i)
+            if head:
+                hx, hy = heads_by_color.setdefault(color, ([], []))
+                hx.extend([p[0] for p in head] + [head[0][0], None])
+                hy.extend([p[1] for p in head] + [head[0][1], None])
+            label = _partner_text(e)
+            if label and i in dot['labels']:
+                lx, ly = dot['labels'][i]
+                annotations.append(dict(
+                    x=lx, y=ly, xref='x', yref='y', text=label, showarrow=False,
+                    font=dict(size=max(7, round(partner_pt * k)), color=color),
+                    bgcolor=paper or 'white', borderpad=1,
+                    xanchor='center', yanchor='middle'))
+        # One trace per line style (not per edge) keeps the browser responsive.
+        for (color, dash, width, leg), (gx, gy, gh) in line_groups.items():
+            fig.add_trace(go.Scatter(
+                x=gx, y=gy, mode='lines', line=dict(color=color, width=width, dash=dash),
+                hoverinfo='text', hovertext=gh, name=leg, showlegend=False))
+        for color, (hx, hy) in heads_by_color.items():
+            fig.add_trace(go.Scatter(
+                x=hx, y=hy, mode='none', fill='toself', fillcolor=color,
+                hoverinfo='skip', showlegend=False))
+        click_names = [n for n in nodes if n in dot['pos']]
+        for n in click_names:
+            x, y = dot['pos'][n]
+            w, h = box_px[n]
+            fill, border, bwidth, op = _box_style(n)
+            shapes.append(dict(
+                type='path', xref='x', yref='y', path=_rounded_box_path(x, y, w / 2, h / 2),
+                line=dict(color=border, width=bwidth), fillcolor=fill, opacity=op,
+                layer='above'))
+            annotations.append(dict(
+                x=x, y=y, xref='x', yref='y', text=_format_node_label(n), showarrow=False,
+                font=dict(size=max(7, round(font_of[n] * k)), color=_text_color(n),
+                          weight='bold' if n == focal_species else 'normal'),
+                xanchor='center', yanchor='middle'))
+        fig.add_trace(go.Scatter(
+            x=[dot['pos'][n][0] for n in click_names],
+            y=[dot['pos'][n][1] for n in click_names],
+            mode='markers', customdata=click_names,
+            text=[_format_node_label(n) for n in click_names],
+            marker=dict(symbol='square', color='rgba(255,255,255,0.01)', line=dict(width=0),
+                        size=[max(18.0, max(box_px[n]) * px_per) for n in click_names]),
+            hovertext=[_species_hover(n) for n in click_names], hoverinfo='text',
+            showlegend=False, name='species'))
+        pad = 12.0
+        fig.update_layout(
+            title=dict(text=title_text, font=dict(size=15, color=title_c), x=0.02,
+                       xanchor='left', y=0.995, yanchor='top', pad=dict(t=2, b=4)),
+            paper_bgcolor=paper, plot_bgcolor=plot_bg, autosize=True, height=fig_h,
+            margin=dict(l=20, r=20, t=56, b=20),
+            font=dict(family='Arial, sans-serif', size=14, color=font),
+            showlegend=False, shapes=shapes, annotations=annotations,
+            xaxis=dict(visible=False, range=[bx0 - pad, bx1 + pad]),
+            yaxis=dict(visible=False, range=[by0 - pad, by1 + pad],
+                       scaleanchor='x', scaleratio=1),
+            uirevision=uirev + '|dot', hovermode='closest', clickmode='event+select')
+        return fig, status
+
+    status['layout'] = 'router'
     pos, layout_meta = layout_rank_grid(
         nodes, rank, focal_species=focal_species, edges=edges)
-    n_edges = len(edges)
     n_nodes = len(nodes)
-    edge_width = 2.2 if n_edges < 40 else (1.7 if n_edges < 80 else 1.35)
     label_size = species_pt
     mid_size = partner_pt
     fig_h = int(PAGE_FIG_HEIGHT)
@@ -2143,47 +2462,6 @@ def build_network_figure(
         n: (pos[n][0], pos[n][1], _as_wh(node_half[n])) for n in nodes if n in pos
     }
 
-    # Clicked species + direct neighbours (fully solid when highlighting).
-    related: Set[str] = set()
-    if hl:
-        related.add(hl)
-        for e in edges:
-            if e['source'] == hl:
-                related.add(e['target'])
-            if e['target'] == hl:
-                related.add(e['source'])
-
-    def _species_hover(n: str) -> str:
-        labs = sorted({e['raw'] for e in edges
-                       if e['source'] == n or e['target'] == n})
-        bits = [n]
-        if _is_ice_like(n):
-            bits.append('<br><i>ice / grain surface</i>')
-        if hl and n in related:
-            bits.append(f'<br><b>On path with {hl}</b>')
-        bits.append('<br><i>Click to highlight links</i>')
-        if labs:
-            bits.append('<br>' + '<br>'.join(labs[:6]))
-        return ''.join(bits)
-
-    def _box_style(n: str) -> Tuple[str, str, float, float]:
-        """fill, border, borderwidth, opacity for a species rectangle."""
-        if hl and n == hl:
-            return '#ffd24d', '#8a6d00', 3.0, 1.0
-        if hl and n not in related:
-            return '#f3f3f3', '#d0d0d0', 1.0, 0.35
-        if n == focal_species:
-            return '#7ec0ee', '#111111', 3.0, 1.0
-        if _is_ice_like(n):
-            return '#f6efe8', '#8c564b', 1.6, 1.0
-        fill = plot_bg if plot_bg not in ('rgba(0,0,0,0)', None) else 'white'
-        return fill, font, 1.5, 1.0
-
-    # When highlighting, omit unrelated links entirely (avoids orphan stubs).
-    draw_edges = [
-        e for e in edges
-        if hl is None or e['source'] == hl or e['target'] == hl
-    ]
     # Per-face ports: crowded sides overflow onto top/bottom so tips do not stack.
     face_ports, exit_faces, enter_faces = _assign_face_ports(
         draw_edges, pos, node_half)
@@ -2197,8 +2475,7 @@ def build_network_figure(
     for e in ordered:
         if e['source'] not in pos or e['target'] not in pos:
             continue
-        pclass = e.get('partner') or 'other'
-        _leg, color, dash = PARTNER_STYLES.get(pclass, PARTNER_STYLES['other'])
+        color, dash, width, _leg, hover = _edge_style(e)
         x0, y0 = pos[e['source']]
         x1, y1 = pos[e['target']]
         ekey = _edge_key(e)
@@ -2280,15 +2557,6 @@ def build_network_figure(
         for px, py in pts:
             route_xs.append(px)
             route_ys.append(py)
-        width = edge_width + (1.4 if hl else 0.0)
-        # Dominant mode: width follows % contribution (sqrt keeps minor links visible).
-        w_pct = e.get('weight')
-        if w_pct is not None:
-            frac = max(0.0, min(100.0, float(w_pct))) / 100.0
-            width = round(4 * width * (0.6 + 1.4 * math.sqrt(frac))) / 4
-        # CR-ion-driven steps (H+, H2+, H3+, He+) dotted; direct CR stays solid orange.
-        if pclass != 'cr' and cr_ions_in(e.get('raw', '')):
-            dash = 'dot'
         if len(pts) >= 2:
             ax0, ay0 = pts[-2]
             tip_x, tip_y = pts[-1]
@@ -2341,9 +2609,6 @@ def build_network_figure(
                 borderpad=2,
                 xanchor='center', yanchor='middle',
             ))
-        hover = str(e.get('raw') or f"{e['source']} → {e['target']}")
-        if w_pct is not None:
-            hover += f' ({float(w_pct):.1f} % contribution)'
         gx, gy, gh = line_groups.setdefault((color, dash, width, _leg), ([], [], []))
         gx.extend([p[0] for p in pts] + [None])
         gy.extend([p[1] for p in pts] + [None])
@@ -2379,7 +2644,7 @@ def build_network_figure(
             opacity=op,
             layer='above',
         ))
-        txt_color = '#c0c0c0' if (hl and n not in related) else '#111111'
+        txt_color = _text_color(n)
         annotations.append(dict(
             x=x, y=y, xref='x', yref='y',
             text=_format_node_label(n),
@@ -2419,16 +2684,9 @@ def build_network_figure(
     if ys_all:
         ys_all.extend([min(ys_all) - marker_pad, max(ys_all) + marker_pad])
 
-    subtitle = ''
-    if hl:
-        n_rel = max(0, len(related) - 1)
-        subtitle = (
-            f'  ·  highlighting {hl} and {n_rel} linked species '
-            f'(click empty / Clear to reset)'
-        )
     fig.update_layout(
         title=dict(
-            text=(title or f'Reaction pathway network — {focal_species}') + subtitle,
+            text=title_text,
             font=dict(size=15, color=title_c), x=0.02, xanchor='left',
             y=0.995, yanchor='top', pad=dict(t=2, b=4)),
         paper_bgcolor=paper,
@@ -2446,9 +2704,7 @@ def build_network_figure(
                    range=_pad_range(ys_all, pad=0.05, abs_pad=0.15),
                    automargin=False, fixedrange=False),
         annotations=annotations,
-        uirevision=(f'pathnet|{focal_species}|{up}|{down}|'
-                    f'iso={int(bool(include_isotopes))}|ice={int(bool(include_ice))}|'
-                    f'pt={partner_pt}|sp={species_pt}|hl={hl or ""}'),
+        uirevision=uirev,
         hovermode='closest',
         clickmode='event+select',
     )
@@ -2473,6 +2729,8 @@ def build_network_panels(
     species_label_size: Optional[float] = None,
     reaction_picker: Optional[Callable[[str, str], Sequence[str]]] = None,
     cr_only: bool = False,
+    max_nodes: Optional[int] = None,
+    branch_limit: Optional[int] = None,
 ) -> Tuple[go.Figure, dict]:
     """Build the combined pathway network figure + status."""
     return build_network_figure(
@@ -2491,13 +2749,15 @@ def build_network_panels(
         species_label_size=species_label_size,
         reaction_picker=reaction_picker,
         cr_only=cr_only,
+        max_nodes=max_nodes,
+        branch_limit=branch_limit,
     )
 
 
 def status_message(status: dict) -> str:
     """Human-readable status line for the Chemistry tab."""
     if status and status.get('cr_only') and status.get('species') and not status.get('ok'):
-        return (f'No cosmic-ray-driven route among the dominant reactions of '
+        return (f'No cosmic-ray-driven route among the shown reactions of '
                 f'{status["species"]} (upstream {status.get("upstream_depth")}, '
                 f'downstream {status.get("downstream_depth")}). Increase the depths '
                 f'or reactions / species, or untick cosmic-ray paths only.')

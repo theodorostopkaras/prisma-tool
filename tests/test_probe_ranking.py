@@ -314,3 +314,29 @@ def test_axis_and_regime_labels_use_latex():
     assert plain == '10⁻¹⁶–10⁻¹³ s⁻¹'
     assert '^{' not in plain
     assert '<sub>' not in lab and '<sup>' not in lab
+
+
+def test_cr_fuv_dominance_power_law():
+    # X ∝ ζ^a G0^b has constant slopes, so D = |a| / (|a| + |b|) everywhere.
+    import numpy as np
+    import probe_ranking as pr
+    c, f, n = np.logspace(-17, -15, 5), np.logspace(0, 4, 6), np.logspace(2, 6, 3)
+    C, F, N = np.meshgrid(c, f, n, indexing='ij')
+    g = {'X': {'grid': 1e-8 * (C / 1e-16) ** 2.0 * F ** -0.5,
+               'crir_values': C, 'fuv_values': F, 'densities': N}}
+    panels, rows = pr.cr_fuv_dominance(g, ['X'], slice_values=(1e3, 1e5), dominance_ratio=3)
+    np.testing.assert_allclose(panels[('X', 0)]['D'], 0.8, atol=1e-6)
+    assert rows[0]['frac_cr'] == 1.0 and rows[1]['frac_fuv'] == 0.0
+    assert pr.fig_cr_fuv_dominance(panels, ['X'], 2) is not None
+
+
+def test_cr_fuv_dominance_default_is_node_mesh():
+    # KoSens fd03c61: linear between nodes, no upsampled mesh by default.
+    import numpy as np
+    import probe_ranking as pr
+    c, f, n = np.logspace(-17, -15, 3), np.logspace(0, 4, 5), np.logspace(2, 6, 3)
+    C, F, N = np.meshgrid(c, f, n, indexing='ij')
+    g = {'X': {'grid': 1e-8 * (C / 1e-16) ** 2.0 * F ** -0.5,
+               'crir_values': C, 'fuv_values': F, 'densities': N}}
+    panels, _rows = pr.cr_fuv_dominance(g, ['X'])
+    assert panels[('X', 0)]['D'].shape == (5, 3)                 # (χ nodes, ζ nodes)

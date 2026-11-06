@@ -1,10 +1,13 @@
+# PRISMA dependencies. Install or update (re-run after every `git pull`):
+#   python -m pip install --upgrade -r requirements.txt
 dash>=2.16
 plotly>=5.20
 numpy>=1.24
 h5py>=3.8
 scipy>=1.10
 pandas>=2.0
+matplotlib>=3.7
 astropy>=5.0
-astroquery>=0.4.7
+astroquery>=0.4.8
 tqdm>=4.65
 Pillow>=9.0

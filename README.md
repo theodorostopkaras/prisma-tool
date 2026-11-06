@@ -415,7 +415,7 @@ Implementation: `atten_compare.py` (numerics checked by
 From the project directory:
 
 ```bash
-python -m pip install -r requirements.txt
+python -m pip install --upgrade -r requirements.txt
 python app.py --dir /path/to/pdrgrid_hdf5
 ```
 
@@ -424,8 +424,8 @@ open a system file window and pick any model file in the grid folder (the
 folder path is filled in automatically), or paste a path and click
 **Load grid** (tick *recursive* to walk sub-folders).
 
-If you already had the tool installed, re-run the `pip install` line after
-pulling updates so new packages (in particular **astroquery**) are picked up.
+If you already had the tool installed, re-run the `pip install --upgrade` line
+after every `git pull` so new or newer packages are picked up.
 
 **Required packages** (from `requirements.txt`):
 
@@ -435,6 +435,7 @@ pulling updates so new packages (in particular **astroquery**) are picked up.
 | `numpy`, `scipy` | Arrays, interpolation, numerics |
 | `pandas` | Per-cell tables of the **Attenuation impact** workflow |
 | `h5py` | Model / chemistry HDF5 grids |
+| `matplotlib` | Contour paths for map-fit / cube overlays (headless) |
 | `astropy` | FITS cubes, WCS, Gaussian line fitting |
 | `astroquery` | CDMS / JPL line ID on **Spectra → Cube viewer** |
 | `tqdm` | Progress bar during map fitting |

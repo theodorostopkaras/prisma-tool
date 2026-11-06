@@ -64,6 +64,19 @@ def test_browse_buttons_on_layout():
         assert btn_id in markup
 
 
+def test_run_dialog_crash_is_not_cancel(monkeypatch):
+    """Issue #1: a crashing chooser falls through; exit 1 is Cancel."""
+    monkeypatch.setenv('LD_LIBRARY_PATH', '/opt/conda/lib')
+    py = sys.executable
+    # child sees a clean LD_LIBRARY_PATH
+    assert ap._run_dialog([py, '-c', 'import os;print(os.environ.get("LD_LIBRARY_PATH","clean"))']) == 'clean'
+    assert ap._run_dialog([py, '-c', 'import sys;sys.exit(1)']) == ''
+    assert ap._run_dialog([py, '-c', 'import os;os.abort()']) is None
+    assert ap._run_dialog([py, '-c', 'import sys;sys.exit(127)']) is None
+    # crash in first backend -> next backend is used
+    assert ap._first_dialog(lambda: None, lambda: '/picked') == '/picked'
+
+
 if __name__ == '__main__':
     test_load_source_from_pick_file_uses_parent()
     test_load_source_from_pick_folder_kept()

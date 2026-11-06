@@ -9741,13 +9741,23 @@ def _resolve_browse_path(picked, keep='folder'):
 
 
 def _run_dialog(cmd, env=None):
-    """Run a chooser. ``None`` = backend missing; ``''`` = cancelled."""
+    """Run a chooser. ``None`` = backend missing/crashed; ``''`` = cancelled."""
+    # Choosers are system binaries: a conda/venv LD_LIBRARY_PATH makes them
+    # load the env's libs (e.g. libffi) and crash (issue #1).
+    env = dict(os.environ if env is None else env)
+    env.pop('LD_LIBRARY_PATH', None)
+    env.pop('LD_PRELOAD', None)
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
     except OSError:
         return None
-    if proc.returncode != 0:
+    if proc.returncode == 1:  # zenity / kdialog Cancel
         return ''
+    if proc.returncode != 0:  # crash / loader error -> try the next backend
+        print(f'PRISMA: {os.path.basename(cmd[0])} failed '
+              f'(exit {proc.returncode}): {(proc.stderr or "").strip()[:200]}',
+              file=sys.stderr)
+        return None
     text = (proc.stdout or '').strip()
     return text.splitlines()[0].strip() if text else ''
 

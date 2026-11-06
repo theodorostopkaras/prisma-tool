@@ -207,7 +207,7 @@ def convert_intensity_units(data, from_unit, to_unit, species_name=None):
         
         raise NotImplementedError(
             'Conversion to K km/s from other units requires molecular line data '
-            'not bundled in Kosma-online-tool. Match FITS BUNIT to the SIMLINE idef.'
+            'not bundled with PRISMA. Match FITS BUNIT to the selected intensity units.'
         )
     
     elif norm_to_unit in ['erg/s/cm2', 'ergs1cm2', 'ergscm2']:

@@ -448,59 +448,58 @@ def test_remap_velocity_to_frequency_is_monotonic_inverse():
     np.testing.assert_allclose(v_back, v, atol=1e-6)
 
 
-def test_splatalogue_parses_orderedfreq_mhz_as_ghz():
+def _cdms_table(**extra):
+    from astropy.table import MaskedColumn, Table
+    cols = {
+        'FREQ': [89188.5247, 88631.8473], 'ELO': [0.0, 0.0], 'TAG': [29507, -27501],
+        'Ju': [1, 1], 'Jl': [0, 0],
+        'vu': MaskedColumn([-999999, -999999]),
+        'F1u': MaskedColumn([0, 2], mask=[True, False]),
+        'F1l': MaskedColumn([0, 1], mask=[True, False]),
+        'name': ['HCO+, v=0', 'HCN, v=0'],
+    }
+    cols.update(extra)
+    return Table(cols)
+
+
+def test_cdms_table_gives_rest_freq_eu_and_transition():
+    rows = lc.rows_from_catalog_table(_cdms_table(), 89.165, 89.212, source='CDMS')
+    assert len(rows) == 1  # HCN 88.63 GHz is outside the window
+    r = rows[0]
+    np.testing.assert_allclose(r['rest_ghz'], 89.1885247, atol=1e-7)
+    np.testing.assert_allclose(r['eu_k'], 4.28, atol=0.01)  # E_u = h nu / k for J=1
+    assert r['species'] == 'HCO+, v=0'
+    assert r['transition'] == '1 - 0'  # -999999 and masked QNs dropped
+    assert r['source'] == 'CDMS'
+    assert r['url'] == 'https://cdms.astro.uni-koeln.de/cgi-bin/cdmsinfo?file=e029507.cat'
+
+
+def test_catalog_eu_limit_and_hyperfine_transition():
+    rows = lc.rows_from_catalog_table(_cdms_table(), 88.0, 90.0, eu_max_k=4.27)
+    assert [r['species'] for r in rows] == ['HCN, v=0']  # HCO+ 4.28 K cut
+    assert rows[0]['transition'] == '1,2 - 0,1'
+
+
+def test_jpl_table_names_species_from_tag():
     from astropy.table import Table
-    table = Table({
-        'name': ['HCO<sup>+</sup> <font color="red">v=0</font>'],
-        'resolved_QNs': ['1-0'],
-        'orderedfreq': [89188.5247],
-        'upper_state_energy_K': [4.28],
-        'linelist': ['CDMS'],
-    })
-    rows = lc.rows_from_splatalogue_table(table, 89.165, 89.212)
-    assert len(rows) == 1
-    np.testing.assert_allclose(rows[0]['rest_ghz'], 89.1885247, atol=1e-7)
-    assert rows[0]['species'] == 'HCO+ v=0'
-    assert rows[0]['source'] == 'splatalogue/CDMS'
+    table = Table({'FREQ': [115271.2018], 'ELO': [0.0], 'TAG': [-28001],
+                   "QN'": [' 1'], 'QN"': [' 0']})
+    rows = lc.rows_from_catalog_table(table, 115.2, 115.3, source='JPL',
+                                      species_names={28001: 'CO'})
+    assert rows[0]['species'] == 'CO'
+    assert rows[0]['transition'] == '1 - 0'
+    np.testing.assert_allclose(rows[0]['eu_k'], 5.53, atol=0.01)
+    assert rows[0]['url'] == 'https://spec.jpl.nasa.gov/ftp/pub/catalog/doc/d028001.pdf'
 
 
-def test_splatalogue_legacy_ghz_column_still_works():
-    from astropy.table import Table
-    table = Table({
-        'Species': ['N2H+'],
-        'Resolved QNs': ['1-0 F=0-1'],
-        'Freq-GHz': [93.171621],
-        'E_U (K)': [4.47],
-    })
-    rows = lc.rows_from_splatalogue_table(table, 93.170, 93.178)
-    assert len(rows) == 1
-    np.testing.assert_allclose(rows[0]['rest_ghz'], 93.171621, atol=1e-7)
-    assert rows[0]['species'] == 'N2H+'
-
-
-def test_splatalogue_drops_lines_outside_frequency_window():
-    from astropy.table import Table
-    table = Table({
-        'name': ['HCO+', 'HCN'],
-        'resolved_QNs': ['1-0', '1-0'],
-        'orderedfreq': [89188.5247, 88631.8473],
-        'upper_state_energy_K': [4.28, 4.25],
-    })
-    rows = lc.rows_from_splatalogue_table(table, 89.165, 89.212)
-    names = {r['species'] for r in rows}
-    assert 'HCO+' in names
-    assert 'HCN' not in names
-
-
-def test_splatalogue_live_hco_window_if_network():
-    """Live CDMS/JPL search; skip if Splatalogue is unreachable."""
-    if not lc.splatalogue_available():
+def test_cdms_live_hco_window_if_network():
+    """Live CDMS search; skip if astroquery or the network is unavailable."""
+    if not lc.catalog_query_available():
         return
-    rows, err = lc.query_splatalogue(89.165, 89.212, v_source_kms=0.0, eu_max_k=150)
+    rows, err = lc.identify_lines(89.165, 89.212, catalog='cdms', eu_max_k=150)
     if err or not rows:
         return
-    blob = ' '.join(r['species'] for r in rows)
-    assert 'HCO' in blob
+    assert any(r['species'].startswith('HCO+') for r in rows)
 
 
 if __name__ == '__main__':
@@ -525,10 +524,10 @@ if __name__ == '__main__':
     test_n2hp_window_finds_hyperfine()
     test_source_velocity_shifts_observed_frequency()
     test_remap_velocity_to_frequency_is_monotonic_inverse()
-    test_splatalogue_parses_orderedfreq_mhz_as_ghz()
-    test_splatalogue_legacy_ghz_column_still_works()
-    test_splatalogue_drops_lines_outside_frequency_window()
-    test_splatalogue_live_hco_window_if_network()
+    test_cdms_table_gives_rest_freq_eu_and_transition()
+    test_catalog_eu_limit_and_hyperfine_transition()
+    test_jpl_table_names_species_from_tag()
+    test_cdms_live_hco_window_if_network()
     print('ok')
 
 

@@ -1,15 +1,14 @@
 """Molecular line identification in a plotted frequency window.
 
 A local 3 mm catalog (IRAM 30 m / CLASS coverage ~80–115 GHz, plus a few
-neighbouring mm lines) works offline.  Splatalogue (CDMS/JPL) is used when
-``astroquery`` is installed and the user selects that catalog.
+neighbouring mm lines) works offline.  The CDMS and JPL catalogues are
+queried directly through ``astroquery`` (network needed) when selected.
 """
 
 from __future__ import annotations
 
-import html
-import re
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -155,60 +154,66 @@ def lines_in_window(freq_min_ghz: float, freq_max_ghz: float,
     return rows
 
 
-_HTML_TAG_RE = re.compile(r'<[^>]+>')
-_LEADING_FLOAT_RE = re.compile(r'([0-9]+(?:\.[0-9]+)?)')
+_MHZ_PER_CM1 = 29979.2458   # 1 cm⁻¹ in MHz
+_K_PER_CM1 = 1.4387769      # hc/k: 1 cm⁻¹ in K
+_QN_MISSING = -999999       # CDMS fill value for unused quantum numbers
+_UPPER_QN = ('Ju', 'Ku', 'vu', 'F1u', 'F2u', 'F3u')   # CDMS columns
+_LOWER_QN = ('Jl', 'Kl', 'vl', 'F1l', 'F2l', 'F3l')
+CATALOG_SERVICES = ('CDMS', 'JPL')
+# Per-species documentation pages (the catalogues have no per-transition page).
+_SPECIES_URL = {
+    'CDMS': 'https://cdms.astro.uni-koeln.de/cgi-bin/cdmsinfo?file=e{tag:06d}.cat',
+    'JPL': 'https://spec.jpl.nasa.gov/ftp/pub/catalog/doc/d{tag:06d}.pdf',
+}
 
 
-def splatalogue_available() -> bool:
+def species_url(source: str, tag: int) -> Optional[str]:
+    """Documentation page of catalogue species ``tag`` in ``source`` (CDMS / JPL)."""
+    fmt = _SPECIES_URL.get(source)
+    return fmt.format(tag=abs(int(tag))) if fmt else None
+
+
+def _jpl_class():
     try:
-        from astroquery.splatalogue import Splatalogue  # noqa: F401
+        from astroquery.linelists.jplspec import JPLSpec
+    except ImportError:  # astroquery < 0.4.8
+        from astroquery.jplspec import JPLSpec
+    return JPLSpec
+
+
+def catalog_query_available() -> bool:
+    try:
+        from astroquery.linelists.cdms import CDMS  # noqa: F401
+        _jpl_class()
         return True
     except Exception:
         return False
 
 
-def _strip_html(text) -> str:
-    if text is None:
-        return ''
-    s = html.unescape(str(text))
-    s = _HTML_TAG_RE.sub('', s)
-    return ' '.join(s.split())
-
-
-def _cell_float(val) -> float:
-    """Numeric table cell, or the first number in a Splatalogue HTML string."""
-    if val is None:
-        return float('nan')
+@lru_cache(maxsize=1)
+def _jpl_species_names() -> dict:
+    """JPL result tables carry only the species TAG; map it to a name."""
     try:
-        if hasattr(val, 'mask') and bool(val.mask):
-            return float('nan')
-    except (TypeError, ValueError):
-        pass
-    try:
-        x = float(val)
-        if np.isfinite(x):
-            return x
-    except (TypeError, ValueError):
-        pass
-    m = _LEADING_FLOAT_RE.search(_strip_html(val))
-    return float(m.group(1)) if m else float('nan')
+        st = _jpl_class().get_species_table()
+        return {int(t): str(n).strip() for t, n in zip(st['TAG'], st['NAME'])}
+    except Exception:
+        return {}
 
 
-def rest_ghz_from_splatalogue(value, *, from_mhz: bool = False) -> float:
-    """Splatalogue JSON ``orderedfreq`` is MHz; older tables used GHz."""
-    x = _cell_float(value)
-    if not np.isfinite(x) or x <= 0:
-        return float('nan')
-    if from_mhz or x >= 3000.0:
-        return x / 1000.0
-    return x
+def _qn_part(value) -> Optional[str]:
+    if np.ma.is_masked(value):
+        return None
+    if isinstance(value, (str, bytes, np.str_)):
+        return ','.join(str(value).split()) or None
+    if int(value) == _QN_MISSING:
+        return None
+    return str(int(value))
 
 
-def _table_col(table, *names):
-    for name in names:
-        if name in table.colnames:
-            return table[name]
-    return None
+def _transition(row, upper, lower) -> str:
+    up = [p for p in (_qn_part(row[c]) for c in upper) if p]
+    lo = [p for p in (_qn_part(row[c]) for c in lower) if p]
+    return f"{','.join(up)} - {','.join(lo)}" if (up or lo) else '—'
 
 
 def _rest_window_for_observed(freq_min_ghz: float, freq_max_ghz: float,
@@ -222,120 +227,121 @@ def _rest_window_for_observed(freq_min_ghz: float, freq_max_ghz: float,
     return tuple(sorted((lo / denom, hi / denom)))
 
 
-def rows_from_splatalogue_table(table, freq_min_ghz: float, freq_max_ghz: float,
-                                v_source_kms: float = 0.0,
-                                limit: int = 80) -> List[dict]:
-    """Keep Splatalogue rows whose rest frequency (the line ID) falls in the window."""
+def rows_from_catalog_table(table, freq_min_ghz: float, freq_max_ghz: float,
+                            v_source_kms: float = 0.0,
+                            eu_max_k: Optional[float] = None,
+                            source: str = 'CDMS',
+                            species_names: Optional[dict] = None,
+                            limit: int = 80) -> List[dict]:
+    """CDMS / JPL catalogue rows (FREQ MHz, ELO cm⁻¹) whose observed frequency is in the window.
+
+    E_u = E_lo + hν, converted to K.  Rows are sorted by E_u so the ``limit``
+    keeps the low-excitation lines that are most likely in a PDR cube.
+    """
     lo, hi = sorted((float(freq_min_ghz), float(freq_max_ghz)))
     src = float(v_source_kms or 0.0)
-
-    species = _table_col(table, 'name', 'Species', 'chemical_name', 'Chemical Name')
-    trans = _table_col(table, 'resolved_QNs', 'Resolved QNs', 'QNs', 'Quantum Number')
-    # New JSON API: orderedfreq is MHz. Legacy HTML tables used GHz column names.
-    freq_mhz = _table_col(table, 'orderedfreq')
-    freq_ghz = _table_col(
-        table,
-        'Freq-GHz(rest frame,redshifted)', 'Freq-GHz',
-        'Rest Frequency (GHz)', 'nu',
-    )
-    freq_fmt = _table_col(table, 'orderedFreq', 'measFreq')
-    eu = _table_col(table, 'upper_state_energy_K', 'E_U (K)', 'Eu_K',
-                    'Upper State Energy (K)')
-    linelist = _table_col(table, 'linelist', 'Line List')
+    cols = table.colnames
+    upper = [c for c in cols if c in _UPPER_QN or c.startswith("QN'")]
+    lower = [c for c in cols if c in _LOWER_QN or c.startswith('QN"')]
+    names = species_names or {}
 
     rows = []
-    n = len(table)
-    for i in range(n):
-        if freq_mhz is not None:
-            nu0 = rest_ghz_from_splatalogue(freq_mhz[i], from_mhz=True)
-        elif freq_ghz is not None:
-            nu0 = rest_ghz_from_splatalogue(freq_ghz[i], from_mhz=False)
-        elif freq_fmt is not None:
-            nu0 = rest_ghz_from_splatalogue(freq_fmt[i], from_mhz=False)
-        else:
-            continue
-        if not np.isfinite(nu0):
-            continue
+    for row in table:
+        freq_mhz = float(row['FREQ'])
+        nu0 = freq_mhz / 1000.0
         nu_obs = radio_obs_freq_ghz(nu0, src)
         if not (lo <= nu_obs <= hi):
             continue
-        sp = _strip_html(species[i]) if species is not None else ''
-        qn = _strip_html(trans[i]) if trans is not None else ''
-        eu_val = None
-        if eu is not None:
-            e = _cell_float(eu[i])
-            if np.isfinite(e):
-                eu_val = e
-        catalog = 'splatalogue'
-        if linelist is not None:
-            tag = _strip_html(linelist[i])
-            if tag:
-                catalog = f'splatalogue/{tag}'
+        eu = (float(row['ELO']) + freq_mhz / _MHZ_PER_CM1) * _K_PER_CM1
+        if eu_max_k is not None and eu > float(eu_max_k):
+            continue
+        tag = abs(int(row['TAG']))  # negative TAG = laboratory frequency
+        species = str(row['name']).strip() if 'name' in cols else names.get(tag, f'tag {tag:06d}')
         rows.append({
-            'species': sp or '—',
-            'transition': qn or '—',
-            'rest_ghz': float(nu0),
+            'species': species,
+            'transition': _transition(row, upper, lower),
+            'rest_ghz': nu0,
             'obs_ghz': float(nu_obs),
-            'eu_k': eu_val,
-            'source': catalog,
+            'eu_k': float(eu),
+            'source': source,
+            'tag': tag,
+            'url': species_url(source, tag),
         })
+    return _dedup_by_energy(rows, limit)
 
-    rows.sort(key=lambda r: (r['eu_k'] is None,
-                             r['eu_k'] if r['eu_k'] is not None else 0,
-                             r['obs_ghz']))
-    seen = set()
-    unique = []
+
+def _dedup_by_energy(rows: List[dict], limit: int) -> List[dict]:
+    rows = sorted(rows, key=lambda r: (r['eu_k'] is None, r['eu_k'] or 0.0, r['obs_ghz']))
+    seen, unique = set(), []
     for rec in rows:
         key = (rec['species'], rec['transition'], round(rec['rest_ghz'], 5))
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(rec)
+        if key not in seen:
+            seen.add(key)
+            unique.append(rec)
     return unique[: int(limit)]
 
 
-def query_splatalogue(freq_min_ghz: float, freq_max_ghz: float,
-                      v_source_kms: float = 0.0, eu_max_k: float = 150.0,
-                      limit: int = 80) -> Tuple[List[dict], Optional[str]]:
-    """Query Splatalogue CDMS/JPL for rest frequencies in the observed window."""
+def query_catalog(service: str, freq_min_ghz: float, freq_max_ghz: float,
+                  v_source_kms: float = 0.0, eu_max_k: Optional[float] = 150.0,
+                  limit: int = 80) -> Tuple[List[dict], Optional[str]]:
+    """Query the CDMS or JPL catalogue (astroquery) for lines in the observed window."""
     try:
-        from astroquery.splatalogue import Splatalogue
         import astropy.units as u
+        from astroquery.linelists.cdms import CDMS
+        JPLSpec = _jpl_class()
     except Exception:
         return [], 'astroquery is not installed (pip install astroquery)'
 
-    lo, hi = sorted((float(freq_min_ghz), float(freq_max_ghz)))
-    rest_lo, rest_hi = _rest_window_for_observed(lo, hi, v_source_kms)
+    rest_lo, rest_hi = _rest_window_for_observed(freq_min_ghz, freq_max_ghz, v_source_kms)
     pad = 0.001  # 1 MHz catalog / rounding pad
+    fmin, fmax = (rest_lo - pad) * u.GHz, (rest_hi + pad) * u.GHz
+    names = None
     try:
-        kw = dict(
-            energy_type='eu_k',
-            line_lists=['CDMS', 'JPL'],
-            exclude=['atmospheric'],
-            energy_levels=['Four'],
-        )
-        if eu_max_k:
-            kw['energy_max'] = float(eu_max_k)
-        table = Splatalogue.query_lines(
-            (rest_lo - pad) * u.GHz, (rest_hi + pad) * u.GHz, **kw)
+        if service == 'JPL':
+            # The all-species search uses JPL's catform service; no per-file fallback.
+            table = JPLSpec.query_lines(fmin, fmax, molecule='All',
+                                        use_getmolecule=False,
+                                        fallback_to_getmolecule=False)
+            names = _jpl_species_names()
+        else:
+            table = CDMS.query_lines(fmin, fmax, molecule='All')
+    except np.ma.MaskError:
+        return [], None  # astroquery's parser chokes on an empty result
+    except OSError as exc:  # requests.ConnectionError / Timeout are OSErrors
+        return [], f'{service} search service is unreachable ({type(exc).__name__}).'
     except Exception as exc:
-        return [], str(exc)
+        return [], f'{service} query failed ({type(exc).__name__}): {str(exc)[:200]}'
 
     if table is None or len(table) == 0:
         return [], None
-    return rows_from_splatalogue_table(
-        table, lo, hi, v_source_kms=v_source_kms, limit=limit), None
+    return rows_from_catalog_table(
+        table, freq_min_ghz, freq_max_ghz, v_source_kms=v_source_kms,
+        eu_max_k=eu_max_k, source=service, species_names=names, limit=limit), None
 
 
 def identify_lines(freq_min_ghz: float, freq_max_ghz: float,
                    catalog: str = 'local', v_source_kms: float = 0.0,
-                   eu_max_k: Optional[float] = 150.0) -> Tuple[List[dict], Optional[str]]:
-    """Return (rows, error) for the chosen catalog in an observed frequency window."""
+                   eu_max_k: Optional[float] = 150.0,
+                   limit: int = 80) -> Tuple[List[dict], Optional[str]]:
+    """Return (rows, error) for ``catalog`` = 'local', 'cdms', 'jpl' or 'cdms+jpl'.
+
+    With several services, rows from the ones that answered are returned
+    together with the error text of the ones that failed.
+    """
     cat = (catalog or 'local').strip().lower()
-    if cat in ('splatalogue', 'splat', 'cdms'):
-        return query_splatalogue(
+    services = [s for s in CATALOG_SERVICES if s.lower() in cat.split('+')]
+    if not services:
+        return lines_in_window(
             freq_min_ghz, freq_max_ghz, v_source_kms=v_source_kms,
-            eu_max_k=float(eu_max_k) if eu_max_k else 150.0)
-    return lines_in_window(
-        freq_min_ghz, freq_max_ghz, v_source_kms=v_source_kms,
-        eu_max_k=eu_max_k), None
+            eu_max_k=eu_max_k), None
+    rows, errors = [], []
+    for svc in services:
+        got, err = query_catalog(svc, freq_min_ghz, freq_max_ghz,
+                                 v_source_kms=v_source_kms, eu_max_k=eu_max_k,
+                                 limit=limit)
+        rows += got
+        if err:
+            errors.append(err)
+    if len(services) > 1:
+        rows = sorted(rows, key=lambda r: (r['eu_k'], r['obs_ghz']))[: int(limit)]
+    return rows, ('\n'.join(errors) or None)

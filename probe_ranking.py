@@ -7,6 +7,12 @@ FUV).  The CRIR axis is split into regimes; slope, plateau detection and a
 probe score are computed independently in each regime so a high score is
 always tied to a specific cosmic-ray range.
 
+The method follows Albertsson, Kauffmann & Menten (2018):
+
+    Albertsson, T., Kauffmann, J., & Menten, K. M. 2018,
+    "Atlas of Cosmic-Ray-induced Astrochemistry", ApJ, 868, 40.
+    doi:10.3847/1538-4357/aae775  (arXiv:1811.02862)
+
 Score
 -----
 ``S = F × V`` in [0, 1]:

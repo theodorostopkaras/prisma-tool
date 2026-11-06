@@ -48,6 +48,15 @@
   --success: #16a34a;
   --purple: #7c3aed;
   --overlay: #9a6b5a;
+  /* Buttons own their colour so they stay blue in the greyscale dark theme. */
+  --btn-accent: #1560CE;
+  --btn-accent-hover: #0F58BE;
+  --btn-soft: rgba(21, 96, 206, 0.10);
+  --btn-soft-hover: rgba(21, 96, 206, 0.18);
+  --btn-soft-ink: #0F55B8;
+  --danger-soft: rgba(180, 35, 24, 0.08);
+  --danger-soft-hover: rgba(180, 35, 24, 0.16);
+  --danger-ink: #B42318;
   --page: #F2F5FA;
   --card: #ffffff;
   --border: #DDE4EE;
@@ -82,6 +91,14 @@
   --success: #22c55e;
   --purple: #a78bfa;
   --overlay: #c4a484;
+  --btn-accent: #2563EB;
+  --btn-accent-hover: #1D4ED8;
+  --btn-soft: rgba(77, 141, 255, 0.16);
+  --btn-soft-hover: rgba(77, 141, 255, 0.26);
+  --btn-soft-ink: #8AB4FF;
+  --danger-soft: rgba(248, 113, 113, 0.14);
+  --danger-soft-hover: rgba(248, 113, 113, 0.24);
+  --danger-ink: #FCA5A5;
   --page: #0F0F11;
   --card: #18181B;
   --border: #27272A;
@@ -217,14 +234,14 @@ body:has(#app-root.theme-dark) {
 }
 
 .btn-primary {
-  background: var(--accent);
-  color: var(--on-accent) !important;
-  border-color: var(--accent);
+  background: var(--btn-accent);
+  color: #fff !important;
+  border-color: var(--btn-accent);
 }
 
 .btn-primary:hover {
-  background: var(--accent-hover);
-  border-color: var(--accent-hover);
+  background: var(--btn-accent-hover);
+  border-color: var(--btn-accent-hover);
 }
 
 .btn-success {
@@ -253,16 +270,26 @@ body:has(#app-root.theme-dark) {
   border-color: var(--overlay);
 }
 
+/* Secondary: tonal fill, no outline, so it never reads as a text input. */
 .btn-ghost {
-  background: transparent;
-  color: var(--text) !important;
-  border-color: var(--border-strong);
+  background: var(--btn-soft);
+  color: var(--btn-soft-ink) !important;
+  border-color: transparent;
 }
 
 .btn-ghost:hover {
-  background: var(--accent-soft);
-  border-color: var(--accent);
-  color: var(--accent-ink) !important;
+  background: var(--btn-soft-hover);
+}
+
+/* Clear / remove actions. */
+.btn-danger-ghost {
+  background: var(--danger-soft);
+  color: var(--danger-ink) !important;
+  border-color: transparent;
+}
+
+.btn-danger-ghost:hover {
+  background: var(--danger-soft-hover);
 }
 
 .btn-sm {
@@ -775,6 +802,7 @@ textarea.kosma-input {
 #main-tabs .tab.grp-grids::before { content: 'Grids & lines'; }
 #main-tabs .tab.grp-cr::before { content: 'Cosmic-ray diagnostics'; }
 #main-tabs .tab.grp-obs::before { content: 'Observations'; }
+#main-tabs .tab.grp-help::before { content: 'Help'; }
 
 #app-root.theme-dark #main-tabs .tab--selected,
 #app-root.theme-dark #main-tabs .tab.tab--selected {
@@ -1284,9 +1312,7 @@ body:has(#app-root) [class$="-MenuList"] {
 }
 
 #app-root.theme-dark button[style*="background-color: #eee"],
-#app-root.theme-dark button[style*="background-color: #f7f7f7"],
-#app-root.theme-dark [id*="btn-clear"],
-#app-root.theme-dark [id*="btn-react-net"] {
+#app-root.theme-dark button[style*="background-color: #f7f7f7"] {
   background-color: #27272A !important;
   color: #E4E4E7 !important;
   border-color: #3F3F46 !important;

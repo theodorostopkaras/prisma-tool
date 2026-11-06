@@ -44,7 +44,7 @@ def main():
     print('    _grid.has_hdf5     :', ap._grid.get('has_hdf5'))
     if not boot:
         print('    !! Bootstrap FAILED -> no sliders/controls will show.')
-        print('       (Is a SIMLINE or HDF5 grid still loaded? Clear it first.)')
+        print('       (Is a line-intensity or HDF5 grid still loaded? Clear it first.)')
         return 2
     varying = {k: v for k, v in ap._grid['axis_tokens'].items() if len(v) > 1}
     print('    varying axes       :', varying or '(single model point)')

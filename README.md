@@ -1,15 +1,11 @@
-# KOSMA-τ Grid Explorer (`Kosma-online-tool`)
+# PRISMA
 
-Interactive browser for **KoSens3D** photodissociation-region (PDR) model grids,
-inspired by the 3D-PDR Grid Explorer but adapted to the KOSMA-τ output format.
+**PDR Results Interactive Simulation Mapping & Analysis** — an interactive
+toolkit for photodissociation-region (PDR) model grids.
 
-The key differences from the original 3D-PDR tool:
-
-| | 3D-PDR explorer | KOSMA-τ explorer (this tool) |
-|---|---|---|
-| Input | one combined `grid.h5` (uploaded) | a **directory of one HDF5 file per model** |
-| Free axes | FUV × ζ (2-D) | density × FUV × ζ (3-D), plus mass / metallicity / attenuation if they vary |
-| Data access | fixed column indices | KOSMA-τ `Metadata/Metadata` table + `species involved` |
+- **Input:** a directory of one HDF5 file per model
+- **Free axes:** density × FUV × ζ (3-D), plus mass / metallicity / attenuation if they vary
+- **Data access:** the HDF5 `Metadata/Metadata` table + `species involved`
 
 ## Application tabs
 
@@ -17,19 +13,19 @@ After loading a main grid on **Load grids**, the other tabs become active:
 
 | Tab | Purpose |
 |---|---|
-| **Load grids** | Main PDR grid, optional overlay / chemistry / SIMLINE directories |
+| **Load grids** | Main PDR grid, optional overlay / chemistry / line-intensity directories |
 | **Model setup** | PDR config JSON summary (shared vs varying parameters, species network) |
 | **Abundance profiles** | Depth profiles vs A_V or n_H |
 | **Heating & cooling** | Thermal balance and rate-component breakdowns |
 | **Grid slices** | 2-D contour maps over n_H, FUV, and ζ |
 | **Chemistry** | Top formation / destruction reactions with contribution metrics |
-| **Intensities** | SIMLINE line-intensity slice maps and spectrum |
-| **Spectra** | SimLine PV FITS velocity spectra / PV diagrams, plus a CARTA-style observational cube viewer |
-| **Interpolation error** | Native vs resampled grids with decimation error maps (abundance + SIMLINE) |
-| **CR attenuation** | ζ<sub>H₂</sub> vs N<sub>H</sub> profiles with Padovani 𝓛/𝓗/𝓤 reference bands |
-| **Probe ranking** | Regime-aware CRIR probe scores; **CR vs FUV dominance** maps D = \|S_ζ\|/(\|S_ζ\|+\|S_χ\|) over (χ₀, ζ) per density |
-| **Attenuation impact** | KoSens attenuation workflow: ζ error from ignoring attenuation, CR-probe quality, one verdict per tracer (single n_H or full 3-D, per environment) |
-| **Map fit** | Fit observed FITS maps to the 3-D SIMLINE model grid (KoSens3D) |
+| **Intensities** | Line-intensity slice maps and spectrum |
+| **Spectra** | Model PV FITS velocity spectra / PV diagrams, plus an observational cube viewer |
+| **Interpolation error** | Native vs resampled grids with decimation error maps (abundance + line intensities) |
+| **CR attenuation** | ζ<sub>H₂</sub> vs N<sub>H</sub> profiles with 𝓛/𝓗/𝓤 reference bands |
+| **Probe ranking** | Regime-aware CRIR probe scores; **CR vs FUV dominance** maps D = \|S_ζ\|/(\|S_ζ\|+\|S_χ\|) over (χ₀, ζ) per density. Method after Albertsson, Kauffmann & Menten (2018, ApJ, 868, 40; [doi:10.3847/1538-4357/aae775](https://doi.org/10.3847/1538-4357/aae775)) |
+| **Attenuation impact** | Attenuation workflow: ζ error from ignoring attenuation, CR-probe quality, one verdict per tracer (single n_H or full 3-D, per environment) |
+| **Map fit** | Fit observed FITS maps to the 3-D model line-intensity grid |
 
 ## How the grid is discovered
 
@@ -58,7 +54,7 @@ files are indexed with ``atten = 0``.
 ## Abundance profiles & heating / cooling
 
 For the selected model, depth profiles are read from the HDF5 file (via the
-KOSMA-τ metadata table and the `Relative densities` matrix) and shown against
+metadata table and the `Relative densities` matrix) and shown against
 either **A_V** or **n_H** (log/linear):
 
 **Abundance profiles** tab:
@@ -86,7 +82,7 @@ panels the line dash pattern is cycled alongside the colour so all components
 stay distinguishable.
 
 **Grid-integrated vs CRIR** integrates every rate as ∫4πr² Γ dr (the rates are
-already per volume; KoSens ``total_heating_cooling_calculation``). The absolute
+already per volume). The absolute
 figure takes a rate floor (default 0) and **Top N channels** (a channel is drawn
 if it is among the N largest in at least one plotted model). The **share bars**
 below give each channel's % of the total heating / cooling, with the attenuated
@@ -129,20 +125,19 @@ Each panel has its **own slider** for the third parameter (independent of the
 profile sliders). Cosmic-ray rate ζ is always plotted on the horizontal axis.
 
 Pick the **contoured quantity** from the dropdown (T_gas, T_dust, n_H at the
-cloud edge, or **X(species)** — clump-integrated relative abundance matching
-KoSens grid plots). Axes use log₁₀ values on linear scales. Use **Contour Z
+cloud edge, or **X(species)** — clump-integrated relative abundance). Axes use log₁₀ values on linear scales. Use **Contour Z
 scale** for log or linear coloring. Mass, metallicity, and attenuation are held
 at their grid mid-points when building each slice.
 
-### KoSens-style interpolation
+### Interpolation
 
 Before plotting, native grid points are resampled to a finer mesh (default
-60 × 60) using the same approach as KoSens3D `resampled_grid_data`:
+60 × 60):
 
 - **Values** interpolated in log₁₀ space (intensities, abundances, etc.)
 - **Axes** resampled in log₁₀ parameter space (n_H, χ, ζ)
-- **Missing / zero** cells imputed along rows and columns (KoSens flux imputation)
-  so sparse SIMLINE or incomplete grids do not produce blocky holes
+- **Missing / zero** cells imputed along rows and columns
+  so sparse line-intensity or incomplete grids do not produce blocky holes
 
 Controls on **Grid slices** and **Intensities**:
 
@@ -153,7 +148,7 @@ Controls on **Grid slices** and **Intensities**:
 | Interpolation method | linear, cubic, nearest, or spline |
 | Clip to original bounds | Prevent overshoot outside native min/max |
 
-Implementation: `grid_interp.py` (`resample_grid_2d_kosens`, `resample_grid_3d_kosens`).
+Implementation: `grid_interp.py`.
 
 ### Overlay triple panels (x-shift)
 
@@ -163,15 +158,16 @@ to **three** sub-plots in a row:
 1. Main grid (reference)
 2. Overlay grid (attenuated)
 3. **Horizontal x-shift** — log₁₀(x_match / x_nom) in dex, from intensity matching
-   along the x-axis (KoSens `grid_attenuation_compare`)
+   along the x-axis
 
 Use **X-shift scan direction** and **Intensity match tolerance (rtol)** to
 control the matching. On the shift panel, **positive** offsets are **red** and
 **negative** offsets are **blue** (`RdBu_r`).
 
-## SIMLINE intensities
+## Line intensities
 
-Load a **SIMLINE directory** on the Load tab (files named
+Line intensities are read directly from the model HDF5 files when present.
+Alternatively, load a **line-intensity directory** on the Load tab (files named
 `jtemp_Model…_<species>.smli`, `jerg_…`, or `tau_…` optical-depth tables; ``.smlc``
 is accepted for ``tau`` as well).
 
@@ -182,16 +178,16 @@ The **Intensities** tab provides:
 - Quantities: **K km/s** (`jtemp`), **erg s⁻¹ cm⁻² Hz⁻¹** (`jerg`), or **τ** (`tau`)
 - Same interpolation and x-shift controls as Grid slices
 
-An optional **overlay SIMLINE** directory (attenuated `.smli` files) enables the
+An optional **overlay line-intensity** directory (attenuated `.smli` files) enables the
 same triple-panel x-shift layout as for HDF5 grid slices.
 
-## SIMLINE spectra (PV FITS)
+## Model spectra (PV FITS)
 
-When SimLine is run with **`-fits`**, position–velocity cubes are written as
+Position–velocity cubes written as
 ``Model<tag>_DD_MM_FF_ZZ_CC_AA_<species>.<transition>.fits`` (brightness
 temperature) and ``…<transition>-tau.fits`` (optical depth) in the same
 directory as the ``.smli`` files. The **Spectra** tab reads these cubes
-locally via ``simline_spectra.py`` (no KoSens dependency):
+via ``simline_spectra.py``:
 
 - **Quantity** — **T<sub>mb</sub> [K]** (default PV cubes) or **τ** optical depth
   (``*-tau.fits`` cubes, matching ``tau_Model…`` ``.smli`` tables)
@@ -215,19 +211,18 @@ window, or paste a path. Controls:
   moment-0), or a single row/pixel index
 - **Line core limits** — velocities *outside* this range define the continuum
   (polynomial degree 1); inside is the line core for the Gaussian fit
-- **N Gaussians** — multi-component line model (Astropy LevMar, same as KoSens)
+- **N Gaussians** — multi-component line model (Astropy LevMar)
 - **Optional Peak / v₀ / FWHM** per component — starting values (blank = auto).
   **Lock filled values** holds those parameters instead of fitting them.
   Width is FWHM, not σ.
-- **Overlay** — plot the observed spectrum on the SimLine 1-D panel
+- **Overlay** — plot the observed spectrum on the model 1-D panel
 - **Fit Gaussians** — continuum + sum of Gaussians; shows per-component
   amplitudes, centres, widths, integrated intensities, and total
   ``∫I dv`` with propagated uncertainty
 
-Implementation: ``obs_spectrum_fits.py`` (vendored from KoSens ``spectrum_fits``;
-no KoSens import).
+Implementation: ``obs_spectrum_fits.py``.
 
-### Cube viewer (CARTA-like)
+### Cube viewer
 
 The **Cube viewer** sub-tab under **Spectra** is a custom reader for the IRAM
 30 m CLASS/GILDAS ``MATRIX`` tables (and ordinary NAXIS=3 image cubes). Those
@@ -240,7 +235,7 @@ gridded here:
   RA offset increases to the left (sky convention).
 - **Spectrum** (right) — **Pixel / region** uses a map click or a box/lasso
   average; **Mean (whole map)** is the nan-mean of every filled OTF cell
-  (same spatial-mean option as the SimLine observational overlay).
+  (same spatial-mean option as the model observational overlay).
   **Spectrum X axis** switches between LSR velocity and observed frequency
   (GHz; radio definition).
 - **Possible lines** — a separate panel under the map/spectrum lists catalog
@@ -248,10 +243,12 @@ gridded here:
   ~50 MHz for a CLASS OTF cube, so you see the target line plus hyperfine
   structure such as N₂H⁺ 1–0). The list is filled as soon as a cube is
   loaded (it does not depend on the selected pixel). Default is a local
-  3 mm list; **Splatalogue (CDMS/JPL)** queries rest frequencies that fall
-  in the cube’s frequency window (the same window whether the spectrum is
-  plotted in velocity or frequency). ``astroquery`` ≥ 0.4.8 returns those
-  IDs as ``orderedfreq`` in MHz. **Source VLSR** Doppler-shifts catalog
+  3 mm list; **CDMS**, **JPL** or **CDMS + JPL** query those catalogues
+  directly (``astroquery.linelists``) for rest frequencies that fall in the
+  cube’s frequency window (the same window whether the spectrum is plotted in
+  velocity or frequency). E_u is computed from the catalogue’s lower-state
+  energy, and up to 80 lines below the E_u limit are listed, lowest E_u first.
+  If one service is down, its error is shown above the rows of the other. **Source VLSR** Doppler-shifts catalog
   lines onto the observed frame. Optional purple markers overlay the spectrum.
 - **Measurements** — peak T, v(peak), ν(peak), centroid, half-max FWHM, integrated
   intensity, RMS, S/N, and sky position. Optional multi-Gaussian fit adds
@@ -259,7 +256,7 @@ gridded here:
   FWHM starting values for each component (or lock filled values).
 - Species labels come from the **filename + RESTFREQ**, not the CLASS ``LINE``
   keyword (often a leftover backend name such as ``HCN_LSB``).
-- **Regions (CARTA-style masks)** — the map tool bar has box, circle/ellipse and
+- **Regions (masks)** — the map tool bar has box, circle/ellipse and
   polygon drawing tools plus an eraser. Shapes stay editable (drag / resize); the
   spectrum, measurements and Gaussian fit use the mean over every pixel whose
   centre lies inside any region. **Add circle** places a circle by numbers:
@@ -275,40 +272,37 @@ is filled in). Implementation: ``cube_viewer.py``.
 
 ## Interpolation error check
 
-The **Interpolation error** tab reproduces KoSens3D
-``plot_interpolation_comparison`` / ``resampled_grid_data`` with
-``calculate_error=True``:
+The **Interpolation error** tab compares native and resampled grids:
 
 1. **Original** — native model grid (one point per grid folder)
-2. **Interpolated** — KoSens-style resample to the chosen ny × nx mesh
+2. **Interpolated** — log-space resample to the chosen ny × nx mesh
 3. **Error** — checkerboard decimation → re-interpolation on the native mesh;
    relative (%) or absolute error in linear flux / abundance units
 
 When both data sources are loaded, each slice plane shows:
 
 - **Abundance / diagnostic** row (from the main HDF5 grid quantity dropdown)
-- **SIMLINE intensity** row (species + transition)
+- **Line intensity** row (species + transition)
 
 ## CR attenuation profiles
 
-The **CR attenuation** tab follows the KoSens ``CR_atten_plot`` notebook:
+The **CR attenuation** tab shows:
 
-- **ζ<sub>H₂</sub> vs N<sub>H</sub> = N(H) + 2N(H₂)** (or A<sub>V</sub>) from KOSMA
-  structure output (`cosray` × 20/13, `cd_prof_h`, `cd_prof_h2`), as KoSens ``CRIR_ratio``
-- **Padovani et al. (2018/2024)** reference bands 𝓛, 𝓗, 𝓤 with ± factor-of-2
+- **ζ<sub>H₂</sub> vs N<sub>H</sub> = N(H) + 2N(H₂)** (or A<sub>V</sub>) from the model
+  structure output (`cosray` × 20/13, `cd_prof_h`, `cd_prof_h2`)
+- Reference bands 𝓛, 𝓗, 𝓤 with ± factor-of-2
   uncertainty shading, placed at N<sub>H</sub> = 2 N(H₂)
 - **Add current model** — snapshot the slider selection; **Add all overlay matches**
   — add every attenuated model at the current density / mass / FUV / metallicity
 - Optional log-log extrapolation to 10²⁵ cm⁻² and attenuation-threshold vertical
   line (stopping rate, default 10²⁰ cm⁻²)
 
-No observational data points are plotted. Implementation: ``cr_attenuation.py``
-(vendored Padovani polynomials from KoSens ``functions_for_cratten``).
+No observational data points are plotted. Implementation: ``cr_attenuation.py``.
 
 Controls match the slice tabs (interpolation method, grid size, axis limits) plus
 **error decimation factor**, **error metric**, **relative threshold**,
 **flux scale**, and **colormap** (default Magma). Error panel uses `RdYlGn_r`
-(green = low error, red = high), as in KoSens.
+(green = low error, red = high).
 
 ## Formation / destruction reactions (chemistry grid)
 
@@ -325,7 +319,7 @@ Pick the species, set **Top reactions / depth point** (N), and choose a
 
 | Metric | Description |
 |---|---|
-| **Fractional contribution** (default) | ∫ 4π r² R dr / ∫ 4π r² R_tot dr: share of the clump-integrated total rate (matches `KOSMA_tau_READ_chem.ipynb`) |
+| **Fractional contribution** (default) | ∫ 4π r² R dr / ∫ 4π r² R_tot dr: share of the clump-integrated total rate |
 | **Rate per X particle** | ∫ 4π r² R dr / ∫ 4π r² n(X) dr = (dN/dt) / N_X (s⁻¹); summed over all reactions it gives 1/τ |
 
 R is the volumetric reaction rate (cm⁻³ s⁻¹) from the `frate_*`/`drate_*` columns. It is
@@ -350,22 +344,22 @@ with labels from the chem-grid metadata table, plotted against A_V
 
 ## Observational map fit
 
-The **Map fit** tab builds 3-D SIMLINE intensity cubes (density × FUV × ζ) and
+The **Map fit** tab builds 3-D line-intensity cubes (density × FUV × ζ) and
 runs ``fit_fits_maps_to_grids_3d`` against user-supplied observed FITS
 maps. Requires:
 
-- Main grid + SIMLINE directory loaded
+- Main grid + line intensities loaded
 
 Provide JSON mappings of spectroscopic line keys to FITS paths and optional
 per-line errors. Output includes fitted n_H, χ, and ζ maps and reduced χ² maps
 (written to the chosen output directory).
 
-With an attenuated SIMLINE overlay loaded and **ε_att** ticked, the maps are
+With an attenuated line-intensity overlay loaded and **ε_att** ticked, the maps are
 refitted with the attenuated grids (``fitted_atten_*``) and
 ε_att (Eq. 16) = log₁₀(ζ_atten / ζ_const) is shown and written to
 ``fitted_<z>_atten_shift_dex.fits``. **Distance / circle radii / scale bar** draw
 circles of physical radius (pc) at the map centre and a scale bar on every
-fitted map (KoSens ``circles_pc`` / ``scale_pc``).
+fitted map.
 
 Implementation: `grid_fit.py`, `map_fit.py`, `map_fit_extras.py`.
 
@@ -377,16 +371,16 @@ attenuated grid). On profile plots it appears as **dashed, translucent lines**
 current slider selection on **every axis except attenuation**, so the
 attenuated counterpart of each model (different `AA` tag) lines up automatically.
 
-The same matching applies to chemistry grids and SIMLINE directories. On slice
+The same matching applies to chemistry grids and line-intensity directories. On slice
 tabs, overlays additionally enable the triple-panel x-shift view described above.
 
-> The overlay assumes the same KOSMA-τ chemical network / species ordering as
+> The overlay assumes the same chemical network / species ordering as
 > the main grid (true for an attenuated version of the same grid).
 
-## Attenuation impact (KoSens attenuation workflow)
+## Attenuation impact
 
-With the attenuated grid loaded as the overlay (SIMLINE overlay for line
-intensities), this tab runs the KoSens procedure
+With the attenuated grid loaded as the overlay (line-intensity overlay for line
+intensities), this tab runs the procedure
 `plot_attenuation_shift_summary` → `plot_attenuation_fuv_response` →
 `reconcile_attenuation_species` and keeps its two questions apart: *which lines
 mislead most if attenuation is ignored* (correction priority) and *which lines
@@ -410,12 +404,11 @@ below the detection limit enter at Δ = 0 and R = 0, and no species is excluded.
 **Compute** builds both cubes and runs the per-cell shift search (the slow
 part); every threshold then applies instantly to the cached cells. Each step
 has "How to read" panels, and the **Guide** sub-tab renders
-`docs/attenuation_workflow.md`, `docs/probe_margin_explained.md` (KoSens,
-verbatim) and `docs/attenuation_good_values.md` (name mapping, 3-D mode, and
+`docs/attenuation_workflow.md`, `docs/probe_margin_explained.md` and `docs/attenuation_good_values.md` (name mapping, 3-D mode, and
 the good value of every quantity).
 
-Implementation: `atten_compare.py` (numerics identical to KoSens —
-`tests/test_atten_compare.py` checks parity — plus Plotly figures).
+Implementation: `atten_compare.py` (numerics checked by
+`tests/test_atten_compare.py`, plus Plotly figures).
 
 ## Install & run
 
@@ -441,18 +434,18 @@ pulling updates so new packages (in particular **astroquery**) are picked up.
 | `dash`, `plotly` | Interactive UI and figures |
 | `numpy`, `scipy` | Arrays, interpolation, numerics |
 | `pandas` | Per-cell tables of the **Attenuation impact** workflow |
-| `h5py` | KOSMA-τ / chemistry HDF5 grids |
+| `h5py` | Model / chemistry HDF5 grids |
 | `astropy` | FITS cubes, WCS, Gaussian line fitting |
-| `astroquery` | Splatalogue (CDMS/JPL) line ID on **Spectra → Cube viewer** |
+| `astroquery` | CDMS / JPL line ID on **Spectra → Cube viewer** |
 | `tqdm` | Progress bar during map fitting |
 | `Pillow` | Image export |
 
 The cube viewer’s **local 3 mm catalog** works with the core stack only.
-**Splatalogue** needs `astroquery` and a network connection. To install that
+**CDMS / JPL** need `astroquery` and a network connection. To install that
 piece on its own:
 
 ```bash
-python -m pip install 'astroquery>=0.4.7'
+python -m pip install 'astroquery>=0.4.8'
 ```
 
 **Optional: Graphviz** (a system program, not a pip package) lays out the
@@ -479,17 +472,17 @@ conda install graphviz        # or: sudo apt install graphviz / brew install gra
 | Module | Role |
 |---|---|
 | `app.py` | Dash UI, callbacks, plotting |
-| `grid_interp.py` | KoSens-aligned 2-D / 3-D grid resampling |
+| `grid_interp.py` | 2-D / 3-D grid resampling |
 | `grid_fit.py` | 3-D intensity cubes and FITS map fit |
 | `map_fit.py` | Core FITS-to-grid fitting (`fit_fits_maps_to_grids_3d`) |
 | `map_fit_extras.py` | Ratio grids, chi² analysis helpers for map fitting |
-| `simline_spectra.py` | SimLine PV FITS spectra and PV diagrams (local, no KoSens) |
-| `cr_attenuation.py` | CR attenuation profiles and Padovani reference bands (local, no KoSens) |
-| `atten_compare.py` | Reference vs attenuated grid comparison (KoSens attenuation workflow port, x-shift match, Plotly figures) |
+| `simline_spectra.py` | Model PV FITS spectra and PV diagrams |
+| `cr_attenuation.py` | CR attenuation profiles and reference bands |
+| `atten_compare.py` | Reference vs attenuated grid comparison (attenuation workflow, x-shift match, Plotly figures) |
 | `obs_spectrum_fits.py` | Observational FITS spectra extraction and Gaussian fitting |
-| `cube_viewer.py` | CLASS MATRIX / spectral-cube map + spectrum (CARTA-like) |
-| `line_catalog.py` | Local 3 mm line list and optional Splatalogue queries |
-| `smli_labels.py` | SIMLINE transition label formatting |
+| `cube_viewer.py` | CLASS MATRIX / spectral-cube map + spectrum |
+| `line_catalog.py` | Local 3 mm line list and optional CDMS / JPL queries |
+| `smli_labels.py` | Line transition label formatting |
 | `model_config.py` | JSON config scan and Model setup panel |
 
 ## Export
@@ -500,7 +493,7 @@ conda install graphviz        # or: sudo apt install graphviz / brew install gra
 
 ## Notes
 
-- Profiles are read using fixed KOSMA-τ dataset paths
+- Profiles are read using fixed HDF5 dataset paths
   (`Local quantities/Positions`, `Local quantities/Gas state`,
   `Local quantities/Densities/Relative densities`) and the
   `Additional output/species involved` list, which aligns 1:1 with the density

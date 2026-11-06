@@ -1,5 +1,5 @@
 /**
- * KOSMA-τ Grid Explorer - Export Format Handler
+ * PRISMA - Export Format Handler
  * 
  * Updates all Plotly graphs to use the selected export format (PNG or SVG)
  * when clicking the camera icon in the modebar.
@@ -22,7 +22,7 @@
                     gd._context.toImageButtonOptions = {
                         format: format,
                         scale: scale,
-                        filename: (gd.id || 'kosma_plot').replace(/[^a-zA-Z0-9_-]/g, '_')
+                        filename: (gd.id || 'prisma_plot').replace(/[^a-zA-Z0-9_-]/g, '_')
                     };
                 }
                 
@@ -31,7 +31,7 @@
                     gd._fullLayout._config.toImageButtonOptions = {
                         format: format,
                         scale: scale,
-                        filename: (gd.id || 'kosma_plot').replace(/[^a-zA-Z0-9_-]/g, '_')
+                        filename: (gd.id || 'prisma_plot').replace(/[^a-zA-Z0-9_-]/g, '_')
                     };
                 }
             } catch (e) {
@@ -39,7 +39,7 @@
             }
         });
         
-        console.log('[KOSMA Export] All graphs updated to:', format);
+        console.log('[PRISMA Export] All graphs updated to:', format);
     }
     
     // Listen for radio button changes
@@ -71,7 +71,7 @@
     
     // Initial setup and periodic refresh
     function init() {
-        console.log('[KOSMA Export] Initializing export format handler...');
+        console.log('[PRISMA Export] Initializing export format handler...');
         
         setupListener();
         
@@ -95,7 +95,7 @@
         setTimeout(checkInitial, 500);
         setTimeout(checkInitial, 1500);
         
-        console.log('[KOSMA Export] Handler ready');
+        console.log('[PRISMA Export] Handler ready');
     }
     
     // Start when DOM is ready

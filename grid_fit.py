@@ -274,7 +274,7 @@ def build_grids_3d_dict(
         missing = [n for n in line_names if n not in lookup]
         if missing:
             raise ValueError(
-                f'No SIMLINE transition for line(s): {missing}. '
+                f'No line transition for: {missing}. '
                 f'Available: {sorted(lookup.keys())}'
             )
 

@@ -1,15 +1,14 @@
-# Attenuation impact — prisma-tool notes and good values
+# Attenuation impact — PRISMA notes and good values
 
 The other two documents on this page (`attenuation_workflow.md`,
-`probe_margin_explained.md`) are the KoSens documentation, kept verbatim so
-they can be re-synced. This file says where their names live in the tab, what
-the 3-D mode adds, and which values to look for.
+`probe_margin_explained.md`) describe the full workflow. This file says where
+their names live in the tab, what the 3-D mode adds, and which values to look for.
 
-## Where the KoSens names live in this tab
+## Where each quantity lives in this tab
 
-| KoSens name (in the docs) | In prisma-tool |
+| Name in the workflow docs | In PRISMA |
 |---|---|
-| `HDF5_DIR_NO_ATTEN` / `HDF5_DIR_ATTEN` | main grid / **overlay grid** on the Load tab (SIMLINE overlay for line intensities) |
+| `HDF5_DIR_NO_ATTEN` / `HDF5_DIR_ATTEN` | main grid / **overlay grid** on the Load tab (line-intensity overlay for line intensities) |
 | `grid_slice_filters` (fixed n) | **Mode** → single n_H slice; mass, metallicity and the other axes follow the sliders |
 | `target_shape` | **Resample to n per axis**: ζ × χ for a single slice (native densities), ζ × χ × n_H in 3-D (default 24³) |
 | `plot_triple_grid_ratio` (stage 3) | Grids / Intensities tab with the overlay loaded |
@@ -30,7 +29,7 @@ Settings that must agree between the steps (exclude ice / isotopologues, max
 per constituent) are entered once and passed to every step, so they cannot
 drift apart.
 
-Species selection follows KoSens: *exclude ice* and *exclude isotopologues* in
+Species selection: *exclude ice* and *exclude isotopologues* in
 every mode, and in 3-D mode `require_catalog` (**3-D: only species in CDMS/JPL**,
 on by default) — only species, and ratios whose both sides, have laboratory
 spectroscopy are graded; the dropped keys are listed in the notes above the

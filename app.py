@@ -120,7 +120,9 @@ CUBE_XAXIS_OPTIONS = [
 ]
 CUBE_LINECAT_OPTIONS = [
     {'label': ' Local 3 mm catalog', 'value': 'local'},
-    {'label': ' Splatalogue (CDMS/JPL)', 'value': 'splatalogue'},
+    {'label': ' CDMS (online)', 'value': 'cdms'},
+    {'label': ' JPL (online)', 'value': 'jpl'},
+    {'label': ' CDMS + JPL (online)', 'value': 'cdms+jpl'},
 ]
 DEFAULT_CUBE_LINECAT = 'local'
 _CV_SPEC_HEIGHT = 360
@@ -1041,7 +1043,7 @@ def _scan_files(directory, recursive):
     if not files:
         raise ValueError(
             'Found .hdf5 files but none had encoded <tag>_DD_MM_FF_ZZ_CC[_AA] '
-            'names or readable KOSMA-τ grid parameters (protdens / cmass / '
+            'names or readable grid parameters (protdens / cmass / '
             'radm_ini / metal / cosray).'
         )
 
@@ -2130,7 +2132,7 @@ def run_map_fit_job(maps_json, errors_json, output_dir, idef,
     if not _grid:
         raise RuntimeError('Load a main grid directory on the Load tab first.')
     if not _simline:
-        raise RuntimeError('Load a SIMLINE directory on the Load tab first.')
+        raise RuntimeError('Load line intensities on the Load tab first.')
 
     maps = gf.parse_json_dict(maps_json)
     if not maps:
@@ -4275,7 +4277,7 @@ def _reaction_contribution_table(order, labels, stats, mode, ranking_metric):
         rate_hdr = 'Rate per X particle (s\u207B\u00B9)'
         weight_note = ('Volume integrals \u222B 4\u03C0 r\u00B2 R dr of the volumetric rates R '
                        '(cm\u207B\u00B3 s\u207B\u00B9); N_X = \u222B 4\u03C0 r\u00B2 n(X) dr for '
-                       'the selected species (KoSens chem read).')
+                       'the selected species.')
     else:
         rate_hdr = 'Integrated |rate|'
         weight_note = ('Structure grid unavailable \u2014 |rate| integrated over A_V.')
@@ -4725,15 +4727,15 @@ def _build_probe_grids_3d(
 
     if quantity == 'intensity':
         if not _simline:
-            raise RuntimeError('Load a SIMLINE directory to rank line intensities.')
+            raise RuntimeError('Load line intensities to rank line intensities.')
         if overlay and not _simline_overlay:
-            raise RuntimeError('Load the attenuated SIMLINE directory as the SIMLINE overlay '
+            raise RuntimeError('Load the attenuated line-intensity directory as the line-intensity overlay '
                                'on the Load tab.')
         lookup = gf._line_lookup(_simline, idef or SIMLINE_DEFAULT_IDEF)
         missing = [n for n in tracers if n not in lookup]
         if missing:
             raise ValueError(
-                f'No SIMLINE transition for: {missing}. '
+                f'No line transition for: {missing}. '
                 'Pick spectroscopic line keys such as CO(1-0).'
             )
         n_work = max(1, len(tracers) * n_models)
@@ -4810,7 +4812,7 @@ def _build_probe_grids_3d(
 
         if (tz, ty, tx) != (nz, ny, nx):
             x_phys, y_phys, z_phys = phys
-            _p(0.82, 'KoSens-style resampling of 3-D cubes…')
+            _p(0.82, 'Resampling 3-D cubes…')
             tracers_len = max(1, len(tracers))
             for i_sp, sp in enumerate(tracers, 1):
                 if callable(progress):
@@ -5987,7 +5989,7 @@ def fig_spaghetti_plane(plane, slice_idx, contour_entries, idef,
     if not plane.get('active'):
         return placeholder_fig(theme=theme), None, None
     if not _grid or not _simline:
-        return placeholder_fig('Load grids and a SIMLINE directory', theme=theme), None, None
+        return placeholder_fig('Load grids and line intensities', theme=theme), None, None
     if not contour_entries:
         return placeholder_fig(
             'Provide observed intensities (line = value) above', theme=theme), None, None
@@ -6027,7 +6029,7 @@ def fig_spaghetti_plane(plane, slice_idx, contour_entries, idef,
         colors.append(INT_CONTOUR_COLORS[i % len(INT_CONTOUR_COLORS)])
 
     if not names or x_plot is None:
-        return placeholder_fig('No matching SIMLINE lines for the given names',
+        return placeholder_fig('No matching lines for the given names',
                                theme=theme), None, None
 
     t = _theme_colors(theme)
@@ -6956,9 +6958,9 @@ def fig_intensity_contour_plane(plane, slice_idx, species, idef, transition_idx,
     if not plane.get('active'):
         return placeholder_fig(theme=theme)
     if not _grid:
-        return placeholder_fig('Load a grid or SIMLINE directory', theme=theme)
+        return placeholder_fig('Load a grid or line intensities', theme=theme)
     if not _simline:
-        return placeholder_fig('Load a SIMLINE directory on the Load tab', theme=theme)
+        return placeholder_fig('Load line intensities on the Load tab', theme=theme)
 
     sk = plane['slice']
     slice_tokens = _grid['axis_tokens'][sk]
@@ -6976,7 +6978,7 @@ def fig_intensity_contour_plane(plane, slice_idx, species, idef, transition_idx,
         slider_values=slider_values)
 
     if not np.any(np.isfinite(Z)):
-        return placeholder_fig('No SIMLINE data for this slice', theme=theme)
+        return placeholder_fig('No line-intensity data for this slice', theme=theme)
 
     unit = _intensity_unit_label(idef)
     sp_html = format_species_html(species)
@@ -7308,7 +7310,7 @@ def fig_intensity_rgb_plane(plane, slice_idx, line_keys, idef, transition_flags,
     if not plane.get('active'):
         return placeholder_fig(theme=theme)
     if not _grid or not _simline:
-        return placeholder_fig('Load a grid and SIMLINE directory', theme=theme)
+        return placeholder_fig('Load a grid and line intensities', theme=theme)
     line_keys = list(line_keys or [])
     if len(line_keys) < 3 or any(not k for k in line_keys[:3]):
         return placeholder_fig('Select three lines for the RGB channels', theme=theme)
@@ -7325,7 +7327,7 @@ def fig_intensity_rgb_plane(plane, slice_idx, line_keys, idef, transition_flags,
     for key in line_keys[:3]:
         resolved = _resolve_simline_line(key, idef)
         if not resolved:
-            return placeholder_fig(f'Unknown SIMLINE line: {key}', theme=theme)
+            return placeholder_fig(f'Unknown line: {key}', theme=theme)
         sp, tidx = resolved
         x_phys, y_phys, Z, xdef, ydef = build_intensity_slice_grid(
             plane, slice_token, sp, idef, tidx,
@@ -7333,7 +7335,7 @@ def fig_intensity_rgb_plane(plane, slice_idx, line_keys, idef, transition_flags,
         grids.append(Z)
         labels.append(key)
     if not any(np.any(np.isfinite(g)) for g in grids):
-        return placeholder_fig('No SIMLINE data for this RGB slice', theme=theme)
+        return placeholder_fig('No line-intensity data for this RGB slice', theme=theme)
 
     transitions = _intensity_rgb_transition_layers(
         plane, slice_token, transition_flags, idef, line_keys[:3],
@@ -7550,9 +7552,9 @@ def fig_intensity_spectrum(values, species, idef, theme='light', int_slice_indic
     ``species`` may be a list; each selected species is overplotted.
     """
     if not _grid:
-        return placeholder_fig('Load a grid or SIMLINE directory', theme=theme)
+        return placeholder_fig('Load a grid or line intensities', theme=theme)
     if not _simline:
-        return placeholder_fig('Load a SIMLINE directory on the Load tab', theme=theme)
+        return placeholder_fig('Load line intensities on the Load tab', theme=theme)
     species_list = _as_str_list(species)
     if not species_list:
         return placeholder_fig('Select a species', theme=theme)
@@ -7790,7 +7792,7 @@ def fig_spectra_plot(values, species, transitions, positions_text,
                     fig.add_trace(go.Scatter(
                         x=velocities, y=spectrum, mode='lines',
                         line=dict(color=COLORS[trace_idx % len(COLORS)], width=1.5, shape='hv'),
-                        name=f'SimLine {tr_label}',
+                        name=f'Model {tr_label}',
                         hovertemplate=(
                             f'{tr_label}<br>v = %{{x:.3g}} km/s'
                             f'<br>{y_hover}<extra></extra>'
@@ -7803,8 +7805,8 @@ def fig_spectra_plot(values, species, transitions, positions_text,
                     selected = np.atleast_1d(selected)
                     for pos, spec in zip(selected, spectra):
                         pos_name = f'{pos:.2f}"'
-                        trace_name = (f'SimLine {tr_label} @ {pos_name}'
-                                      if len(trans_list) > 1 else f'SimLine {pos_name}')
+                        trace_name = (f'Model {tr_label} @ {pos_name}'
+                                      if len(trans_list) > 1 else f'Model {pos_name}')
                         fig.add_trace(go.Scatter(
                             x=velocities, y=spec, mode='lines',
                             line=dict(color=COLORS[trace_idx % len(COLORS)],
@@ -7818,11 +7820,11 @@ def fig_spectra_plot(values, species, transitions, positions_text,
                         trace_idx += 1
 
             if positions is None:
-                simline_subtitle = 'SimLine spatial mean'
+                simline_subtitle = 'model spatial mean'
             elif n_simline == 1:
-                simline_subtitle = f'SimLine, {len(selected)} position(s)'
+                simline_subtitle = f'model, {len(selected)} position(s)'
             else:
-                simline_subtitle = f'SimLine {n_simline} transitions'
+                simline_subtitle = f'model, {n_simline} transitions'
 
     fit_result = None
     fit_error = None
@@ -7881,25 +7883,25 @@ def fig_spectra_plot(values, species, transitions, positions_text,
             return placeholder_fig(f'Observational spectrum: {fit_error}', theme=theme), None, fit_error
         if has_simline_request:
             if not _grid:
-                return placeholder_fig('Load a grid or SIMLINE directory', theme=theme), None, None
+                return placeholder_fig('Load a grid or line intensities', theme=theme), None, None
             if not _simline:
-                return placeholder_fig('Load a SIMLINE directory on the Load tab',
+                return placeholder_fig('Load line intensities on the Load tab',
                                        theme=theme), None, None
             return placeholder_fig('Select species and transition(s)', theme=theme), None, None
         if obs_path and str(obs_path).strip():
             return placeholder_fig('Enter a valid observational FITS path', theme=theme), None, None
-        return placeholder_fig('Load SimLine data and/or an observational FITS cube',
+        return placeholder_fig('Load model line data and/or an observational FITS cube',
                               theme=theme), None, None
 
     sp_html = format_species_html(species) if species else ''
     if n_simline == 1 and species:
         title = f'{sp_html} spectrum  [{simline_subtitle}]'
     elif n_simline > 1:
-        title = f'{sp_html} — {n_simline} SimLine transitions'
+        title = f'{sp_html} — {n_simline} model transitions'
     elif fit_result is not None:
         title = f'Observed spectrum — {os.path.basename(fit_result.file_path)}'
     elif obs_overlay:
-        title = 'Observed + SimLine spectra'
+        title = 'Observed + model spectra'
     else:
         title = 'Spectra'
 
@@ -8600,8 +8602,8 @@ def fig_cube_spectrum(path, hdu, selection, v_low, v_high, n_gauss, do_fit,
         for vlim in (lo, hi):
             xv = _x_at_v(vlim)
             if np.isfinite(xv):
-                fig.add_vline(x=float(xv), line=dict(color='rgba(60,120,200,0.45)',
-                                                     width=1, dash='dot'))
+                fig.add_vline(x=float(xv), line=dict(color='white', width=3,
+                                                     dash='dash'))
 
     if mark_lines and line_rows:
         y_span = np.nanmax(y) - np.nanmin(y) if np.any(np.isfinite(y)) else 1.0
@@ -8898,17 +8900,19 @@ def _line_id_table_layout(cube, freq_window, line_rows, error, v_source):
         'Catalog matches in this cube’s frequency coverage — independent of '
         'the selected pixel. Purple markers on the spectrum use the same list.',
         style={'margin': '0 0 10px', 'opacity': 0.75, 'fontSize': '12px'})
-    if error:
-        return html.Div([header, blurb,
-                         html.Span(error, style={'color': '#d62728'})],
-                        style={'fontSize': '13px'})
+    err_msg = (html.P(error, style={'color': '#d62728', 'margin': '0 0 8px',
+                                    'whiteSpace': 'pre-line'})
+               if error else None)
+    if error and not line_rows:
+        return html.Div([header, blurb, err_msg], style={'fontSize': '13px'})
     if not line_rows:
         return html.Div([
             header, blurb,
             html.P('No catalog lines in this window. A CLASS cube is typically '
                    '~50 MHz wide, so you usually see the target line and any '
-                   'hyperfine components (e.g. N₂H⁺ 1–0). Try Splatalogue for a '
-                   'deeper CDMS/JPL search, or check the source VLSR.',
+                   'hyperfine components (e.g. N₂H⁺ 1–0). Try the CDMS or JPL '
+                   'catalogue for a deeper search, raise the E_u limit, or '
+                   'check the source VLSR.',
                    style={'margin': '0', 'opacity': 0.8}),
         ], style={'fontSize': '13px'})
 
@@ -8924,13 +8928,17 @@ def _line_id_table_layout(cube, freq_window, line_rows, error, v_source):
     ]
     if show_v:
         heads.append(html.Th('v (km/s)', style=center))
-    heads.append(html.Th('E_u (K)', style=center))
+    heads += [html.Th('E_u (K)', style=center), html.Th('Catalog', style=center)]
     body = [html.Tr(heads, style={'backgroundColor': 'var(--accent-soft)'})]
     for rec in line_rows:
         eu = rec.get('eu_k')
         eu_s = f'{eu:.1f}' if eu is not None and np.isfinite(eu) else '—'
         cols = [
-            html.Td(rec.get('species') or '—', style=cell),
+            html.Td(html.A(rec.get('species') or '—', href=rec['url'],
+                           target='_blank', rel='noopener noreferrer',
+                           title=f'Open {rec.get("source")} entry (tag {rec.get("tag", 0):06d})')
+                    if rec.get('url') else (rec.get('species') or '—'),
+                    style=cell),
             html.Td(rec.get('transition') or '—', style=cell),
             html.Td(f'{rec["rest_ghz"]:.6f}', style=center),
             html.Td(f'{rec["obs_ghz"]:.6f}', style=center),
@@ -8939,17 +8947,21 @@ def _line_id_table_layout(cube, freq_window, line_rows, error, v_source):
             v_line = lc.radio_velocity_kms(rec['obs_ghz'], rest0)
             cols.append(html.Td(
                 f'{v_line:.2f}' if np.isfinite(v_line) else '—', style=center))
-        cols.append(html.Td(eu_s, style=center))
+        cols += [html.Td(eu_s, style=center),
+                 html.Td(rec.get('source', 'local'), style=center)]
         body.append(html.Tr(cols))
     note = html.P(
         f'{len(line_rows)} line(s). Rest frequencies from the '
-        f'{line_rows[0].get("source", "local")} catalog; observed frequency uses '
+        f'{" + ".join(sorted({r.get("source", "local") for r in line_rows}))} '
+        'catalog; observed frequency uses '
         'the radio definition ν = ν₀ (1 − v/c).'
         + ('  v is LSR velocity of ν obs relative to the cube rest frequency.'
-           if show_v else ''),
+           if show_v else '')
+        + ('  Click a species to open its CDMS / JPL catalogue entry.'
+           if any(r.get('url') for r in line_rows) else ''),
         style={'margin': '8px 0 0', 'opacity': 0.7, 'fontSize': '12px'})
     return html.Div([
-        header, blurb,
+        header, blurb, err_msg,
         html.Table(body, style={'borderCollapse': 'collapse', 'width': '100%'}),
         note,
     ], style={'fontSize': '13px', 'lineHeight': '1.4'})
@@ -8959,9 +8971,9 @@ def fig_simline_pv(values, species, transition, pos_min, pos_max, zscale,
                    colorscale, pv_quantity='intensity', theme='light'):
     """Position-velocity diagram from a SimLine PV FITS cube."""
     if not _grid:
-        return placeholder_fig('Load a grid or SIMLINE directory', theme=theme)
+        return placeholder_fig('Load a grid or line intensities', theme=theme)
     if not _simline:
-        return placeholder_fig('Load a SIMLINE directory on the Load tab', theme=theme)
+        return placeholder_fig('Load line intensities on the Load tab', theme=theme)
     if isinstance(transition, (list, tuple)):
         transition = transition[0] if transition else None
     if not species or not transition:
@@ -9458,6 +9470,21 @@ _CUBE_MAP_CFG = {
 _SLICE_GRAPH_CFG = {**_GRAPH_CFG, 'responsive': False}
 _TAB_STYLE = {}
 _TAB_SEL = {}
+
+BUG_REPORT_REPO = 'https://github.com/theodorostopkaras/prisma-tool'
+
+
+def _bug_issue_url(title, body, steps):
+    """GitHub 'new issue' URL prefilled with the report; the user submits it there."""
+    import platform
+    from urllib.parse import urlencode
+    env = (f'- Python {platform.python_version()}, Dash {dash.__version__}\n'
+           f'- {platform.platform()}')
+    text = (f'### Description\n{(body or "").strip()}\n\n'
+            f'### Steps to reproduce\n{(steps or "").strip()}\n\n'
+            f'### Environment\n{env}\n')
+    q = urlencode({'title': (title or '').strip() or '[Bug] ', 'body': text, 'labels': 'bug'})
+    return f'{BUG_REPORT_REPO}/issues/new?{q}'
 _NESTED_TAB_STYLE = {}
 _NESTED_TAB_SEL = {}
 _PAGE_INTRO = {'margin': '0 0 14px', 'fontSize': '13px', 'lineHeight': '1.5',
@@ -9580,7 +9607,7 @@ _HDF5_FILETYPES = (
     ('All files', '*.*'),
 )
 _SIMLINE_FILETYPES = (
-    ('SIMLINE files', '*.smli *.smlc'),
+    ('Line-intensity files', '*.smli *.smlc'),
     ('All files', '*.*'),
 )
 _FITS_FILETYPES = (
@@ -9607,7 +9634,7 @@ _PATH_BROWSE = (
     {
         'button': 'btn-browse-simline',
         'input': 'simline-dir-input',
-        'title': 'Select any SIMLINE file in the output folder',
+        'title': 'Select any line-intensity file in the output folder',
         'filetypes': _SIMLINE_FILETYPES,
         'keep': 'folder',
         'mode': 'file',
@@ -9631,7 +9658,7 @@ _PATH_BROWSE = (
     {
         'button': 'btn-browse-simline-overlay',
         'input': 'simline-overlay-dir-input',
-        'title': 'Select any overlay SIMLINE file in the output folder',
+        'title': 'Select any overlay line-intensity file in the output folder',
         'filetypes': _SIMLINE_FILETYPES,
         'keep': 'folder',
         'mode': 'file',
@@ -10152,7 +10179,7 @@ def _atten_impact_page():
     info = html.Div(className='probe-info', children=[html.Div([
         html.Strong('What this page answers'),
         html.P('The main grid is the constant-cosmic-ray reference; the overlay grid loaded on '
-               'the Load tab (the SIMLINE overlay for line intensities) is its attenuated twin. '
+               'the Load tab (the line-intensity overlay for line intensities) is its attenuated twin. '
                'Fitting a real — attenuated — source with the constant-CR grid returns the wrong '
                'ζ. This page measures by how much, for which tracers, and why, keeping two '
                'questions apart:', style={'margin': '6px 0 6px'}),
@@ -10190,7 +10217,7 @@ def _atten_impact_page():
     selection = _ai_card('1', 'What to compare', html.Div([
         _ai_field('Quantity', _choice(id='ai-quantity', options=PROBE_QUANTITY_OPTIONS,
                                              value='rel_abund', **_RADIO),
-                  'Line intensities need a SIMLINE directory and a SIMLINE overlay; abundances '
+                  'Line intensities need a line-intensity directory and its overlay; abundances '
                   'and column densities use the HDF5 grid and its overlay.'),
         html.Div(id='ai-idef-wrap', style={'display': 'none'}, children=_ai_field(
             'Intensity units', _choice(id='ai-idef', options=SIMLINE_MAPFIT_IDEF_OPTIONS,
@@ -10203,11 +10230,11 @@ def _atten_impact_page():
             'Ice species have no line emission. Run once with and once without isotopologues '
             'to separate the two investigations. In 3-D mode only species (and ratios whose '
             'both sides) have laboratory spectroscopy in CDMS or JPL are graded, as nothing '
-            'else can be observed (KoSens require_catalog; H3+ and a few IR species are kept).'),
+            'else can be observed (H3+ and a few IR species are kept).'),
         _ai_field('Ratios', dcc.Checklist(id='ai-include-ratios',
                                           options=[{'label': ' include pairs', 'value': 'on'}],
                                           value=[], **_RADIO),
-                  'Also test ratios of the selected tracers (KoSens pairing rules); den_contrib '
+                  'Also test ratios of the selected tracers; den_contrib '
                   'tells when a ratio only restates its numerator.'),
         _ai_field('Species per figure', _ai_number('ai-max-species', 10, min=1, step=1),
                   'Steps 1 and 2 draw every selected species (after the filters) in as many '
@@ -10224,9 +10251,9 @@ def _atten_impact_page():
 
     setup = _ai_card('2', 'Grid and resolution', html.Div([
         _ai_field('Mode', _choice(id='ai-mode', value='single', options=[
-            {'label': ' single n_H slice (as KoSens)', 'value': 'single'},
+            {'label': ' single n_H slice', 'value': 'single'},
             {'label': ' full 3-D grid (n_H × χ × ζ)', 'value': '3d'}], **_RADIO),
-            'Single: the (ζ, χ) plane at one density — exactly the KoSens procedure. 3-D: every '
+            'Single: the (ζ, χ) plane at one density. 3-D: every '
             'density slice, pooled, plus verdicts per (n_H, χ, ζ) environment.'),
         html.Div(id='ai-density-wrap', children=_ai_field(
             'Density n_H [cm⁻³]',
@@ -10236,7 +10263,7 @@ def _atten_impact_page():
             dcc.Checklist(id='ai-interp-enable', options=[{'label': ' on', 'value': 'on'}],
                           value=['on'], **_RADIO),
             _ai_number('ai-interp-n', 60, min=2, max=200, step=1)]),
-            'KoSens interpolates before the shift search: a single slice to n × n in ζ × χ '
+            'Interpolate before the shift search: a single slice to n × n in ζ × χ '
             '(60 × 60, native densities), the 3-D grid to an n × n × n cube in ζ × χ × n_H '
             '(24³; the cost scales with n³). Off = native models only: faster, every cell a '
             'real model, but fractions over fewer cells.'),
@@ -10245,7 +10272,7 @@ def _atten_impact_page():
         html.Div([
             _ai_field('n_H bins', _ai_text('ai-env-n', '2'),
                       'A number = that many equal-log-width bins between the axis min and max '
-                      '(3 → low / mid / high, as KoSens); “full” = no split; or comma-separated '
+                      '(3 → low / mid / high); “full” = no split; or comma-separated '
                       'edge values, e.g. 1e3, 1e4. Also the bins of the step-1 heatmaps and '
                       'winner map.'),
             _ai_field('χ bins', _ai_text('ai-env-chi', '2'),
@@ -10417,7 +10444,7 @@ def _atten_impact_page():
             'Impact matrix options',
             _ai_field('D grid', _choice(
                 id='ai-d-grid', value='native', options=[
-                    {'label': ' native models (as KoSens)', 'value': 'native'},
+                    {'label': ' native models', 'value': 'native'},
                     {'label': ' resampled cube', 'value': 'interp'}], **_RADIO),
                 'The grid behind the D matrix, its ranking and the observer table: the '
                 'slopes of the models themselves, or of the resampled cube. The |Δ| matrix '
@@ -10432,14 +10459,12 @@ def _atten_impact_page():
             _ai_field('Rows from D', dcc.Checklist(
                 id='ai-impact-pair', value=['on'],
                 options=[{'label': ' pair with D matrix', 'value': 'on'}], **_RADIO),
-                'KoSens notebook: the impact matrix takes its rows from the CR-dominance (D) '
+                'The impact matrix takes its rows from the CR-dominance (D) '
                 'matrix, so each species sits in the same row of both.'),
             _ai_field('Rows', _ai_number('ai-impact-top', 15, min=1, step=1),
-                      'Species drawn: the largest median over the attenuated boxes (KoSens '
-                      'top_n).'),
+                      'Species drawn: the largest median over the attenuated boxes.'),
             _ai_field('Exclude', _ai_text('ai-impact-exclude', ''),
-                      'Comma-separated species dropped before the ranking (KoSens '
-                      'exclude_species), e.g. CH3OH.'),
+                      'Comma-separated species dropped before the ranking, e.g. CH3OH.'),
             _ai_field('min f_att', _ai_number('ai-min-f-att', 0.0, min=0, max=1, step=0.01),
                       'Boxes whose median CR-attenuated mass fraction is ≤ this never '
                       'switched attenuation on: blank in the impact matrix, left out of its '
@@ -10497,7 +10522,7 @@ def _atten_impact_page():
                    className='kosma-muted', style={'fontSize': '12px'}),
             _ai_graph('ai-fig-scope'),
             _ai_table_slot('ai-tbl-scope'),
-            html.H4('3-D · observer error table (KoSens observer_error_table_3d)'),
+            html.H4('3-D · observer error table'),
             html.P('Fitting with constant-ζ models at an FUV field off by δ = log χ_adopt − '
                    'log χ_true gives log(ζ_fit/ζ_true) = −ε_att − r·δ. Per box: Δ (grid-'
                    'matched shift, unmatched = 0), its linear form Δ_lin = −R/S_ζ, '
@@ -10551,13 +10576,13 @@ def _atten_impact_page():
     guide = [
         _doc_details('Good values — what to look for in every figure and table',
                      'attenuation_good_values.md', 'Good values', open_=True),
-        _doc_details('Where the KoSens names live in this tab', 'attenuation_good_values.md',
-                     'Where the KoSens names'),
+        _doc_details('Where each quantity lives in this tab', 'attenuation_good_values.md',
+                     'Where each quantity lives'),
         _doc_details('3-D mode', 'attenuation_good_values.md', '3-D mode'),
         _doc_details('Pitfalls', 'attenuation_workflow.md', '10. Pitfalls'),
         _doc_details('probe_margin and the ζ error, in pictures (with a worked example)',
                      'probe_margin_explained.md'),
-        _doc_details('The full workflow (KoSens documentation)', 'attenuation_workflow.md'),
+        _doc_details('The full workflow', 'attenuation_workflow.md'),
     ]
 
     def sub(label, value, children):
@@ -10629,6 +10654,27 @@ def _probe_ranking_page():
                 'Clump-integrated X uses ∫ 4π r² n dr / ∫ 4π r² n_H dr.',
                 style={'margin': '10px 0 0'},
             ),
+            html.P([
+                html.Strong('Method. '),
+                'The probe ranking follows the approach published by Albertsson, '
+                'Kauffmann & Menten (2018), who mapped how cosmic-ray ionization '
+                'drives the abundances of interstellar species to identify CRIR tracers:',
+                html.Br(),
+                html.Span([
+                    'Albertsson, T., Kauffmann, J., & Menten, K. M. 2018, ',
+                    html.I('Atlas of Cosmic-Ray-induced Astrochemistry'),
+                    ', ApJ, 868, 40.  ',
+                    html.A('doi:10.3847/1538-4357/aae775',
+                           href='https://doi.org/10.3847/1538-4357/aae775',
+                           target='_blank', rel='noopener noreferrer'),
+                    '  ·  ',
+                    html.A('ADS', href='https://ui.adsabs.harvard.edu/abs/2018ApJ...868...40A',
+                           target='_blank', rel='noopener noreferrer'),
+                    '  ·  ',
+                    html.A('arXiv:1811.02862', href='https://arxiv.org/abs/1811.02862',
+                           target='_blank', rel='noopener noreferrer'),
+                ], className='kosma-muted'),
+            ], style={'margin': '10px 0 0'}),
         ]),
     ])
 
@@ -10671,10 +10717,10 @@ def _probe_ranking_page():
                           className='kosma-input', style={'width': '100%'}),
             ], style={**_CTRL_BOX, 'minWidth': '150px'}),
             html.Div([
-                html.Label('KoSens-style interpolation', style=_CTRL_LABEL),
+                html.Label('Interpolation', style=_CTRL_LABEL),
                 dcc.Checklist(
                     id='pr-interp-enable',
-                    options=[{'label': ' resample grid before ranking (KoSens 3-D)', 'value': 'on'}],
+                    options=[{'label': ' resample grid before ranking (3-D)', 'value': 'on'}],
                     value=['on'],
                     **_RADIO,
                 ),
@@ -10690,7 +10736,7 @@ def _probe_ranking_page():
                     style={'width': '100%'},
                 ),
                 html.Span(
-                    'On by default to match KoSens3D: interpolate n × G₀ × ζ '
+                    'On by default: interpolate n × G₀ × ζ '
                     'to n×n×n, score, then snap to native nodes (median). '
                     'Turn off only for a fast native-grid preview.',
                     className='kosma-muted',
@@ -10827,7 +10873,7 @@ def _probe_ranking_page():
                 dcc.Tab(label='Tables', value='pr-tables',
                         style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
                         children=[
-                    html.P('KoSens3D-style ranking tables.  Each sub-tab shows a '
+                    html.P('Ranking tables.  Each sub-tab shows a '
                            'different view of the last computed ranking; use the '
                            'Environment ranking tab for bar charts at selected '
                            '(n_H, G₀) nodes.',
@@ -10856,7 +10902,7 @@ def _probe_ranking_page():
                 dcc.Tab(label='Score heatmap', value='pr-heat',
                         style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
                         children=[
-                    html.P('One figure per tracer, as in KoSens3D: median probe score '
+                    html.P('One figure per tracer: median probe score '
                            'on the native (n_H, G₀) plane after interpolating the cube '
                            '(default 60³).  CRIR regimes sit side by side.  Q1 (green) '
                            'is the top 25% by median score in a regime.',
@@ -10954,8 +11000,7 @@ def _probe_ranking_page():
                 dcc.Tab(label='CR vs FUV dominance', value='pr-dominance',
                         style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
                         children=[
-                    html.P('Complement to the ζ-only probe score (KoSens '
-                           'plot_cr_fuv_dominance_3d): at each density, the local slopes '
+                    html.P('Complement to the ζ-only probe score: at each density, the local slopes '
                            'S_ζ = dlog X/dlog ζ and S_χ = dlog X/dlog χ₀ over a ±baseline/2 '
                            'window give D = |S_ζ|/(|S_ζ|+|S_χ|): 1 = X moves with ζ only '
                            '(clean CR tracer), 0 = with χ₀ only. Black lines are iso-X '
@@ -11076,7 +11121,7 @@ def _int_contour_overlay_row():
                 value=['show'],
                 style={'fontSize': '13px'},
             ),
-            html.Span('  jtemp only — KoSens-style observational limit',
+            html.Span('  jtemp only — observational detection limit',
                       className='kosma-muted',
                       style={'fontSize': '11px', 'marginLeft': '8px'}),
         ], style={'flex': '1.6', 'minWidth': '280px', 'marginRight': '12px'}),
@@ -11153,7 +11198,7 @@ def _rgb_grid_controls():
     return html.Div([
         html.H4('RGB phase diagram',
                 style={'fontSize': '14px', 'margin': '18px 0 6px', 'fontWeight': '600'}),
-        html.P('Fractional abundance dominance of three species (KoSens-style RGB map). '
+        html.P('Fractional abundance dominance of three species (RGB map). '
                'Per-channel conversion factors scale each species before the mix '
                '(e.g. mass-density weights). Optional white contours mark chemistry transitions.',
                style={**_PAGE_INTRO, 'marginBottom': '8px'}),
@@ -11188,14 +11233,14 @@ def _rgb_intensity_controls():
     return html.Div([
         html.H4('RGB phase diagram',
                 style={'fontSize': '14px', 'margin': '18px 0 6px', 'fontWeight': '600'}),
-        html.P('Fractional intensity dominance of three SIMLINE lines. '
+        html.P('Fractional intensity dominance of three lines. '
                'Per-channel conversion factors scale each line before the mix '
                '(and the C\u2194CO intensity contour). '
                'H\u2194H\u2082 uses HDF5 abundances when a PDR grid is loaded; '
                'CO\u2194JCO is unavailable for intensities (no ice line).',
                style={**_PAGE_INTRO, 'marginBottom': '8px'}),
         html.Div(
-            _rgb_channel_dropdowns('int-', 'Load SIMLINE\u2026')
+            _rgb_channel_dropdowns('int-', 'Load line intensities\u2026')
             + [html.Div([
                 html.Label('Transition contours', style=_CTRL_LABEL),
                 _choice(multi=True, 
@@ -11228,8 +11273,8 @@ def _spaghetti_controls():
         html.H4('Spaghetti contours (observed intensities)',
                 style={'fontSize': '14px', 'margin': '18px 0 6px', 'fontWeight': '600'}),
         html.P(
-            'Overlay model = observed intensity contours for several SIMLINE lines '
-            'on each parameter slice (KoSens spaghetti_plot_grid). Optional error '
+            'Overlay model = observed intensity contours for several lines '
+            'on each parameter slice. Optional error '
             'bands default to 20% of the level; with two or more lines the χ² '
             'closest point in parameter space is marked (find_nearest_contour_points).',
             style={**_PAGE_INTRO, 'marginBottom': '8px'},
@@ -11240,7 +11285,7 @@ def _spaghetti_controls():
                 dcc.Dropdown(
                     id='int-spaghetti-lines',
                     options=[], value=[], multi=True,
-                    placeholder='Load SIMLINE\u2026 then pick lines to seed the text box',
+                    placeholder='Load line intensities\u2026 then pick lines to seed the text box',
                     style={'fontSize': '13px'}),
             ], style={'flex': '1.4', 'minWidth': '240px', 'marginRight': '12px'}),
             html.Div([
@@ -11254,7 +11299,7 @@ def _spaghetti_controls():
                            'fontFamily': 'monospace', 'resize': 'vertical'},
                 ),
                 html.Span(
-                    '  JSON or lines: Name = value [± err]. Names must match SIMLINE keys.',
+                    '  JSON or lines: Name = value [± err]. Names must match the line keys.',
                     className='kosma-muted',
                     style={'fontSize': '11px', 'marginTop': '4px', 'display': 'block'},
                 ),
@@ -11365,7 +11410,7 @@ def _interp_error_control_row():
             html.Label('Error decimation factor', style=_CTRL_LABEL),
             dcc.Input(id='ie-decimation', type='number', value=DEFAULT_ERROR_DECIMATION,
                       min=2, max=8, step=1, className='kosma-input', style=input_style),
-            html.Span('  checkerboard decimation (KoSens default: 2)',
+            html.Span('  checkerboard decimation (default: 2)',
                       className='kosma-muted',
                       style={'fontSize': '11px', 'marginLeft': '8px'}),
         ], style={'flex': '1.3', 'minWidth': '220px', 'marginRight': '12px'}),
@@ -11678,8 +11723,7 @@ app.layout = html.Div(
                 html.Span('PRISMA', className='app-brand-name'),
             ], id='app-title', className='app-brand-title'),
             html.P(
-                'PDR Results Interactive Simulation Mapping & Analysis — '
-                'KOSMA-τ / KoSens3D model grids.',
+                'PDR Results Interactive Simulation Mapping & Analysis.',
                 id='app-subtitle',
                 className='app-brand-lead',
             ),
@@ -11687,9 +11731,9 @@ app.layout = html.Div(
                 html.Summary('About'),
                 html.P(
                     'Browse photodissociation-region (PDR) model grids: depth profiles, '
-                    'heating & cooling, chemistry, and SIMLINE line intensities across '
+                    'heating & cooling, chemistry, and line intensities across '
                     'density, FUV, cosmic-ray rate, and related parameters. Load an HDF5 '
-                    'model directory and/or a SIMLINE output folder, then use the tabs '
+                    'model directory and/or a line-intensity folder, then use the tabs '
                     'to explore profiles, 2-D grid slices, spectra, and map fits.',
                     id='app-blurb',
                 ),
@@ -11766,11 +11810,11 @@ app.layout = html.Div(
         children=[
 
         # --- Page 1: grid loaders -------------------------------------------
-        dcc.Tab(label='Load', value='load', className='grp-data',
+        dcc.Tab(label='📂 Load', value='load', className='grp-data',
                 style=_TAB_STYLE, selected_style=_TAB_SEL,
                 children=[
             html.Div(style={'paddingTop': '14px'}, children=[
-                html.P('Load model grids and SIMLINE directories to explore PDR models. '
+                html.P('Load model grids and line-intensity directories to explore PDR models. '
                        'Click Browse to open a file window on this computer and pick any '
                        'model file in the folder you want (the folder is filled in for you), '
                        'or paste a path. Primary grids drive the parameter sliders; overlay '
@@ -11786,7 +11830,7 @@ app.layout = html.Div(
                             'Primary grids',
                         ], className='load-section-title'),
                         html.P(
-                            'Main HDF5 grid and SIMLINE output that define the parameter space. '
+                            'Main HDF5 grid and line intensities that define the parameter space. '
                             'These populate the sliders and drive visualizations.',
                             className='load-section-desc',
                         ),
@@ -11836,7 +11880,7 @@ app.layout = html.Div(
                                     html.Button('Load chemistry', id='btn-load-chem', n_clicks=0,
                                                 className='btn btn-success'),
                                     html.Button('Clear', id='btn-clear-chem', n_clicks=0,
-                                                className='btn btn-ghost'),
+                                                className='btn btn-danger-ghost'),
                                 ], className='load-card-row'),
                                 html.Div(id='chem-status', className='load-status'),
                             ]),
@@ -11844,13 +11888,13 @@ app.layout = html.Div(
                         ),
                         dcc.Store(id='chem-state', data=0),
                         _load_card(
-                            'SIMLINE directory',
+                            'Line-intensity directory',
                             'line intensities & spectra (can load standalone)',
                             html.Div([
                                 html.Div([
                                     dcc.Input(
                                         id='simline-dir-input', type='text', value='',
-                                        placeholder='Browse or paste /path/to/simlineoutput',
+                                        placeholder='Browse or paste /path/to/line/intensities',
                                         className='kosma-input',
                                     ),
                                     _browse_btn('btn-browse-simline'),
@@ -11861,10 +11905,10 @@ app.layout = html.Div(
                                         style={'fontSize': '13px', 'whiteSpace': 'nowrap',
                                                'alignSelf': 'center'},
                                     ),
-                                    html.Button('Load SIMLINE', id='btn-load-simline', n_clicks=0,
+                                    html.Button('Load lines', id='btn-load-simline', n_clicks=0,
                                                 className='btn btn-purple'),
                                     html.Button('Clear', id='btn-clear-simline', n_clicks=0,
-                                                className='btn btn-ghost'),
+                                                className='btn btn-danger-ghost'),
                                 ], className='load-card-row'),
                                 html.Div(id='simline-status', className='load-status'),
                             ]),
@@ -11910,7 +11954,7 @@ app.layout = html.Div(
                                     html.Button('Load overlay', id='btn-load-overlay', n_clicks=0,
                                                 className='btn btn-overlay'),
                                     html.Button('Clear', id='btn-clear-overlay', n_clicks=0,
-                                                className='btn btn-ghost'),
+                                                className='btn btn-danger-ghost'),
                                 ], className='load-card-row'),
                                 html.Div(id='overlay-status', className='load-status'),
                             ]),
@@ -11939,7 +11983,7 @@ app.layout = html.Div(
                                                 id='btn-load-chem-overlay', n_clicks=0,
                                                 className='btn btn-overlay'),
                                     html.Button('Clear', id='btn-clear-chem-overlay',
-                                                n_clicks=0, className='btn btn-ghost'),
+                                                n_clicks=0, className='btn btn-danger-ghost'),
                                 ], className='load-card-row'),
                                 html.Div(id='chem-overlay-status', className='load-status'),
                             ]),
@@ -11947,13 +11991,13 @@ app.layout = html.Div(
                         ),
                         dcc.Store(id='chem-overlay-state', data=0),
                         _load_card(
-                            'Overlay SIMLINE',
+                            'Overlay line intensities',
                             'triple-panel shift on Intensities tab',
                             html.Div([
                                 html.Div([
                                     dcc.Input(
                                         id='simline-overlay-dir-input', type='text', value='',
-                                        placeholder='Browse or paste /path/to/attenuated/simlineoutput',
+                                        placeholder='Browse or paste /path/to/attenuated/line/intensities',
                                         className='kosma-input',
                                     ),
                                     _browse_btn('btn-browse-simline-overlay'),
@@ -11964,11 +12008,11 @@ app.layout = html.Div(
                                         style={'fontSize': '13px', 'whiteSpace': 'nowrap',
                                                'alignSelf': 'center'},
                                     ),
-                                    html.Button('Load overlay SIMLINE',
+                                    html.Button('Load overlay lines',
                                                 id='btn-load-simline-overlay', n_clicks=0,
                                                 className='btn btn-overlay'),
                                     html.Button('Clear', id='btn-clear-simline-overlay',
-                                                n_clicks=0, className='btn btn-ghost'),
+                                                n_clicks=0, className='btn btn-danger-ghost'),
                                 ], className='load-card-row'),
                                 html.Div(id='simline-overlay-status', className='load-status'),
                             ]),
@@ -11983,7 +12027,7 @@ app.layout = html.Div(
         ]),
 
         # --- Page 2: model setup (JSON configs) -----------------------------
-        dcc.Tab(label='Model setup', value='modelsetup', style=_TAB_STYLE,
+        dcc.Tab(label='⚙️ Model setup', value='modelsetup', style=_TAB_STYLE,
                 selected_style=_TAB_SEL, children=[
             html.Div(style={'paddingTop': '10px'}, children=[
                 html.P('Simulation parameters from PDR config JSON files under '
@@ -11996,7 +12040,7 @@ app.layout = html.Div(
         ]),
 
         # --- Page 3: abundance profiles -------------------------------------
-        dcc.Tab(label='Profiles', value='profiles', className='grp-profiles',
+        dcc.Tab(label='📈 Profiles', value='profiles', className='grp-profiles',
                 style=_TAB_STYLE,
                 selected_style=_TAB_SEL, children=[
             html.Div(style={'paddingTop': '10px'}, children=[
@@ -12035,7 +12079,7 @@ app.layout = html.Div(
         ]),
 
         # --- Page 3: heating & cooling --------------------------------------
-        dcc.Tab(label='Thermal', value='thermal', style=_TAB_STYLE,
+        dcc.Tab(label='🌡️ Thermal', value='thermal', style=_TAB_STYLE,
                 selected_style=_TAB_SEL, children=[
             html.Div(style={'paddingTop': '10px'}, children=[
                 html.P('Thermal balance and per-component heating and cooling rates vs depth.',
@@ -12063,7 +12107,7 @@ app.layout = html.Div(
                     dcc.Tab(label='Grid-integrated vs CRIR', value='thermal-crir',
                             style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
                             children=[
-                        html.P('KoSens grid-integrated diagnostics: each heating / cooling '
+                        html.P('Grid-integrated diagnostics: each heating / cooling '
                                'mechanism is volume-integrated (\u222B 4\u03C0r\u00B2 rate n dr) per '
                                'model and plotted against the cosmic-ray ionization rate \u03B6 for '
                                'the selected densities. FUV, clump mass, metallicity and '
@@ -12121,7 +12165,7 @@ app.layout = html.Div(
                                       config=_GRAPH_CFG, style={'marginBottom': '12px'}),
                             dcc.Graph(id='plot-abs-heatcool-crir', figure=placeholder_fig(),
                                       config=_GRAPH_CFG, style={'marginBottom': '12px'}),
-                            html.P('Share bars (KoSens plot_heating_cooling_share_bars): each '
+                            html.P('Share bars: each '
                                    'channel\'s % of the total heating / cooling, same channels '
                                    'as above. With an HDF5 overlay loaded, the attenuated grid '
                                    'stands hatched next to the main grid at every ζ.',
@@ -12129,7 +12173,7 @@ app.layout = html.Div(
                             dcc.Graph(id='plot-heatcool-share', figure=placeholder_fig(),
                                       config=_GRAPH_CFG),
                         ]),
-                        html.H4('Rate-regime map (KoSens plot_rate_regime_boundary)',
+                        html.H4('Rate-regime map',
                                 style={'fontSize': '14px', 'margin': '18px 0 6px'}),
                         html.P('One cell per model: which of two channels dominates the '
                                'grid-integrated rate. With the attenuated grid loaded as HDF5 '
@@ -12187,7 +12231,7 @@ app.layout = html.Div(
         ]),
 
         # --- Page 5: chemistry ----------------------------------------------
-        dcc.Tab(label='Chemistry', value='chemistry', style=_TAB_STYLE, selected_style=_TAB_SEL,
+        dcc.Tab(label='⚗️ Chemistry', value='chemistry', style=_TAB_STYLE, selected_style=_TAB_SEL,
                 children=[
             html.Div(style={'paddingTop': '10px'}, children=[
                 html.P('Top formation and destruction reactions for a selected species '
@@ -12197,7 +12241,7 @@ app.layout = html.Div(
                        'chemistry filenames; load an HDF5 grid for depth profiles and '
                        'abundance colormaps. Choose how reactions '
                        'are ranked: fractional contribution to the total rate, or '
-                       'rate per X particle (KoSens ``top_reactions_plot`` metrics). '
+                       'rate per X particle. '
                        'Below, separate formation and destruction networks show all '
                        'partners in those same top-N reactions (reactants left, products right). '
                        'Switch the network to Dominant to keep only the top reactions (by rate '
@@ -12364,7 +12408,7 @@ app.layout = html.Div(
                                     className='btn btn-ghost btn-sm',
                                     style={'marginRight': '8px'}),
                         html.Button('Clear highlight', id='btn-react-net-clear', n_clicks=0,
-                                    className='btn btn-ghost btn-sm'),
+                                    className='btn btn-danger-ghost btn-sm'),
                     ], style={'alignSelf': 'flex-end'}),
                 ], style={'display': 'flex', 'alignItems': 'flex-end',
                           'flexWrap': 'wrap', 'marginBottom': '8px'}),
@@ -12382,7 +12426,7 @@ app.layout = html.Div(
         ]),
 
         # --- Page 4: 2-D grid slices --------------------------------------
-        dcc.Tab(label='Grids', value='grids', className='grp-grids',
+        dcc.Tab(label='🗺️ Grids', value='grids', className='grp-grids',
                 style=_TAB_STYLE, selected_style=_TAB_SEL,
                 children=[
             html.Div(style={'paddingTop': '10px'}, children=[
@@ -12391,7 +12435,7 @@ app.layout = html.Div(
                        'main panels, and every extra quantity gets its own row of slice maps. '
                        'Add all species / Add all column densities fill each box. Without an '
                        'overlay grid the three slice planes appear side by side as square '
-                       'panels. Grids are resampled in log parameter space (KoSens-style) '
+                       'panels. Grids are resampled in log parameter space '
                        'before plotting. With an overlay loaded, each plane expands to three '
                        'sub-plots (reference, overlay, x-shift) stacked vertically.',
                        style=_PAGE_INTRO),
@@ -12423,8 +12467,8 @@ app.layout = html.Div(
                                          style={'fontSize': '13px'}),
                         ], style={'flex': '2', 'minWidth': '260px', 'marginRight': '12px'}),
                         html.Button('Add all column densities', id='btn-contour-all-cdens', n_clicks=0,
-                                    title='HDF5 Integrated quantities/Column densities (KoSens cd_*)',
-                                    className='btn btn-success btn-sm', style=_ALL_BTN_STYLE),
+                                    title='HDF5 Integrated quantities/Column densities (cd_*)',
+                                    className='btn btn-primary btn-sm', style=_ALL_BTN_STYLE),
                     ], style={'display': 'flex', 'alignItems': 'flex-start',
                               'flexWrap': 'wrap', 'width': '100%'}),
                 ], className='kosma-panel',
@@ -12448,8 +12492,8 @@ app.layout = html.Div(
                     dcc.Tab(label='Ratios', value='grid-ratios',
                             style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
                             children=[
-                        html.P('KoSens abundance ratios from the species selected above '
-                               '(needs two or more). Intra-list pairs use the KoSens '
+                        html.P('Abundance ratios from the species selected above '
+                               '(needs two or more). Intra-list pairs use a fixed '
                                'molecule priority so the higher-priority species is in '
                                'the numerator (C⁺ > C > HCO⁺ > CO > ¹³CO > …). '
                                'Equal-priority pairs keep your selection order.',
@@ -12477,7 +12521,7 @@ app.layout = html.Div(
                     dcc.Tab(label='Abundance PDF', value='grid-apdf',
                             style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
                             children=[
-                        html.P('KoSens abundance PDF: a 2-D histogram of species abundance '
+                        html.P('Abundance PDF: a 2-D histogram of species abundance '
                                'versus \u03B6_H / n_H, aggregating every depth point across the '
                                'grid (mass, metallicity and attenuation fixed to the sliders; '
                                'density, FUV and CRIR vary). With "split by CRIR" one panel is '
@@ -12534,15 +12578,15 @@ app.layout = html.Div(
         ]),
 
         # --- Page 6: SIMLINE intensities ------------------------------------
-        dcc.Tab(label='Intensities', value='intensities', style=_TAB_STYLE,
+        dcc.Tab(label='✨ Intensities', value='intensities', style=_TAB_STYLE,
                 selected_style=_TAB_SEL, children=[
             html.Div(style={'paddingTop': '10px'}, children=[
-                html.P('SIMLINE line intensities from per-model .smli files. Select several '
+                html.P('Line intensities from the model HDF5 files or per-model .smli files. Select several '
                        'species and/or transitions (or Add all species / Add all transitions) '
                        'to overlay spectra and add extra contour rows under the main maps. '
-                       'Without overlay SIMLINE the three slice planes appear side by side as '
+                       'Without an overlay the three slice planes appear side by side as '
                        'square panels; grids are resampled in log parameter space before '
-                       'plotting. With overlay SIMLINE each plane expands to three sub-plots '
+                       'plotting. With an overlay each plane expands to three sub-plots '
                        'side by side (reference, overlay, x-shift) stacked vertically.',
                        style=_PAGE_INTRO),
                 html.Div([
@@ -12552,7 +12596,7 @@ app.layout = html.Div(
                                        value=SIMLINE_DEFAULT_IDEF, **_RADIO),
                     ], style={'flex': '1.4', 'minWidth': '220px', 'marginRight': '12px'}),
                     html.Div([
-                        html.Label('Viewing angle (Meudon)', style=_CTRL_LABEL),
+                        html.Label('Viewing angle', style=_CTRL_LABEL),
                         _choice(id='hdf5-angle', options=[], value=None, **_RADIO),
                     ], id='hdf5-angle-wrap',
                         style={'display': 'none', 'minWidth': '160px', 'marginRight': '12px'}),
@@ -12560,7 +12604,7 @@ app.layout = html.Div(
                         html.Label('Species', style=_CTRL_LABEL),
                         dcc.Dropdown(id='int-species', options=[], value=[],
                                      multi=True,
-                                     placeholder='Load a SIMLINE directory\u2026',
+                                     placeholder='Load line intensities\u2026',
                                      style={'fontSize': '13px'}),
                     ], style={'flex': '1.2', 'minWidth': '160px', 'marginRight': '8px'}),
                     html.Button('Add all species', id='btn-int-all-species', n_clicks=0,
@@ -12583,7 +12627,7 @@ app.layout = html.Div(
                 _advanced_details('Attenuation x-shift matching', _shift_control_row(prefix='int-')),
                 _advanced_details('Contour overlays', _int_contour_overlay_row()),
                 _advanced_details(
-                    'CO SLED classes (Rosenberg et al. 2015)',
+                    'CO SLED classes',
                     html.P('α = (L11-10 + L12-11 + L13-12) / (L5-4 + L6-5 + L7-6) per model; '
                            'class I α < 0.33, II 0.33–0.66, III > 0.66. Uses the CO lines of the '
                            'selected quantity (K km/s or erg).', className='kosma-muted',
@@ -12618,11 +12662,11 @@ app.layout = html.Div(
                     dcc.Tab(label='Ratios', value='int-ratios',
                             style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
                             children=[
-                        html.P('KoSens line-intensity ratios from the species and transitions '
+                        html.P('Line-intensity ratios from the species and transitions '
                                'selected above. Intra-molecule (one species, two or more '
                                'transitions): higher-energy / lower-energy '
                                '(e.g. CO(2-1)/CO(1-0)). Inter-molecule (two or more species): '
-                               'higher KoSens priority / lower '
+                               'higher priority / lower '
                                '(C⁺ > C > HCO⁺ > CO > …).',
                                style=_PAGE_INTRO),
                         html.Div([
@@ -12651,16 +12695,15 @@ app.layout = html.Div(
         ]),
 
         # --- Page 8: interpolation error check --------------------------------
-        dcc.Tab(label='Interpolation', value='interperror',
+        dcc.Tab(label='🔀 Interpolation', value='interperror',
                 style=_TAB_STYLE,
                 selected_style=_TAB_SEL, children=[
             html.Div(style={'paddingTop': '10px'}, children=[
-                html.P('Compare native model grids with KoSens-style resampling and '
+                html.P('Compare native model grids with log-space resampling and '
                        'estimate interpolation error (decimate \u2192 re-interpolate on the '
-                       'native mesh, matching ``resampled_grid_data`` with '
-                       '``calculate_error=True``). Shows abundance / diagnostic grids when '
-                       'the main HDF5 grid is loaded, and SIMLINE intensity grids when a '
-                       'SIMLINE directory is loaded.',
+                       'native mesh). Shows abundance / diagnostic grids when '
+                       'the main HDF5 grid is loaded, and line-intensity grids when line '
+                       'intensities are loaded.',
                        style=_PAGE_INTRO),
                 html.Div([
                     html.Div([
@@ -12670,9 +12713,9 @@ app.layout = html.Div(
                                      style={'fontSize': '13px'}),
                     ], style={'flex': '2', 'minWidth': '220px', 'marginRight': '12px'}),
                     html.Div([
-                        html.Label('SIMLINE species', style=_CTRL_LABEL),
+                        html.Label('Line species', style=_CTRL_LABEL),
                         dcc.Dropdown(id='ie-int-species', options=[], value=None,
-                                     placeholder='Load SIMLINE\u2026',
+                                     placeholder='Load line intensities\u2026',
                                      style={'fontSize': '13px'}),
                     ], style={'flex': '1', 'minWidth': '120px', 'marginRight': '12px'}),
                     html.Div([
@@ -12697,20 +12740,19 @@ app.layout = html.Div(
         ]),
 
         # --- Probe ranking ---------------------------------------------------
-        dcc.Tab(label='Probe ranking', value='proberank', className='grp-cr',
+        dcc.Tab(label='🏆 Probe ranking', value='proberank', className='grp-cr',
                 style=_TAB_STYLE,
                 selected_style=_TAB_SEL, children=[
             html.Div(style={'paddingTop': '10px'}, children=_probe_ranking_page()),
         ]),
 
         # --- Page 9: CR attenuation profiles ----------------------------------
-        dcc.Tab(label='CR attenuation', value='cratten', style=_TAB_STYLE,
+        dcc.Tab(label='📉 CR attenuation', value='cratten', style=_TAB_STYLE,
                 selected_style=_TAB_SEL, children=[
             html.Div(style={'paddingTop': '10px'}, children=[
                 html.P('Cosmic-ray ionisation rate ζ<sub>H₂</sub> vs column density, '
-                       'following the KoSens CR_atten_plot notebook. Padovani et al. '
-                       '(2018/2024) reference bands 𝓛, 𝓗, 𝓤 are always available; '
-                       'add one or more KOSMA model profiles from the sliders or overlay grid.',
+                       'with reference bands 𝓛, 𝓗, 𝓤 for low, high and upper-limit CR spectra; '
+                       'add one or more model profiles from the sliders or overlay grid.',
                        style=_PAGE_INTRO),
                 html.Div([
                     html.Div([
@@ -12729,7 +12771,7 @@ app.layout = html.Div(
                         _choice(multi=True, 
                             id='cr-atten-options',
                             options=[
-                                {'label': ' Padovani 𝓛 / 𝓗 / 𝓤 bands', 'value': 'padovani'},
+                                {'label': ' Reference 𝓛 / 𝓗 / 𝓤 bands', 'value': 'padovani'},
                                 {'label': ' Extrapolate profiles to 10²⁵ cm⁻²', 'value': 'extrap'},
                                 {'label': ' Attenuation onset markers (◆)', 'value': 'threshold'},
                             ],
@@ -12748,7 +12790,7 @@ app.layout = html.Div(
                                 className='btn btn-overlay',
                                 style={'marginRight': '8px'}),
                     html.Button('Clear profiles', id='cr-atten-clear', n_clicks=0,
-                                className='btn btn-ghost'),
+                                className='btn btn-danger-ghost'),
                 ], style={'padding': '0 18px 10px'}),
                 html.Div([
                     html.Label('Profiles to plot', style=_CTRL_LABEL),
@@ -12762,16 +12804,16 @@ app.layout = html.Div(
         ]),
 
         # --- Attenuation impact (KoSens attenuation workflow) ---------------
-        dcc.Tab(label='Attenuation impact', value='attenimpact', style=_TAB_STYLE,
+        dcc.Tab(label='💥 Attenuation impact', value='attenimpact', style=_TAB_STYLE,
                 selected_style=_TAB_SEL, children=[
             html.Div(style={'paddingTop': '10px'}, children=_atten_impact_page()),
         ]),
 
         # --- Page 7: spectra (SimLine PV + CARTA-like cube viewer) ------------
-        dcc.Tab(label='Spectra', value='spectra', className='grp-obs', style=_TAB_STYLE,
+        dcc.Tab(label='🔺 Spectra', value='spectra', className='grp-obs', style=_TAB_STYLE,
                 selected_style=_TAB_SEL, children=[
             html.Div(style={'paddingTop': '10px'}, children=[
-                html.P('SimLine position–velocity cubes, or a CARTA-style viewer for '
+                html.P('Model position–velocity cubes, or a cube viewer for '
                        'observational CLASS/GILDAS MATRIX tables and spectral image cubes: '
                        'collapse the map, click a pixel (or box/lasso a region), and plot '
                        'that spectrum.',
@@ -12784,8 +12826,8 @@ app.layout = html.Div(
                             children=[
                         html.P('Emission spectrum stored in the model HDF5 '
                                '(Integrated quantities/Spectrum) for the model selected '
-                               'with the sliders: KOSMA-\u03c4 IR continuum in Jy, Meudon '
-                               'emerging intensity (perpendicular to the cloud surface).',
+                               'with the sliders (IR continuum in Jy, or emerging intensity '
+                               'perpendicular to the cloud surface, depending on the model file).',
                                style=_PAGE_INTRO),
                         html.Div([
                             html.Div([
@@ -12816,10 +12858,10 @@ app.layout = html.Div(
                                       config=_GRAPH_CFG),
                         ]),
                     ]),
-                    dcc.Tab(label='SimLine PV', value='sp-simline',
+                    dcc.Tab(label='Model PV', value='sp-simline',
                             style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
                             children=[
-                html.P('Velocity-resolved spectra and position–velocity diagrams from SimLine '
+                html.P('Velocity-resolved spectra and position–velocity diagrams from model '
                        'PV FITS cubes (brightness temperature or optical depth), with optional '
                        'observational CLASS MATRIX / cube FITS overlay and multi-Gaussian '
                        'line fitting.',
@@ -12833,7 +12875,7 @@ app.layout = html.Div(
                     html.Div([
                         html.Label('Species', style=_CTRL_LABEL),
                         dcc.Dropdown(id='sp-species', options=[], value=None,
-                                     placeholder='Load a SIMLINE directory\u2026',
+                                     placeholder='Load line intensities\u2026',
                                      style={'fontSize': '13px'}),
                     ], style={'flex': '1', 'minWidth': '140px', 'marginRight': '12px'}),
                     html.Div([
@@ -12923,7 +12965,7 @@ app.layout = html.Div(
                         ], style={'flex': '1', 'minWidth': '120px', 'marginRight': '12px'}),
                         html.Div([
                             dcc.Checklist(id='obs-overlay', options=[
-                                {'label': ' Overlay on SimLine spectrum', 'value': 'on'},
+                                {'label': ' Overlay on model spectrum', 'value': 'on'},
                             ], value=['on'], style={'fontSize': '13px'}),
                         ], style={'flex': '1.4', 'minWidth': '200px', 'marginRight': '12px'}),
                         html.Div([
@@ -12945,7 +12987,7 @@ app.layout = html.Div(
                     dcc.Tab(label='Cube viewer', value='sp-cube',
                             style=_NESTED_TAB_STYLE, selected_style=_NESTED_TAB_SEL,
                             children=[
-                html.P('CARTA-like view of an observational spectral cube. CLASS/GILDAS '
+                html.P('Interactive view of an observational spectral cube. CLASS/GILDAS '
                        'MATRIX tables are gridded as-is (missing cells stay blank). '
                        'CASA image cubes (``*.image.fits``, ``*.pbcor.fits``, 3-D or 4-D '
                        'with a Stokes axis) load from the image HDU; extra BEAMS tables '
@@ -13130,8 +13172,9 @@ app.layout = html.Div(
                                   placeholder='for pc', style={'width': '100%'}),
                     ], style={'flex': '0.9', 'minWidth': '90px', 'marginRight': '10px'}),
                     html.Button('Add circle', id='cv-add-circle', n_clicks=0,
-                                style={'marginRight': '8px'}),
-                    html.Button('Clear regions', id='cv-clear-regions', n_clicks=0),
+                                className='btn btn-ghost btn-sm', style={'marginRight': '8px'}),
+                    html.Button('Clear regions', id='cv-clear-regions', n_clicks=0,
+                                className='btn btn-danger-ghost btn-sm'),
                 ], className='kosma-panel',
                    style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
                           'padding': '10px 14px', 'marginBottom': '10px'}),
@@ -13261,19 +13304,18 @@ app.layout = html.Div(
         ]),
 
         # --- Page 10: observational map fit ---------------------------------
-        dcc.Tab(label='Map fit', value='mapfit', style=_TAB_STYLE,
+        dcc.Tab(label='🎯 Map fit', value='mapfit', style=_TAB_STYLE,
                 selected_style=_TAB_SEL, children=[
             html.Div(style={'paddingTop': '10px'}, children=[
-                html.P('Fit observational FITS intensity maps to the 3-D SIMLINE model grid '
-                       '(KoSens3D ``fit_fits_maps_to_grids_3d``). Requires a main grid and '
-                       'SIMLINE directory on the Load tab. The three fit axes are chosen '
+                html.P('Fit observational FITS intensity maps to the 3-D model line-intensity grid. '
+                       'Requires a main grid and line intensities on the Load tab. The three fit axes are chosen '
                        'automatically from the varying parameters in the loaded grid '
                        '(density × FUV × ζ when all three vary; otherwise the first three '
                        'varying axes, e.g. density × mass × FUV for 4-token grids).',
                        style=_PAGE_INTRO),
                 html.Div([
                     html.Div([
-                        html.Label('Intensity units (SIMLINE)', style=_CTRL_LABEL),
+                        html.Label('Intensity units', style=_CTRL_LABEL),
                         _choice(id='fit-idef', options=SIMLINE_MAPFIT_IDEF_OPTIONS,
                                        value=SIMLINE_DEFAULT_IDEF, **_RADIO),
                     ], style={'flex': '1.2', 'minWidth': '200px', 'marginRight': '12px'}),
@@ -13397,7 +13439,7 @@ app.layout = html.Div(
                                   style={'width': '80px'}),
                     ], style={**_CTRL_BOX, 'minWidth': '90px'}),
                     html.Div('Circles of physical radius at the map centre and a scale bar '
-                             'on every fitted map (KoSens circles_pc / scale_pc).',
+                             'on every fitted map.',
                              style={'fontSize': '12px', 'opacity': 0.8, 'alignSelf': 'center'}),
                 ], className='kosma-panel',
                    style={'display': 'flex', 'alignItems': 'flex-end', 'flexWrap': 'wrap',
@@ -13429,7 +13471,7 @@ app.layout = html.Div(
                     ], style={'padding': '0 18px', 'marginBottom': '12px'}),
                     html.Div([
                         dcc.Graph(id='plot-fit-delta-att', figure=placeholder_fig(
-                                      'Load an attenuated SIMLINE overlay and run a fit '
+                                      'Load an attenuated line-intensity overlay and run a fit '
                                       'for the ε_att map'),
                                   config=_GRAPH_CFG, style={'width': '100%'}),
                     ], style={'padding': '0 18px', 'marginBottom': '12px'}),
@@ -13467,6 +13509,34 @@ app.layout = html.Div(
                                   config=_GRAPH_CFG, style={'width': '100%'}),
                     ], style={'padding': '0 18px'}),
                 ]),
+            ]),
+        ]),
+
+        # --- Page 11: bug report -> prefilled GitHub issue ------------------
+        dcc.Tab(label='🐞 Report a bug', value='bugreport', className='grp-help',
+                style=_TAB_STYLE, selected_style=_TAB_SEL, children=[
+            html.Div(className='kosma-panel', style={'padding': '16px', 'marginTop': '10px',
+                                                      'maxWidth': '760px'}, children=[
+                html.P(['Describe the problem below and press the button. A new GitHub issue opens in '
+                        'your browser, already filled in. Review it there and click ',
+                        html.B('Create'), ' (you need a GitHub account).'], style=_PAGE_INTRO),
+                html.Label('Title', style={'fontWeight': '600', 'fontSize': '13px'}),
+                dcc.Input(id='bug-title', type='text', className='kosma-input',
+                          placeholder='e.g. Map fit crashes when a FITS map has NaN pixels',
+                          style={'width': '100%', 'marginBottom': '12px'}),
+                html.Label('What happened, and what did you expect?',
+                           style={'fontWeight': '600', 'fontSize': '13px'}),
+                dcc.Textarea(id='bug-body', className='kosma-input',
+                             style={'width': '100%', 'height': '120px', 'marginBottom': '12px'}),
+                html.Label('Steps to reproduce (page, files, settings)',
+                           style={'fontWeight': '600', 'fontSize': '13px'}),
+                dcc.Textarea(id='bug-steps', className='kosma-input',
+                             placeholder='1. Load grid ...\n2. Open the Map fit page ...\n3. ...',
+                             style={'width': '100%', 'height': '100px', 'marginBottom': '12px'}),
+                html.P('Python, Dash and OS versions are added to the report automatically.',
+                       className='kosma-muted', style={'fontSize': '12px'}),
+                html.A('🐞 Open issue on GitHub', id='bug-submit', href=_bug_issue_url('', '', ''),
+                       target='_blank', rel='noopener noreferrer', className='btn btn-primary'),
             ]),
         ]),
     ]),
@@ -13692,7 +13762,7 @@ def _grid_ratio_dropdown(quantities, current=None):
     hint = ''
     if len(species) < 2:
         hint = ('Select at least two species in the quantity list to build '
-                'KoSens abundance ratios.')
+                'abundance ratios.')
         return [], [], hint
     pairs = mfe.abundance_ratio_pairs(species)
     opts = [{'label': f'X({n})/X({d})', 'value': _ratio_pair_value(n, d)}
@@ -13729,14 +13799,14 @@ def _int_ratio_dropdown(species, transition, idef, current=None):
     trans_list = _as_str_list(transition)
     if not species_list:
         hint = ('Select a species and at least two transitions, or two or more '
-                'species, to build KoSens line-intensity ratios.')
+                'species, to build line-intensity ratios.')
         return [], [], hint
     if not trans_list:
-        hint = ('Select at least one transition to build KoSens line-intensity ratios.')
+        hint = ('Select at least one transition to build line-intensity ratios.')
         return [], [], hint
     if len(species_list) < 2 and len(trans_list) < 2:
         hint = ('Select at least two transitions of this species, or a second '
-                'species, to build KoSens line-intensity ratios.')
+                'species, to build line-intensity ratios.')
         return [], [], hint
     lookup = _selected_line_lookup(species, transition, idef)
     pairs = mfe.transition_ratio_pairs(list(lookup))
@@ -13746,7 +13816,7 @@ def _int_ratio_dropdown(species, transition, idef, current=None):
     kept = [v for v in _as_str_list(current) if v in valid]
     default = kept or ([opts[0]['value']] if opts else [])
     if lookup and not pairs:
-        hint = ('No KoSens ratios for these lines (need parseable spectroscopic '
+        hint = ('No ratios for these lines (need parseable spectroscopic '
                 'keys with distinct energy levels; inter-molecule pairs must '
                 'differ in priority).')
     return opts, default, hint
@@ -13952,7 +14022,7 @@ def _int_contour_extra_figures(idents, idef, zscale, shift_dir, shift_rtol,
     if not idents:
         return []
     if not _grid or not _simline:
-        p = placeholder_fig('Load grids and a SIMLINE directory', theme=theme)
+        p = placeholder_fig('Load grids and line intensities', theme=theme)
         return [p] * len(idents)
     colorscale = _parse_grid_colorscale(grid_colorscale)
     icfg = _interp_config(interp_ny, interp_nx, interp_x_lim, interp_y_lim,
@@ -14048,7 +14118,7 @@ def _int_ratio_figures(idents, idef, zscale, shift_dir, shift_rtol,
     if not idents:
         return []
     if not _grid or not _simline:
-        p = placeholder_fig('Load grids and a SIMLINE directory', theme=theme)
+        p = placeholder_fig('Load grids and line intensities', theme=theme)
         return [p] * len(idents)
     colorscale = _parse_grid_colorscale(grid_colorscale)
     icfg = _interp_config(interp_ny, interp_nx, interp_x_lim, interp_y_lim,
@@ -14325,7 +14395,7 @@ def handle_load(n_clicks, directory, recursive, simline_state,
     if _simline.get('from_hdf5'):
         int_note = f'   \u2014   intensities for {len(_simline["species"])} species from HDF5'
         if _simline.get('angles'):
-            int_note += f' (Meudon, angles {", ".join(_simline["angles"])}\u00B0)'
+            int_note += f' (viewing angles {", ".join(_simline["angles"])}\u00B0)'
     status = html.Span([
         html.Span('Loaded', className='status-chip ok'),
         html.Code(grid['directory'], style={'marginLeft': '8px'}),
@@ -14343,6 +14413,16 @@ def handle_load(n_clicks, directory, recursive, simline_state,
     return ([status, True] + slider_cfg + slice_cfg * 6
             + [sp_opts, defaults, cq_opts, cq_val, cd_opts, cd_val, ie_cq_opts, ie_cq_val]
             + simline_ui)
+
+
+@app.callback(
+    Output('bug-submit', 'href'),
+    Input('bug-title', 'value'),
+    Input('bug-body', 'value'),
+    Input('bug-steps', 'value'),
+)
+def update_bug_link(title, body, steps):
+    return _bug_issue_url(title, body, steps)
 
 
 app.clientside_callback(
@@ -14484,9 +14564,9 @@ def update_labels(*values):
         tok = _tokens_from_values(values)
         spath = _simline_sample_path(tok)
         if spath:
-            fname = f'{os.path.basename(spath)}  (SIMLINE only — no HDF5)'
+            fname = f'{os.path.basename(spath)}  (line intensities only — no HDF5)'
         else:
-            fname = 'SIMLINE model point (no HDF5)'
+            fname = 'Line-intensity model point (no HDF5)'
     elif _grid.get('chem_only'):
         tok = _tokens_from_values(values)
         cpath = _chem_sample_path(tok)
@@ -15169,10 +15249,10 @@ def handle_simline_overlay(n_load, n_clear, directory, recursive, state):
 
     if trigger.startswith('btn-clear-simline-overlay'):
         clear_simline_overlay()
-        return (html.Span('Overlay SIMLINE cleared.', style={'color': 'var(--text-muted)'}), state + 1)
+        return (html.Span('Overlay line intensities cleared.', style={'color': 'var(--text-muted)'}), state + 1)
 
     if not _simline:
-        return (html.Span('\u2717  Load a main SIMLINE directory first.',
+        return (html.Span('\u2717  Load the main line intensities first.',
                           style={'color': '#d62728', 'fontWeight': '600'}), state)
 
     try:
@@ -15183,7 +15263,7 @@ def handle_simline_overlay(n_load, n_clear, directory, recursive, state):
 
     note = f'  ({sl["n_skipped"]} skipped)' if sl['n_skipped'] else ''
     status = html.Span([
-        html.Span('\u2713  Overlay SIMLINE ', style={'color': '#8c564b', 'fontWeight': '700'}),
+        html.Span('\u2713  Overlay lines ', style={'color': '#8c564b', 'fontWeight': '700'}),
         html.Code(sl['directory']),
         html.Span(f'   {sl["n_files"]} files{note}',
                   style={'color': 'var(--text)', 'marginLeft': '10px'}),
@@ -15287,9 +15367,9 @@ def handle_chem(n_load, n_clear, directory, recursive, state, cur_species):
     elif _grid_has_hdf5():
         mode_note = '   \u2014   using loaded HDF5 grid axes'
     elif _grid and _grid.get('simline_only'):
-        mode_note = '   \u2014   using SIMLINE grid axes'
+        mode_note = '   \u2014   using line-intensity grid axes'
     elif _chem and not bootstrapped and not _grid_has_hdf5():
-        mode_note = ('   \u2014   chemistry loaded (clear SIMLINE or load HDF5 '
+        mode_note = ('   \u2014   chemistry loaded (clear line intensities or load HDF5 '
                      'for chemistry-only navigation)')
     grid_sync = (_grid_sync_from_axis_tokens(_grid['axis_tokens']) if bootstrapped
                  else no_grid_sync)
@@ -15378,7 +15458,7 @@ def handle_simline(n_load, n_clear, directory, recursive, state,
         clear_simline()
         clear_simline_only_grid()
         grid_sync = _empty_grid_sync(loaded=False) if was_simline_only else no_grid_sync
-        msg = 'SIMLINE directory cleared.'
+        msg = 'Line intensities cleared.'
         if _grid_has_hdf5():
             _load_hdf5_simline()
         if _simline:
@@ -15409,13 +15489,13 @@ def handle_simline(n_load, n_clear, directory, recursive, state,
             f'{len(_grid["axis_tokens"][p["key"]])} {p["name"].split()[0]}'
             for p in PARAM_DEFS if len(_grid['axis_tokens'][p['key']]) > 1
         ) or 'single model'
-        mode_note = f'   \u2014   grid from filenames: {cube}  (SIMLINE-only mode)'
+        mode_note = f'   \u2014   grid from filenames: {cube}  (line-intensity-only mode)'
     elif _grid_has_hdf5():
         mode_note = '   \u2014   using loaded HDF5 grid axes'
     grid_sync = (_grid_sync_from_axis_tokens(_grid['axis_tokens']) if bootstrapped
                  else no_grid_sync)
     status = html.Span([
-        html.Span('\u2713  SIMLINE ', style={'color': '#9467bd', 'fontWeight': '700'}),
+        html.Span('\u2713  Lines ', style={'color': '#9467bd', 'fontWeight': '700'}),
         html.Code(sl['directory']),
         html.Span(f'   {sl["n_files"]} files, {len(sl["species"])} species{pv_note}{note}{mode_note}',
                   style={'color': 'var(--text)', 'marginLeft': '10px'}),
@@ -16315,11 +16395,11 @@ def update_ie_panels(*args_in):
                 ))
                 int_wrap.append(wrap_show)
             else:
-                int_figs.append(placeholder_fig(too_small or 'No SIMLINE data for this slice',
+                int_figs.append(placeholder_fig(too_small or 'No line-intensity data for this slice',
                                                 theme=theme))
                 int_wrap.append(wrap_show)
         else:
-            int_figs.append(placeholder_fig('Load SIMLINE and pick species / transition',
+            int_figs.append(placeholder_fig('Load line intensities and pick species / transition',
                                             theme=theme))
             int_wrap.append(wrap_hide)
 
@@ -16365,7 +16445,7 @@ def update_intensity_contours(*args_in):
     theme = _parse_plot_theme(plot_theme)
     colorscale = _parse_grid_colorscale(grid_colorscale)
     if not _grid or not _simline or not _as_str_list(species) or not _as_str_list(transition):
-        p = placeholder_fig('Load grids and a SIMLINE directory', theme=theme)
+        p = placeholder_fig('Load grids and line intensities', theme=theme)
         return (p,) * len(SLICE_PLANES)
     icfg = _interp_config(interp_ny, interp_nx, interp_x_lim, interp_y_lim,
                           interp_method, interp_clip)
@@ -16677,7 +16757,7 @@ def update_spaghetti_plots(*args_in):
     options = options or []
     n_planes = len(SLICE_PLANES)
     if not _grid or not _simline:
-        p = placeholder_fig('Load grids and a SIMLINE directory', theme=theme)
+        p = placeholder_fig('Load grids and line intensities', theme=theme)
         return (p,) * n_planes + (p,) * n_planes + (
             _spaghetti_status_children(None, theme=theme),
         )
@@ -16726,7 +16806,7 @@ def update_intensity_rgb_plots(*args_in):
      interp_method, interp_clip, plot_theme) = args_in[:n_fixed]
     theme = _parse_plot_theme(plot_theme)
     if not _grid or not _simline:
-        p = placeholder_fig('Load grids and a SIMLINE directory', theme=theme)
+        p = placeholder_fig('Load grids and line intensities', theme=theme)
         return (p,) * len(SLICE_PLANES)
     icfg = _interp_config(interp_ny, interp_nx, interp_x_lim, interp_y_lim,
                           interp_method, interp_clip)
@@ -17392,7 +17472,7 @@ def update_react_net_hidden_bar(hidden):
 )
 def update_fit_available_lines(_simline_state, idef):
     if not _simline:
-        return 'Load a SIMLINE directory on the Load tab to see available line keys.'
+        return 'Load line intensities on the Load tab to see available line keys.'
     keys = gf.list_simline_line_keys(_simline, idef or SIMLINE_DEFAULT_IDEF)
     if not keys:
         return 'No transitions found for the selected intensity units.'
@@ -17547,7 +17627,7 @@ def refresh_fit_figures_on_theme(plot_theme, grid_colorscale, _fit_state,
         _chi2_detail_figure(figs, 'chi2_bars', 'No observed vs model bars', theme=theme),
         _chi2_detail_figure(figs, 'species_contours', 'No species contours (enable χ² analysis)', theme=theme),
         figs.get('delta_att', placeholder_fig(
-            'No ε_att map — load an attenuated SIMLINE overlay and tick the ε_att option',
+            'No ε_att map — load an attenuated line-intensity overlay and tick the ε_att option',
             theme=theme)),
     )
 

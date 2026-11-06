@@ -1299,7 +1299,7 @@ def chi2_analysis_3d(my_grids_3d,
     print(f"{'='*70}\n")
     
     if plot_results or plot_projections or plot_chi2_volume or plot_species_slices or plot_species_surfaces:
-        print(f"{ORANGE}Note: chi2_analysis plotting is disabled in Kosma-online-tool "
+        print(f"{ORANGE}Note: chi2_analysis plotting is disabled in PRISMA "
               f"(computation-only mode).{NC}")
     
     results = {

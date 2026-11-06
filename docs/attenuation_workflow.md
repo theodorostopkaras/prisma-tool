@@ -1,17 +1,13 @@
 # Grid attenuation comparison — full workflow
 
-Companion to `Scripts/GRID/grid_attenuation_compare.ipynb`.
-Every function named here lives in `src/kosens/grid/grid_functions.py`.
-
-The rendered method PDF (with figures on a synthetic grid) is
-`Scripts/function_documentation/kosens_grid_attenuation_workflow.pdf`, built by
-`python Scripts/GRID/make_attenuation_method_doc.py`.
+The method behind the Attenuation impact tab. Function names refer to the
+steps of the workflow; their implementation is in `atten_compare.py`.
 
 ---
 
 ## 0. The question
 
-Two KOSMA-τ model trees over the same `(ζ_H, G_0)` plane, identical in every respect
+Two PDR model trees over the same `(ζ_H, G_0)` plane, identical in every respect
 except cosmic-ray attenuation:
 
 | case | tree | meaning |
@@ -435,7 +431,7 @@ shift_overview["regime_winners"].query("species in @probes")
 ```
 
 Take the `robust attenuation probe` rows back to `regime_winners` from stage 4 to see **where** in
-`(ζ_H, G_0)` to follow each one up, and to `top_models` for the individual KOSMA-τ models
+`(ζ_H, G_0)` to follow each one up, and to `top_models` for the individual models
 behind the largest shifts.
 
 A species you would act on is:
@@ -516,7 +512,7 @@ One line per column. A name that appears in two tables means the same thing in b
 
 | column | meaning | how to read |
 |---|---|---|
-| `n_cells` | Cells of the species (every grid cell). | Cells are interpolated mesh points (target_shape), not independent KOSMA-τ models, so neighbouring cells are not independent evidence. |
+| `n_cells` | Cells of the species (every grid cell). | Cells are interpolated mesh points (target_shape), not independent models, so neighbouring cells are not independent evidence. |
 | `n_valid` | Cells with a model (finite shift; unmatched and unobservable as 0). | Equals n_cells unless part of the grid has no model. |
 | `mean_abs_shift_dex` | Mean \|Δ\| over all cells (unmatched and unobservable as 0). | Pulled by outliers; prefer the median. |
 | `median_abs_shift_dex` | Median \|Δ\| over all cells (unmatched and unobservable as 0). The sort key. | No slope gate: small and zero shifts pull it down. Equals error_dex. |

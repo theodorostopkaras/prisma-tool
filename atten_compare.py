@@ -2379,7 +2379,7 @@ def fig_co_alpha_classes(counts, *, bins=(0.33, 0.66), theme=None, height=560):
         y=[counts["I"], counts["II"], counts["III"]], text=list(counts.values()),
         textposition="outside", marker_color=["#1f77b4", "#ff7f0e", "#d62728"]))
     fig.update_yaxes(title_text="Number of models")
-    _style(fig, t, "CO SLED classes<br><sup>Rosenberg et al. 2015</sup>", height)
+    _style(fig, t, "CO SLED classes", height)
     return fig.update_layout(margin=dict(l=55, r=10, t=60, b=50))
 
 

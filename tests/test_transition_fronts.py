@@ -30,7 +30,7 @@ def test_front_fractions_normalise_carbon_and_drop_missing():
     idx = {'H2': 0, 'C+': 1, 'C': 2, 'CO': 3}
     fr = tf.front_fractions(rel, idx)
     x_c = rel[:, 1] + rel[:, 2] + rel[:, 3]
-    assert np.allclose(fr['cplus'], rel[:, 1] / x_c)
+    assert np.allclose(fr['cplus'], rel[:, 1] / (rel[:, 1] + rel[:, 2]))
     assert np.allclose(fr['co'], rel[:, 3] / x_c)
     assert np.allclose(fr['h2'], rel[:, 0])
     assert set(tf.front_fractions(rel, {'H2': 0})) == {'h2'}
@@ -105,3 +105,34 @@ def test_media_map_and_volume_styles():
     cube = {'co': GX / 3.0, 'cplus': 1.0 - GX / 3.0, 'h2': GX / 6.0}
     fig = tf.fig_regime_cube(X, Y, Z, cube, levels, T, LABELS, style='volumes')
     assert {tr.type for tr in fig.data} == {'isosurface'}
+
+
+def test_cplus_front_sits_where_cplus_equals_c():
+    # C+ falls and C rises linearly in A_V; they cross at A_V = 4 while CO is
+    # still large, so a fraction of all carbon (old 1/e rule) would miss it.
+    av = np.linspace(0.0, 10.0, 101)
+    cp, c = 1e-4 * (1 - av / 8), 1e-4 * av / 8
+    co = np.full_like(av, 5e-5)
+    rel = np.column_stack([cp.clip(0), c, co])
+    fr = tf.front_fractions(rel, {'C+': 0, 'C': 1, 'CO': 2})
+    f = tf.FRONT_BY_KEY['cplus']
+    depth = tf.front_depth(av, fr['cplus'], f['default_level'], f['rising'])
+    assert abs(depth - 4.0) < 1e-9
+
+
+def test_kosma_zero_surface_point_is_not_a_front():
+    # Surface row of Model100_40_20_50_10_17_00: C+, C, CO all at the 1e-37
+    # zero value; real chemistry (C+ ~ all carbon) starts one point deeper.
+    av = np.array([0.0, 1e-11, 1.0, 2.0, 3.0])
+    rel = np.array([[1e-37, 1e-37, 1e-37],
+                    [2.3e-4, 2e-10, 7e-15],
+                    [2.3e-4, 4e-7, 1e-9],
+                    [1.0e-4, 1.2e-4, 4e-8],
+                    [6e-7, 2.8e-5, 2e-4]])
+    fr = tf.front_fractions(rel, {'C+': 0, 'C': 1, 'CO': 2})
+    assert np.isnan(fr['cplus'][0]) and np.isnan(fr['co'][0])
+    depth = tf.front_depth(av, fr['cplus'], 0.5, rising=False)
+    assert 1.0 < depth < 2.0          # the real C+ = C crossing, not A_V = 0
+    # A genuinely small, non-zero C+ still counts.
+    fr = tf.front_fractions(np.array([[1e-30, 1e-20, 1e-10]]), {'C+': 0, 'C': 1, 'CO': 2})
+    assert fr['cplus'][0] == 1e-30 / (1e-30 + 1e-20)

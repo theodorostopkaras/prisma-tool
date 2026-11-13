@@ -6,6 +6,9 @@ argument-hint: "<what to change in the UI>"
 
 Implement this UI change following the CLAUDE.md "UI change" workflow.
 
+0. **Design direction**: invoke the `impeccable` skill (critique / polish / layout /
+   colorize … as fits the request) and the `design-taste-frontend` skill first, and follow
+   their guidance in the steps below.
 1. **Locate**: grep `app.py` for the tab / component id and the matching rules in
    `assets/theme.css`; note the callbacks that read or write those ids.
 2. **Design + implement** with the `ui-designer` agent: theme tokens from `theme.css`,

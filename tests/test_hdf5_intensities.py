@@ -155,3 +155,18 @@ def test_spectral_regimes_follow_x_axis():
         want = [5.0, 25.0] if axis == 'wavelength' else [2.99792458e5 / 25, 2.99792458e5 / 5]
         assert np.allclose(edges, want), (axis, edges)
         assert {'FUV', 'Vis', 'MIR', 'FIR', 'cm'} <= set(labels)
+
+
+@pytest.mark.skipif(not os.path.isfile(MEUDON), reason='Meudon sample not available')
+def test_clear_grid_drops_grid_and_hdf5_intensities(monkeypatch):
+    from types import SimpleNamespace
+    ap._simline = {}
+    ap._chem = {}
+    ap.scan_directory(MEUDON)
+    assert ap._grid and ap._simline.get('from_hdf5')
+    monkeypatch.setattr(ap.dash, 'callback_context',
+                        SimpleNamespace(triggered_id='btn-clear-grid'))
+    out = ap.handle_load(1, 1, MEUDON, [], 0, ['CO'], 'CO', 'CO')
+    assert out[1] is False                     # grid-loaded
+    assert ap._grid == {} and ap._simline == {}
+    assert out[-12] == 1 and out[-11] == []    # simline-state bumped, species emptied

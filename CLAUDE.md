@@ -104,6 +104,9 @@ needed — invoke the matching one for every change request:
 5. UI for it via `ui-designer`; update `README.md` / `docs/`.
 
 ### UI change
+**Always invoke the `impeccable` and `design-taste-frontend` skills**
+(`.claude/skills/impeccable`, `.claude/skills/taste-skill`) for any request about how the app
+looks or for design ideas/critique — before proposing or editing anything.
 1. Find the component id in `app.py` and its rules in `assets/theme.css`.
 2. Use theme tokens and `plot_style.py`; keep ids and callback signatures stable.
 3. Check both light and dark themes; never hide or clip data for looks.

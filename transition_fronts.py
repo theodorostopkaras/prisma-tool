@@ -1,10 +1,11 @@
 """Photochemical transition fronts over a PDR model grid (Grids -> 3D fronts).
 
-Front definitions follow Gaches, Bisbas, Brendel & Zhu (arXiv:2608.04116,
-Sec. 3.4): the H2 dissociation front sits where x(H2) = 0.25 (x(H) = 2x(H2)
-= 0.5) and the C+ recombination front where x(C+)/x_C = 1/e. The paper does
-not define the C/CO transition; here it is where CO holds half the carbon,
-x(CO)/x_C = 0.5. x_C = x(C+) + x(C) + x(CO) (the dominant carbon carriers).
+The H2 dissociation front sits where x(H2) = 0.25 (x(H) = 2x(H2) = 0.5),
+following Gaches, Bisbas, Brendel & Zhu (arXiv:2608.04116, Sec. 3.4). The C+/C
+recombination front is the crossing x(C+) = x(C), i.e. x(C+)/[x(C+) + x(C)]
+= 0.5 (that paper uses x(C+)/x_C = 1/e instead). The C/CO front is where CO
+holds half the carbon, x(CO)/x_C = 0.5, with x_C = x(C+) + x(C) + x(CO) (the
+dominant carbon carriers).
 
 Two views:
   * front depth  -- A_V of each front for every model of a 2-D parameter
@@ -14,8 +15,6 @@ Two views:
     coloured by its dominant zone, with isosurfaces of the column-integrated
     fractions at the same thresholds.
 """
-import math
-
 import numpy as np
 import plotly.graph_objects as go
 from scipy import ndimage
@@ -27,7 +26,7 @@ FRONTS = [
     dict(key='h2', label='H/H₂ dissociation', colour='#E5484D', default_level=0.25,
          rule='x(H₂)', rising=True),
     dict(key='cplus', label='C⁺/C recombination', colour='#3DD6F5',
-         default_level=round(1.0 / math.e, 3), rule='x(C⁺)/x_C', rising=False),
+         default_level=0.5, rule='x(C⁺)/[x(C⁺)+x(C)]', rising=False),
     dict(key='co', label='C/CO', colour='#46A758', default_level=0.5,
          rule='x(CO)/x_C', rising=True),
 ]
@@ -42,12 +41,24 @@ MEDIA = [
 ]
 
 
+# KOSMA-τ writes 1e-37 for an abundance that is zero (e.g. the surface point of
+# some n_H >= 1e4 models).  Read it as zero so a 1e-37 / 2e-37 ratio is 0/0 = NaN
+# (skipped) and not a spurious C+ = C crossing at A_V = 0.  Real small values stay.
+KOSMA_ZERO = 1e-37
+
+
 def _carbon_fractions(c_plus, c, co):
+    """(x(C+)/[x(C+)+x(C)], x(CO)/x_C): 0.5 marks C+ = C and CO = half the carbon.
+
+    Abundances at the KOSMA-τ zero value (``KOSMA_ZERO``) count as zero; a ratio
+    with a zero denominator is NaN.
+    """
     c_plus, c, co = (np.asarray(a, dtype=float) for a in (c_plus, c, co))
-    x_c = c_plus + c + co
+    c_plus, c, co = (np.where(a <= KOSMA_ZERO, 0.0, a) for a in (c_plus, c, co))
+    x_atomic, x_c = c_plus + c, c_plus + c + co
     with np.errstate(divide='ignore', invalid='ignore'):
-        safe = np.where(x_c > 0, x_c, np.nan)
-        return c_plus / safe, co / safe
+        return (c_plus / np.where(x_atomic > 0, x_atomic, np.nan),
+                co / np.where(x_c > 0, x_c, np.nan))
 
 
 def front_fractions(rel, species_idx):

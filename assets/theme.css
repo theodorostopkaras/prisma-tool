@@ -1,10 +1,60 @@
 /* PRISMA design system — light/dark via #app-root.theme-light / .theme-dark */
 
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
+/* IBM Plex (SIL OFL 1.1), served from assets/fonts/ so the app looks the same
+   offline or on a cluster. Sans is one variable file per subset (400-700);
+   the Greek subset carries chi, zeta, tau. */
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('fonts/plex-sans-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+    U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF,
+    U+FFFD;
+}
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('fonts/plex-sans-latin-ext.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304,
+    U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB,
+    U+20AD-20C4, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('fonts/plex-sans-greek.woff2') format('woff2');
+  unicode-range: U+0370-0377, U+037A-037F, U+0384-038A, U+038C, U+038E-03A1, U+03A3-03FF;
+}
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('fonts/plex-mono-latin-400.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+    U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF,
+    U+FFFD;
+}
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('fonts/plex-mono-latin-600.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+    U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF,
+    U+FFFD;
+}
 
 :root {
   --font: 'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
-  --mono: ui-monospace, 'IBM Plex Mono', Menlo, Consolas, monospace;
+  --mono: 'IBM Plex Mono', ui-monospace, Menlo, Consolas, monospace;
 
   /* Spacing scale (4px base) */
   --s1: 4px;
@@ -77,25 +127,28 @@
 }
 
 #app-root.theme-dark {
-  /* Graphite: the interface is greyscale, colour belongs to the data.
-     Selected means bright (inverted), not coloured. */
-  --accent: #E4E4E7;
-  --accent-hover: #FAFAFA;
-  --accent-ink: #E4E4E7;
-  --accent-soft: rgba(255, 255, 255, 0.08);
-  --on-accent: #111113;
+  /* Black + yellow: greyscale surfaces, #FFC93C for every accent and
+     action (all filled buttons share it). Text has three steps (heading /
+     body / muted); green, lilac and clay only mark the data categories
+     (chemistry, lines, overlay) on title dots and status chips. */
+  --accent: #FFC93C;
+  --accent-hover: #FFD666;
+  --accent-ink: #FFC93C;
+  --accent-soft: rgba(255, 201, 60, 0.12);
+  --on-accent: #000000;
+  --on-btn: #000000;
   --ink: #18181B;
   --deep: #1F1F23;
-  --beam: #71717A;
-  --glow: #E4E4E7;
-  --success: #22c55e;
-  --purple: #a78bfa;
-  --overlay: #c4a484;
-  --btn-accent: #2563EB;
-  --btn-accent-hover: #1D4ED8;
-  --btn-soft: rgba(77, 141, 255, 0.16);
-  --btn-soft-hover: rgba(77, 141, 255, 0.26);
-  --btn-soft-ink: #8AB4FF;
+  --beam: #FFC93C;
+  --glow: #FFC93C;
+  --success: #4ADE80;
+  --purple: #C4B5FD;
+  --overlay: #D6A28C;
+  --btn-accent: #FFC93C;
+  --btn-accent-hover: #FFD666;
+  --btn-soft: rgba(255, 201, 60, 0.14);
+  --btn-soft-hover: rgba(255, 201, 60, 0.24);
+  --btn-soft-ink: #FFC93C;
   --danger-soft: rgba(248, 113, 113, 0.14);
   --danger-soft-hover: rgba(248, 113, 113, 0.24);
   --danger-ink: #FCA5A5;
@@ -103,9 +156,9 @@
   --card: #18181B;
   --border: #27272A;
   --border-strong: #3F3F46;
-  --text: #E4E4E7;
+  --text: #D9DADC;
   --text-muted: #A1A1AA;
-  --text-heading: #FAFAFA;
+  --text-heading: #F4F4F5;
   --input-bg: #131316;
   --input-border: #3F3F46;
   --seg-bg: #131316;
@@ -116,7 +169,7 @@
   --zebra: rgba(255, 255, 255, 0.03);
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
   --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.4);
-  --ring: 0 0 0 2px rgba(250, 250, 250, 0.35);
+  --ring: 0 0 0 2px rgba(255, 201, 60, 0.55);
 }
 
 /* Dash 4 core components (Dropdown, Slider inputs, Checklist, popovers) colour
@@ -125,7 +178,7 @@
 #app-root.theme-dark,
 body:has(#app-root.theme-dark) {
   --Dash-Fill-Inverse-Strong: #18181B;
-  --Dash-Fill-Interactive-Strong: #E4E4E7;
+  --Dash-Fill-Interactive-Strong: #FFC93C;
   --Dash-Fill-Interactive-Weak: rgba(255, 255, 255, 0.04);
   --Dash-Fill-Disabled: rgba(255, 255, 255, 0.08);
   --Dash-Fill-Primary-Hover: rgba(255, 255, 255, 0.06);
@@ -134,10 +187,10 @@ body:has(#app-root.theme-dark) {
   --Dash-Shading-Weak: rgba(0, 0, 0, 0.4);
   --Dash-Stroke-Strong: #52525B;
   --Dash-Stroke-Weak: #3F3F46;
-  --Dash-Text-Primary: #E4E4E7;
-  --Dash-Text-Strong: #FAFAFA;
+  --Dash-Text-Primary: #D9DADC;
+  --Dash-Text-Strong: #D9DADC;
   --Dash-Text-Weak: #A1A1AA;
-  --Dash-Text-Disabled: rgba(228, 228, 231, 0.45);
+  --Dash-Text-Disabled: rgba(217, 218, 220, 0.45);
 }
 
 html, body {
@@ -155,7 +208,7 @@ body:has(#app-root.theme-light) {
 body:not(:has(#app-root.theme-light)),
 body:has(#app-root.theme-dark) {
   background-color: #0F0F11;
-  color: #E4E4E7;
+  color: #D9DADC;
 }
 
 #app-root {
@@ -182,7 +235,7 @@ body:has(#app-root.theme-dark) {
 }
 
 #app-root.theme-light { color: #22314A; }
-#app-root.theme-dark { color: #E4E4E7; }
+#app-root.theme-dark { color: #D9DADC; }
 
 /* ---- Cards / panels ---- */
 /* Elevation language: flat surfaces are separated by a border only.
@@ -235,7 +288,7 @@ body:has(#app-root.theme-dark) {
 
 .btn-primary {
   background: var(--btn-accent);
-  color: #fff !important;
+  color: var(--on-btn, #fff) !important;
   border-color: var(--btn-accent);
 }
 
@@ -244,30 +297,22 @@ body:has(#app-root.theme-dark) {
   border-color: var(--btn-accent-hover);
 }
 
-.btn-success {
-  background: var(--success);
-  color: #fff !important;
-  border-color: var(--success);
-}
-
-.btn-success:hover {
-  filter: brightness(1.05);
-}
-
-.btn-purple {
-  background: var(--purple);
-  color: #fff !important;
-  border-color: var(--purple);
-}
-
-.btn-purple:hover {
-  filter: brightness(1.05);
-}
-
+/* Every filled action shares the accent colour in both themes. The data
+   category (chemistry, lines, overlay) is shown by the dot before the card
+   title, not by the button. */
+.btn-success,
+.btn-purple,
 .btn-overlay {
-  background: var(--overlay);
-  color: #fff !important;
-  border-color: var(--overlay);
+  background: var(--btn-accent);
+  color: var(--on-btn, #fff) !important;
+  border-color: var(--btn-accent);
+}
+
+.btn-success:hover,
+.btn-purple:hover,
+.btn-overlay:hover {
+  background: var(--btn-accent-hover);
+  border-color: var(--btn-accent-hover);
 }
 
 /* Secondary: tonal fill, no outline, so it never reads as a text input. */
@@ -323,6 +368,18 @@ input.kosma-input {
   box-sizing: border-box;
 }
 
+/* Dash 4 wraps dcc.Input in a div that receives the className too; without
+   this the wrapper and the input each draw a box (a border inside a border). */
+.dash-input-container.kosma-input {
+  padding: 0;
+  border: none;
+  background: none;
+}
+
+.dash-input-container.kosma-input > input {
+  width: 100%;
+}
+
 /* Multi-line inputs opt out of the fixed height. */
 #app-root textarea,
 textarea.kosma-input {
@@ -371,7 +428,7 @@ textarea.kosma-input {
   align-items: center;
   justify-content: space-between;
   gap: var(--s5);
-  padding: var(--s3) var(--s4);
+  padding: var(--s2) var(--s4);
   margin-bottom: var(--s3);
   border: none;
   border-radius: var(--radius);
@@ -395,18 +452,11 @@ textarea.kosma-input {
 .app-header .app-about p,
 #app-root.theme-dark .app-header .app-brand-lead,
 #app-root.theme-dark .app-header .app-about p {
-  color: #D4D4D8 !important;
+  color: #D9DADC !important;
 }
 
 .app-header .app-about summary {
   color: var(--glow);
-}
-
-.app-logo {
-  width: 48px;
-  height: 48px;
-  margin-right: var(--s3);
-  border-radius: 11px;
 }
 
 /* Theme toggle sits on navy, so it gets a glass pill rather than the
@@ -417,7 +467,7 @@ textarea.kosma-input {
 }
 
 #app-root .app-header .theme-seg-btn {
-  color: #D4D4D8 !important;
+  color: #D9DADC !important;
 }
 
 #app-root .app-header .theme-seg-btn:has(input:checked) {
@@ -432,22 +482,28 @@ textarea.kosma-input {
 }
 
 .app-logo {
-  width: 52px;
-  height: 52px;
-  margin-right: 14px;
-  border-radius: 10px;
+  width: 32px;
+  height: 32px;
+  margin-right: var(--s3);
+  border-radius: 8px;
   flex-shrink: 0;
   object-fit: cover;
 }
 
+/* One row: wordmark, tagline, About. The open About text wraps to its own
+   line so the bar stays ~48px when closed. */
 .app-brand {
   flex: 1;
   min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: var(--s3);
 }
 
 .app-brand-title {
-  margin: 0 0 2px !important;
-  font-size: var(--fs-xl) !important;
+  margin: 0 !important;
+  font-size: var(--fs-lg) !important;
   font-weight: 700 !important;
   line-height: 1.2 !important;
   letter-spacing: -0.03em;
@@ -467,9 +523,12 @@ textarea.kosma-input {
 }
 
 .app-about {
-  margin-top: 6px;
   font-size: 12px;
   color: var(--text-muted);
+}
+
+.app-about[open] {
+  flex-basis: 100%;
 }
 
 .app-about summary {
@@ -638,7 +697,7 @@ textarea.kosma-input {
 }
 
 #app-root.theme-dark .theme-ico-moon {
-  box-shadow: inset -3px -1px 0 1px #D4D4D8;
+  box-shadow: inset -3px -1px 0 1px #D9DADC;
 }
 
 #app-root.theme-dark .theme-ico-sun {
@@ -727,9 +786,9 @@ textarea.kosma-input {
   border: 1px solid var(--border-strong) !important;
   border-left-width: 0 !important;
   border-radius: 0 !important;
-  padding: 9px 18px !important;
+  padding: 8px 10px !important;
   font-weight: 600 !important;
-  font-size: var(--fs-md) !important;
+  font-size: 14px !important;
   font-family: var(--font) !important;
   letter-spacing: -0.01em;
   bottom: 0 !important;
@@ -748,7 +807,7 @@ textarea.kosma-input {
    (on the right, so a group that wraps to a new row starts flush left). */
 #main-tabs .tab:has(+ .tab[class*="grp-"]),
 #main-tabs .tab:last-child {
-  margin-right: var(--s5);
+  margin-right: var(--s3);
   border-top-right-radius: var(--radius-sm) !important;
   border-bottom-right-radius: var(--radius-sm) !important;
 }
@@ -901,21 +960,32 @@ textarea.kosma-input {
 }
 
 .load-card {
-  padding: var(--s3) var(--s3) var(--s3) var(--s4);
+  --card-accent: var(--accent);
+  padding: var(--s3);
   background: var(--sunken);
   border: none;
   border-radius: var(--radius-sm);
   margin-bottom: var(--s2);
-  box-shadow: inset 3px 0 0 0 var(--accent);
 }
 
 .load-card:last-child {
   margin-bottom: 0;
 }
 
-.load-card.accent-green { box-shadow: inset 3px 0 0 0 var(--success); }
-.load-card.accent-purple { box-shadow: inset 3px 0 0 0 var(--purple); }
-.load-card.accent-overlay { box-shadow: inset 3px 0 0 0 var(--overlay); }
+.load-card.accent-green { --card-accent: var(--success); }
+.load-card.accent-purple { --card-accent: var(--purple); }
+.load-card.accent-overlay { --card-accent: var(--overlay); }
+
+/* Data-category marker: a dot before the title. */
+.load-card-title::before {
+  content: '';
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: var(--s2);
+  border-radius: 50%;
+  background: var(--card-accent);
+}
 
 .load-card-head {
   display: flex;
@@ -936,21 +1006,48 @@ textarea.kosma-input {
   color: var(--text-muted);
 }
 
+/* Two lines per card so the path gets the width:
+     path ........................ | Browse
+     recursive |        | Load ... | Clear
+   Fixed button columns keep every card aligned. */
 .load-card-row {
-  display: flex;
+  display: grid;
+  grid-template-columns: 104px minmax(0, 1fr) minmax(140px, 200px) 84px;
   align-items: stretch;
   gap: 8px;
-  flex-wrap: wrap;
+}
+
+.load-card-row > :first-child {
+  grid-column: 1 / 4;
+}
+
+.load-card-row > :nth-child(4) {
+  grid-column: 3;
+}
+
+.load-card-row > * {
+  min-width: 0;
 }
 
 .load-card-row .btn {
-  flex-shrink: 0;
+  width: 100%;
 }
 
-.load-card-row .kosma-input,
-.load-card-row input[type="text"] {
-  flex: 1;
-  min-width: 180px;
+@media (max-width: 760px) {
+  .load-card-row {
+    display: flex;
+    flex-wrap: wrap;
+  }
+
+  .load-card-row .btn {
+    width: auto;
+    flex-shrink: 0;
+  }
+
+  .load-card-row .kosma-input,
+  .load-card-row input[type="text"] {
+    flex: 1 1 100%;
+  }
 }
 
 .path-browse-row {
@@ -974,6 +1071,11 @@ textarea.kosma-input {
   margin-top: 8px;
   font-size: 13px;
   min-height: 18px;
+}
+
+/* No reserved blank line under a card until there is a status to show. */
+.load-status:empty {
+  display: none;
 }
 
 .status-chip {
@@ -1068,11 +1170,11 @@ textarea.kosma-input {
 #app-root.theme-dark h3,
 #app-root.theme-dark h4,
 #app-root.theme-dark label {
-  color: #FAFAFA !important;
+  color: #D9DADC !important;
 }
 
 #app-root.theme-dark p {
-  color: #D4D4D8;
+  color: #D9DADC;
 }
 
 .page-intro {
@@ -1118,7 +1220,7 @@ textarea.kosma-input {
 #app-root.theme-dark table,
 #app-root.theme-dark th,
 #app-root.theme-dark td {
-  color: #E4E4E7;
+  color: #D9DADC;
   border-color: #27272A !important;
 }
 
@@ -1143,7 +1245,7 @@ textarea.kosma-input {
 
 #app-root.theme-dark .rc-slider-mark-text,
 #app-root.theme-dark .dash-slider-mark {
-  color: #D4D4D8 !important;
+  color: #D9DADC !important;
   opacity: 1 !important;
 }
 
@@ -1164,13 +1266,13 @@ textarea.kosma-input {
 }
 
 #app-root.theme-dark .rc-slider-dot {
-  border-color: #A1A1AA !important;
+  border-color: #D9DADC !important;
   background-color: #18181B !important;
 }
 
 #app-root.theme-dark .rc-slider-handle {
   border-color: var(--accent) !important;
-  background-color: #F4F4F5 !important;
+  background-color: #D9DADC !important;
 }
 
 #app-root .rc-slider-track {
@@ -1210,7 +1312,7 @@ textarea.kosma-input {
 #app-root.theme-dark [class$="-Input"],
 #app-root.theme-dark [class$="-ValueContainer"] {
   background-color: #131316 !important;
-  color: #E4E4E7 !important;
+  color: #D9DADC !important;
   border-color: #3F3F46 !important;
 }
 
@@ -1219,14 +1321,14 @@ textarea.kosma-input {
 #app-root.theme-dark .Select-value-label,
 #app-root.theme-dark div[class*="-singleValue"],
 #app-root.theme-dark div[class*="-placeholder"] {
-  color: #E4E4E7 !important;
+  color: #D9DADC !important;
 }
 
 #app-root.theme-dark .Select-arrow,
 #app-root.theme-dark [class*="-indicatorContainer"] svg,
 #app-root.theme-dark [class*="-dropdownIndicator"] {
-  color: #A1A1AA !important;
-  fill: #A1A1AA !important;
+  color: #D9DADC !important;
+  fill: #D9DADC !important;
 }
 
 #app-root.theme-dark .VirtualizedSelectFocusedOption,
@@ -1234,13 +1336,13 @@ textarea.kosma-input {
 #app-root.theme-dark div[class*="-option"]:hover,
 #app-root.theme-dark [class$="-option"]:hover {
   background-color: #27272A !important;
-  color: #FAFAFA !important;
+  color: #D9DADC !important;
 }
 
 #app-root.theme-dark .Select-option.is-selected,
 #app-root.theme-dark [class*="-option"][class*="selected"] {
   background-color: var(--accent-soft) !important;
-  color: #FAFAFA !important;
+  color: #D9DADC !important;
 }
 
 body:has(#app-root.theme-dark) div[class*="-menu"],
@@ -1248,21 +1350,21 @@ body:has(#app-root.theme-dark) div[class$="-menu"],
 body:has(#app-root.theme-dark) .Select-menu-outer,
 body:has(#app-root.theme-dark) .Select-menu {
   background-color: #18181B !important;
-  color: #E4E4E7 !important;
+  color: #D9DADC !important;
   border: 1px solid #3F3F46 !important;
 }
 
 body:has(#app-root.theme-dark) div[class*="-option"],
 body:has(#app-root.theme-dark) .Select-option {
   background-color: #18181B !important;
-  color: #E4E4E7 !important;
+  color: #D9DADC !important;
 }
 
 body:has(#app-root.theme-dark) div[class*="-option"]:hover,
 body:has(#app-root.theme-dark) .Select-option:hover,
 body:has(#app-root.theme-dark) .Select-option.is-focused {
   background-color: #27272A !important;
-  color: #FAFAFA !important;
+  color: #D9DADC !important;
 }
 
 body:has(#app-root.theme-dark) [class*="-MenuList"],
@@ -1288,7 +1390,7 @@ body:has(#app-root) [class$="-MenuList"] {
 #app-root.theme-dark .form-check-label,
 #app-root.theme-dark .dash-radioitems label,
 #app-root.theme-dark .dash-checklist label {
-  color: #E4E4E7 !important;
+  color: #D9DADC !important;
 }
 
 /* ---- Dark: catch remaining light inline backgrounds ---- */
@@ -1301,37 +1403,37 @@ body:has(#app-root) [class$="-MenuList"] {
 #app-root.theme-dark [style*="background: white"] {
   background-color: #18181B !important;
   border-color: #27272A !important;
-  color: #E4E4E7 !important;
+  color: #D9DADC !important;
 }
 
 #app-root.theme-dark input:not([type="checkbox"]):not([type="radio"]):not([type="hidden"]):not([type="submit"]):not([type="button"]):not(.theme-seg-input):not(.seg-input),
 #app-root.theme-dark textarea {
   background-color: #131316 !important;
-  color: #E4E4E7 !important;
+  color: #D9DADC !important;
   border-color: #3F3F46 !important;
 }
 
 #app-root.theme-dark button[style*="background-color: #eee"],
 #app-root.theme-dark button[style*="background-color: #f7f7f7"] {
   background-color: #27272A !important;
-  color: #E4E4E7 !important;
+  color: #D9DADC !important;
   border-color: #3F3F46 !important;
 }
 
 #app-root.theme-dark [style*="color: #666"],
 #app-root.theme-dark [style*="color: '#666"],
 #app-root.theme-dark span[style*="color: rgb(102, 102, 102)"] {
-  color: #A1A1AA !important;
+  color: #D9DADC !important;
 }
 
 #app-root.theme-dark [style*="color: #333"],
 #app-root.theme-dark [style*="color: '#333"] {
-  color: #E4E4E7 !important;
+  color: #D9DADC !important;
 }
 
 #app-root.theme-dark [style*="color: #555"],
 #app-root.theme-dark [style*="color: '#555"] {
-  color: #D4D4D8 !important;
+  color: #D9DADC !important;
 }
 
 #app-root.theme-dark [style*="border-bottom: 1px solid #eee"] {
@@ -1347,7 +1449,7 @@ body:has(#app-root) [class$="-MenuList"] {
 #app-root.theme-dark #model-setup-panel th,
 #app-root.theme-dark #model-setup-panel td {
   background-color: #18181B !important;
-  color: #E4E4E7 !important;
+  color: #D9DADC !important;
   border-color: #3F3F46 !important;
 }
 
@@ -1363,7 +1465,7 @@ body:has(#app-root) [class$="-MenuList"] {
 }
 
 #app-root.theme-dark #model-setup-panel [style*="color: #1a1a2e"] {
-  color: #FAFAFA !important;
+  color: #D9DADC !important;
 }
 
 /* Scrollbars */
@@ -1382,7 +1484,7 @@ body:has(#app-root) [class$="-MenuList"] {
 }
 
 #app-root.theme-dark ::-webkit-scrollbar-thumb:hover {
-  background: #A1A1AA;
+  background: #D9DADC;
 }
 
 #app-root.theme-dark .dash-loading,
@@ -1392,7 +1494,7 @@ body:has(#app-root) [class$="-MenuList"] {
 
 #app-root.theme-dark .rc-slider-tooltip-inner {
   background-color: #27272A !important;
-  color: #E4E4E7 !important;
+  color: #D9DADC !important;
   border: 1px solid #3F3F46 !important;
 }
 
@@ -1404,7 +1506,7 @@ body:has(#app-root) [class$="-MenuList"] {
 }
 
 #app-root.theme-dark a:hover {
-  color: #FAFAFA;
+  color: #D9DADC;
   text-decoration-color: currentColor;
 }
 
@@ -1445,7 +1547,7 @@ body:has(#app-root) [class$="-MenuList"] {
 }
 
 #app-root.theme-dark #export-format-selector label {
-  color: #D4D4D8;
+  color: #D9DADC;
 }
 
 /* ---- Probe ranking ---- */
@@ -1453,7 +1555,6 @@ body:has(#app-root) [class$="-MenuList"] {
   background: var(--card);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  box-shadow: inset 3px 0 0 0 var(--accent);
   padding: var(--s3) var(--s4) var(--s4) var(--s4);
   margin-bottom: var(--s3);
   font-size: var(--fs-base);
@@ -1468,7 +1569,7 @@ body:has(#app-root) [class$="-MenuList"] {
 }
 
 .probe-eq {
-  font-family: ui-monospace, 'IBM Plex Mono', Menlo, monospace;
+  font-family: var(--mono);
   font-size: 13px;
   font-weight: 600;
   color: var(--text-heading);
@@ -1530,7 +1631,6 @@ body:has(#app-root) [class$="-MenuList"] {
   margin: 0 0 var(--s3);
   padding: var(--s2) var(--s3);
   border-radius: var(--radius-sm);
-  box-shadow: inset 3px 0 0 0 var(--accent);
   background: var(--sunken);
 }
 
@@ -1703,7 +1803,7 @@ body:has(#app-root) [class$="-MenuList"] {
 /* Checkboxes/radios, focus outlines and text selection otherwise fall back
    to the browser's blue. */
 #app-root.theme-dark {
-  accent-color: #E4E4E7;
+  accent-color: #FFC93C;
 }
 
 #app-root.theme-dark *:focus-visible {
@@ -1712,8 +1812,8 @@ body:has(#app-root) [class$="-MenuList"] {
 }
 
 #app-root.theme-dark ::selection {
-  background: rgba(250, 250, 250, 0.18);
-  color: #FAFAFA;
+  background: rgba(255, 201, 60, 0.30);
+  color: #D9DADC;
 }
 
 /* ---- Inline radio / checklist groups (_RADIO in app.py) -----------------

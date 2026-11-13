@@ -81,12 +81,20 @@ The heating/cooling rates come from
 panels the line dash pattern is cycled alongside the colour so all components
 stay distinguishable.
 
-**Grid-integrated vs CRIR** integrates every rate as ∫4πr² Γ dr (the rates are
-already per volume). The absolute
+**Grid-integrated rates** integrates every rate as ∫4πr² Γ dr (the rates are
+already per volume) and plots it against the **x axis** parameter, one panel per
+selected value of the **panel** parameter (the rate-regime map uses the panel
+parameter as its y axis). Both lists hold only the parameters the loaded grid
+varies (single-valued ones are listed last); the defaults are ζ on x and n_H in
+the panels, falling back to the grid's varying axes when ζ or n_H is fixed. The
+same rule sets the three axes of **Grids → 3D fronts** and the axes pooled by
+**Grids → Abundance PDF**, which also has an **x axis** choice (local ζ_H/n_H by
+default, or A_V, n_H, N_H, N(H₂)) and a **Split by** choice (one panel per value
+of a varying grid parameter, ζ by default, or none). The absolute
 figure takes a rate floor (default 0) and **Top N channels** (a channel is drawn
 if it is among the N largest in at least one plotted model). The **share bars**
 below give each channel's % of the total heating / cooling, with the attenuated
-overlay grid hatched next to the main grid at every ζ.
+overlay grid hatched next to the main grid at every x value.
 
 ## Model setup (JSON configs)
 

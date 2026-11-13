@@ -182,3 +182,21 @@ def test_cr_path_keeps_same_column_crphot_entry():
     kept = cn.cr_path_edges([crphot, step, loop], 'HCO+', rank)
     assert crphot in kept and step in kept
     assert loop not in kept  # non-CR same-column steps still close cycles: dropped
+
+
+def test_heuristic_walk_keeps_cr_ionisation_of_seed():
+    """H3+ network must show H2 + CR → H2+ even though H2+ is a seed (walk stops there)."""
+    labels = {
+        'H3+': {'formation': ['H2+ + H2 → H3+ + H'], 'destruction': []},
+        'H2+': {'formation': ['H+ + H → H2+', 'H2 + CRP → H2+ + e-'],
+                'destruction': ['H2+ + H2 → H3+ + H']},
+        'H2': {'formation': [], 'destruction': []},
+        'H': {'formation': [], 'destruction': []},
+        'H+': {'formation': [], 'destruction': []},
+    }
+    # H2 is also a destruction product of H3+; the CR route must still put it upstream.
+    labels['H3+']['destruction'] = ['H3+ + e- → H2 + H']
+    _, edges, rank = cn.build_multihop_pathway(labels, 'H3+')
+    assert rank['H2'] < rank['H2+'] < rank['H3+']
+    assert any(e['source'] == 'H2' and e['target'] == 'H2+' and e['partner'] == 'cr'
+               for e in edges)

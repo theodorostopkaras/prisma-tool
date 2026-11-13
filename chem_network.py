@@ -1728,6 +1728,21 @@ def build_multihop_pathway(
             # Dominant mode walks through seed ions (H3+, He+, H+ are CR products);
             # depth + top-k already bound the tree.
             if pre in CHAIN_SEED_SPECIES and reaction_picker is None:
+                # Stop here, but keep the seed's direct CR ionisation as a leaf
+                # (H2 + CRP → H2+ + e⁻ feeds H3+); otherwise the CR origin is lost.
+                if pre not in visited_up:
+                    for cr_raw in _labels_for(labels_by_species, pre, 'formation'):
+                        r, p = parse_reaction(cr_raw)
+                        if partner_class(r, p) != 'cr':
+                            continue
+                        cr_edge = pathway_edge_from_reaction(
+                            cr_raw, pre, 'formation', known_species=known_keys)
+                        _add_edge(cr_edge)
+                        src = cr_edge['source'] if cr_edge else None
+                        if src in nodes and src != focal:
+                            # Precursor column, so the CR route reads left → right.
+                            up_hop[src] = min(up_hop.get(src, hop + 1), hop + 1)
+                            upstream.add(src)
                 visited_up.add(pre)
                 continue
             # Ice counterparts stay as leaves unless the focus itself is ice.

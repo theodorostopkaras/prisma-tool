@@ -10,7 +10,7 @@ import json
 import re
 import urllib.request
 
-__version__ = '1.0.0'
+__version__ = '1.1.0'
 
 REPO = 'theodorostopkaras/prisma-tool'
 _LATEST_URL = f'https://api.github.com/repos/{REPO}/releases/latest'

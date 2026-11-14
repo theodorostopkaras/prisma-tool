@@ -50,6 +50,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 
 import numpy as np
 import pandas as pd
@@ -142,7 +143,15 @@ parser.add_argument('--host',  default='127.0.0.1')
 parser.add_argument('--debug', action='store_true')
 parser.add_argument('--browser', action='store_true',
                     help='serve to a browser tab instead of the PRISMA app window')
+parser.add_argument('--install', action='store_true',
+                    help='add PRISMA (with its icon) to the Linux applications menu and exit')
 args, _ = parser.parse_known_args()
+
+if args.install and __name__ == '__main__':
+    import desktop_window
+    print('PRISMA added to the applications menu: '
+          + desktop_window.install_desktop_entry())
+    sys.exit(0)
 
 
 # --- Constants ----------------------------------------------------------------
@@ -9835,6 +9844,14 @@ def _resolve_browse_path(picked, keep='folder'):
 
 
 _DIALOG_PROCS = set()  # open Browse dialogs; closed together with the PRISMA window
+_last_ping = [time.time()]  # last heartbeat from an open PRISMA page
+
+
+@app.server.route('/_prisma_alive', methods=['POST'])
+def _prisma_alive():
+    """Heartbeat from assets/heartbeat.js; lets a menu-launched PRISMA quit with its tab."""
+    _last_ping[0] = time.time()
+    return '', 204
 
 
 def _run_tracked(cmd, env=None):
@@ -19307,6 +19324,12 @@ if __name__ == '__main__':
     run = getattr(app, 'run', None) or app.run_server
     url = f'http://{args.host}:{args.port}'
 
+    def _quit():
+        """Exit PRISMA completely, closing a Browse dialog left open."""
+        for proc in list(_DIALOG_PROCS):
+            proc.kill()
+        os._exit(0)
+
     def _app_window():
         """Show PRISMA in its own window; fall back to the browser if that fails.
 
@@ -19317,12 +19340,18 @@ if __name__ == '__main__':
         rc = subprocess.call(
             [sys.executable, os.path.join(here, 'desktop_window.py'), url])
         if rc == 0:  # window closed by the user -> quit PRISMA completely
-            for proc in list(_DIALOG_PROCS):  # a Browse dialog still open
-                proc.kill()
-            os._exit(0)
+            _quit()
         print(f'App window unavailable (exit code {rc}); open PRISMA at {url}')
         import webbrowser
         webbrowser.open(url)
+        if sys.stdin is None or not sys.stdin.isatty():
+            # Started from the menu icon: no terminal to Ctrl+C, so quit once the
+            # browser tab has stopped pinging (assets/heartbeat.js, every 20 s).
+            # Browsers slow timers in background tabs to ~1/min, hence 3 min.
+            _last_ping[0] = time.time()
+            while time.time() - _last_ping[0] < 180:
+                time.sleep(15)
+            _quit()
 
     # Debug hot-reload restarts the process, so it always serves to the browser.
     if not (args.browser or args.debug):

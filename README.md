@@ -420,25 +420,38 @@ Implementation: `atten_compare.py` (numerics checked by
 
 ## Install & run
 
-From the project directory:
-
 ```bash
+git clone https://github.com/theodorostopkaras/prisma-tool.git
+cd prisma-tool
 python -m pip install --upgrade -r requirements.txt
-python app.py --dir /path/to/pdrgrid_hdf5
+python app.py --install      # Linux: add PRISMA, with its icon, to the applications menu
 ```
 
-PRISMA opens in its own app window (via `pywebview`). Use `--browser` to
-serve it to a browser tab at <http://127.0.0.1:8050> instead (also the fallback
-if `pywebview` is missing or the window crashes, and always the case with
-`--debug`).
+Then start PRISMA from the applications menu (search "PRISMA"; right-click the
+running app -> *Add to Favorites* to pin it to the dock), or from the terminal:
+
+```bash
+python app.py                          # or: python app.py --dir /path/to/pdrgrid_hdf5
+```
+
+PRISMA opens in its own app window (via `pywebview`); closing the window quits
+PRISMA completely. `--install` points the menu entry at this folder and this
+Python, so re-run it if you move the folder or switch Python environments. To
+remove it: `rm ~/.local/share/applications/prisma.desktop`.
+
+Use `--browser` to serve PRISMA to a browser tab at <http://127.0.0.1:8050>
+instead. That is also the fallback if `pywebview` is missing or the window
+crashes, and always the case with `--debug`. Started from the menu (no
+terminal to press Ctrl+C in), a fallback PRISMA quits by itself about 3 minutes
+after its browser tab is closed.
 
 On the **Load** tab, click **Browse** to
 open a system file window and pick any model file in the grid folder (the
 folder path is filled in automatically), or paste a path and click
 **Load grid** (tick *recursive* to walk sub-folders).
 
-If you already had the tool installed, re-run the `pip install --upgrade` line
-after every `git pull` so new or newer packages are picked up.
+To update, run `git pull` and re-run the `pip install --upgrade` line, so new
+or newer packages are picked up (see [Updates](#updates)).
 
 **Required packages** (from `requirements.txt`):
 
@@ -495,13 +508,14 @@ and publish. Drafts and pre-releases do not trigger the badge.
 | `--port` | `8050` | port |
 | `--debug` | off | Dash debug / hot-reload |
 | `--browser` | off | browser tab instead of the app window |
+| `--install` | off | add PRISMA to the Linux applications menu, then exit |
 
 ## Code layout
 
 | Module | Role |
 |---|---|
 | `app.py` | Dash UI, callbacks, plotting |
-| `desktop_window.py` | Native app window (pywebview) |
+| `desktop_window.py` | Native app window (pywebview), menu entry (`--install`) |
 | `update_check.py` | Version number, GitHub release check |
 | `grid_interp.py` | 2-D / 3-D grid resampling |
 | `grid_fit.py` | 3-D intensity cubes and FITS map fit |

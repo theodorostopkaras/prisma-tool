@@ -11,3 +11,6 @@ astropy>=5.0
 astroquery>=0.4.8
 tqdm>=4.65
 Pillow>=9.0
+# Native PRISMA window (Linux needs the Qt backend; Windows/macOS use the system webview)
+pywebview[qt]>=5.0; sys_platform == "linux"
+pywebview>=5.0; sys_platform != "linux"

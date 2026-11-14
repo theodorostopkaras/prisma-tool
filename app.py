@@ -92,6 +92,7 @@ import map_fit_extras as mfe
 import probe_ranking as pr
 import atten_compare as ac
 import transition_fronts as tf
+import update_check as uc
 
 
 # --- CLI ----------------------------------------------------------------------
@@ -139,6 +140,8 @@ parser.add_argument('--recursive', action='store_true',
 parser.add_argument('--port',  default=8050, type=int)
 parser.add_argument('--host',  default='127.0.0.1')
 parser.add_argument('--debug', action='store_true')
+parser.add_argument('--browser', action='store_true',
+                    help='serve to a browser tab instead of the PRISMA app window')
 args, _ = parser.parse_known_args()
 
 
@@ -9831,6 +9834,22 @@ def _resolve_browse_path(picked, keep='folder'):
     return picked
 
 
+_DIALOG_PROCS = set()  # open Browse dialogs; closed together with the PRISMA window
+
+
+def _run_tracked(cmd, env=None):
+    """``subprocess.run(cmd, capture_output=True, text=True)``, remembering the
+    process while it runs so quitting PRISMA can close a dialog left open."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env=env)
+    _DIALOG_PROCS.add(proc)
+    try:
+        out, err = proc.communicate()
+    finally:
+        _DIALOG_PROCS.discard(proc)
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
 def _run_dialog(cmd, env=None):
     """Run a chooser. ``None`` = backend missing/crashed; ``''`` = cancelled."""
     # Choosers are system binaries: a conda/venv LD_LIBRARY_PATH makes them
@@ -9839,7 +9858,7 @@ def _run_dialog(cmd, env=None):
     env.pop('LD_LIBRARY_PATH', None)
     env.pop('LD_PRELOAD', None)
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        proc = _run_tracked(cmd, env=env)
     except OSError:
         return None
     if proc.returncode == 1:  # zenity / kdialog Cancel
@@ -9985,9 +10004,8 @@ def _pick_tkinter(kind, title, start_dir, filetypes):
     )
     encoded = ';;'.join(f'{name}|{pat}' for name, pat in (filetypes or ()))
     try:
-        proc = subprocess.run(
-            [sys.executable, '-c', script, start_dir or '', kind, title, encoded],
-            capture_output=True, text=True)
+        proc = _run_tracked(
+            [sys.executable, '-c', script, start_dir or '', kind, title, encoded])
     except OSError:
         return None
     if proc.returncode != 0:
@@ -11848,9 +11866,11 @@ app.layout = html.Div(
                     'to explore profiles, 2-D grid slices, spectra, and map fits.',
                     id='app-blurb',
                 ),
+                html.P(f'Version {uc.__version__}', id='app-version'),
             ]),
         ]),
         html.Div(id='theme-toggle-wrap', className='theme-toggle', children=[
+            html.Div(id='update-badge'),
             dcc.RadioItems(
                 id='plot-theme',
                 options=PLOT_THEME_OPTIONS,
@@ -14592,6 +14612,27 @@ app.clientside_callback(
     Input('main-tabs', 'value'),
     Input('grid-loaded', 'data'),
 )
+
+
+@app.callback(
+    Output('update-badge', 'children'),
+    Input('update-badge', 'id'),
+)
+def show_update_badge(_):
+    """Header badge when GitHub has a newer PRISMA release (checked once per run)."""
+    rel = uc.check_for_update()
+    if rel is None:
+        return None
+    return html.Details(className='app-update', children=[
+        html.Summary(f'Update {rel["tag_name"]}'),
+        html.Div(className='app-update-panel', children=[
+            html.P(f'PRISMA {rel["tag_name"]} is available (you have '
+                   f'v{uc.__version__}). In the PRISMA folder run:'),
+            html.Pre('git pull\npython -m pip install --upgrade -r requirements.txt'),
+            html.P('then restart PRISMA.'),
+            html.A("What's new", href=rel['html_url'], target='_blank'),
+        ]),
+    ])
 
 
 @app.callback(
@@ -19264,4 +19305,26 @@ if __name__ == '__main__':
         except Exception as exc:
             print(f'Could not pre-load --dir: {exc}')
     run = getattr(app, 'run', None) or app.run_server
+    url = f'http://{args.host}:{args.port}'
+
+    def _app_window():
+        """Show PRISMA in its own window; fall back to the browser if that fails.
+
+        The window runs in a child process: a broken Qt/GTK install can segfault,
+        which would otherwise take the server down with it.
+        """
+        here = os.path.dirname(os.path.abspath(__file__))
+        rc = subprocess.call(
+            [sys.executable, os.path.join(here, 'desktop_window.py'), url])
+        if rc == 0:  # window closed by the user -> quit PRISMA completely
+            for proc in list(_DIALOG_PROCS):  # a Browse dialog still open
+                proc.kill()
+            os._exit(0)
+        print(f'App window unavailable (exit code {rc}); open PRISMA at {url}')
+        import webbrowser
+        webbrowser.open(url)
+
+    # Debug hot-reload restarts the process, so it always serves to the browser.
+    if not (args.browser or args.debug):
+        threading.Thread(target=_app_window, daemon=True).start()
     run(debug=args.debug, host=args.host, port=args.port)

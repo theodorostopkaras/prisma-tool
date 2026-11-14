@@ -427,7 +427,12 @@ python -m pip install --upgrade -r requirements.txt
 python app.py --dir /path/to/pdrgrid_hdf5
 ```
 
-Then open <http://127.0.0.1:8050>. On the **Load** tab, click **Browse** to
+PRISMA opens in its own app window (via `pywebview`). Use `--browser` to
+serve it to a browser tab at <http://127.0.0.1:8050> instead (also the fallback
+if `pywebview` is missing or the window crashes, and always the case with
+`--debug`).
+
+On the **Load** tab, click **Browse** to
 open a system file window and pick any model file in the grid folder (the
 folder path is filled in automatically), or paste a path and click
 **Load grid** (tick *recursive* to walk sub-folders).
@@ -448,6 +453,7 @@ after every `git pull` so new or newer packages are picked up.
 | `astroquery` | CDMS / JPL line ID on **Spectra → Cube viewer** |
 | `tqdm` | Progress bar during map fitting |
 | `Pillow` | Image export |
+| `pywebview` | Native app window (Qt backend on Linux) |
 
 The cube viewer’s **local 3 mm catalog** works with the core stack only.
 **CDMS / JPL** need `astroquery` and a network connection. To install that
@@ -466,6 +472,19 @@ is used.
 conda install graphviz        # or: sudo apt install graphviz / brew install graphviz
 ```
 
+### Updates
+
+When a newer PRISMA release is published on GitHub, an **Update** badge appears
+in the header with the commands to update (`git pull`, then the `pip install`
+line above) and a link to the release notes. PRISMA asks GitHub once at start-up;
+offline or without a newer release, nothing is shown. Only published releases
+count, not individual commits.
+
+**Publishing a release (maintainer):** set `__version__` in `update_check.py`
+(e.g. `'1.1.0'`), commit, then `git tag v1.1.0 && git push origin v1.1.0`, and on
+GitHub open *Releases -> Draft a new release*, pick the tag, write what changed
+and publish. Drafts and pre-releases do not trigger the badge.
+
 ### CLI options
 
 | flag | default | meaning |
@@ -475,12 +494,15 @@ conda install graphviz        # or: sudo apt install graphviz / brew install gra
 | `--host` | `127.0.0.1` | bind address |
 | `--port` | `8050` | port |
 | `--debug` | off | Dash debug / hot-reload |
+| `--browser` | off | browser tab instead of the app window |
 
 ## Code layout
 
 | Module | Role |
 |---|---|
 | `app.py` | Dash UI, callbacks, plotting |
+| `desktop_window.py` | Native app window (pywebview) |
+| `update_check.py` | Version number, GitHub release check |
 | `grid_interp.py` | 2-D / 3-D grid resampling |
 | `grid_fit.py` | 3-D intensity cubes and FITS map fit |
 | `map_fit.py` | Core FITS-to-grid fitting (`fit_fits_maps_to_grids_3d`) |

@@ -563,6 +563,82 @@ textarea.kosma-input {
   flex-shrink: 0;
   display: flex;
   align-items: center;
+  gap: var(--s3);
+}
+
+/* Update badge: a glass pill on the navy header, like the theme toggle.
+   The panel drops below it so opening it does not reflow the header. */
+.app-update {
+  position: relative;
+}
+
+.app-update summary {
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  padding: var(--s1) var(--s3);
+  border-radius: var(--radius-pill);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.10);
+  color: var(--glow);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.app-update summary::-webkit-details-marker { display: none; }
+
+.app-update summary::before {
+  content: '';
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: var(--glow);
+  vertical-align: 1px;
+}
+
+.app-update summary:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
+}
+
+.app-update-panel {
+  position: absolute;
+  right: 0;
+  top: calc(100% + var(--s2));
+  z-index: 50;
+  width: 26rem;
+  max-width: calc(100vw - 32px);
+  padding: var(--s3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+  box-shadow: var(--shadow-md);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.app-update-panel p {
+  margin: 0 0 var(--s2) !important;
+  color: var(--text) !important;
+}
+
+.app-update-panel pre {
+  margin: 0 0 var(--s2);
+  padding: var(--s2);
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  user-select: all;
+}
+
+.app-update-panel a {
+  color: var(--accent-ink);
+  font-weight: 600;
 }
 
 .theme-seg {
